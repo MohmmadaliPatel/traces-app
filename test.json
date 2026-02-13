@@ -1,0 +1,398 @@
+{
+  "metadata": {
+    "loggedInPan": "EHPPS7819B",
+    "jsonVersion": "5.0.0",
+    "downloadDate": "08-Aug-2023",
+    "utilityVersion": "5.0.0"
+  },
+  "header": {
+    "title": "Annual Information Statement (AIS)",
+    "columnLabel": ["Financial Year ", "Assessment Year "],
+    "columnData": ["2023-24", "2024-25"]
+  },
+  "partA": {
+    "heading": "General Information",
+    "title": "Part A",
+    "columnLabel": [
+      "Permanent Account Number (PAN)",
+      "Aadhaar Number",
+      "Name of Assessee",
+      "Date of Birth",
+      "Mobile Number",
+      "E-mail Address",
+      "Address"
+    ],
+    "columnData": [
+      "EHPPS7819B",
+      "XXXX XXXX 4074",
+      "HARDIK HEMCHAND SAVLA",
+      "27/05/1993",
+      "9769107820",
+      "hardiksavla27593@gmail.com",
+      "F-1703,SAMARTH GARDEN,DUTTA MANDIR ROAD,BHANDUP WEST,MUMBAI,400078,MAHARASHTRA"
+    ]
+  },
+  "partB": {
+    "title": "",
+    "lastFeedbackMap": {},
+    "sections": [
+      {
+        "sectionKey": "tdsTcs",
+        "title": "Part B1-Information relating to tax deducted or collected at source",
+        "heading": "TDS/TCS Information",
+        "elements": [
+          {
+            "title": "Salary",
+            "l2": {
+              "columnLabel": [
+                "Information Category",
+                "Information Code",
+                "Information Description",
+                "Information Source",
+                "Count",
+                "Amount",
+                "Information Category Code",
+                "Derived Amount",
+                "Qualifies For"
+              ],
+              "columnData": [
+                [
+                  "Salary",
+                  "TDS-192",
+                  "Salary received (Section 192)",
+                  "BDO INDIA TECHNOLOGY SOLUTIONS PRIVATE LIMITED (MUMB32767A)",
+                  "2",
+                  "2,25,815.00",
+                  "SAL",
+                  null,
+                  ""
+                ]
+              ],
+              "columnDataType": [
+                "String",
+                "string",
+                "string",
+                "string",
+                "numeric",
+                "decimal",
+                "String",
+                "decimal",
+                "String"
+              ]
+            },
+            "l1": {
+              "columnLabel": [
+                {
+                  "field": "tsnId",
+                  "name": "TSN",
+                  "type": "string",
+                  "seq": 0,
+                  "sumRequired": "N",
+                  "isEditable": false,
+                  "isMandatory": false,
+                  "displayFeedback": false,
+                  "infoCode": null,
+                  "validationRegex": null
+                },
+                {
+                  "field": "quarter",
+                  "name": "Quarter",
+                  "type": "string",
+                  "seq": 1,
+                  "sumRequired": "N",
+                  "isEditable": false,
+                  "isMandatory": false,
+                  "displayFeedback": false,
+                  "infoCode": "TDS-192",
+                  "validationRegex": []
+                },
+                {
+                  "field": "transactionDate",
+                  "name": "Date of Payment/Credit",
+                  "type": "date",
+                  "seq": 2,
+                  "sumRequired": "N",
+                  "isEditable": false,
+                  "isMandatory": false,
+                  "displayFeedback": false,
+                  "infoCode": "TDS-192",
+                  "validationRegex": []
+                },
+                {
+                  "field": "amtPaid",
+                  "name": "Amount Paid/Credited",
+                  "type": "decimal",
+                  "seq": 3,
+                  "sumRequired": "Y",
+                  "isEditable": true,
+                  "isMandatory": true,
+                  "displayFeedback": true,
+                  "infoCode": "TDS-192",
+                  "validationRegex": [
+                    {
+                      "rule": "^\\d+$",
+                      "message": "Invalid input. Please enter numeric digits with amount greater than equal to '0'",
+                      "type": "regex"
+                    },
+                    {
+                      "rule": "^[0-9]*$",
+                      "message": "Invalid input. Please enter amount greater than equal to 0",
+                      "type": "regex"
+                    },
+                    {
+                      "rule": "^[0-9]{1,14}$",
+                      "message": "Only upto 14 length allowed",
+                      "type": "regex"
+                    }
+                  ]
+                },
+                {
+                  "field": "amountDeducted",
+                  "name": "TDS Deducted",
+                  "type": "decimal",
+                  "seq": 4,
+                  "sumRequired": "N",
+                  "isEditable": false,
+                  "isMandatory": false,
+                  "displayFeedback": false,
+                  "infoCode": "TDS-192",
+                  "validationRegex": []
+                },
+                {
+                  "field": "amountDeposited",
+                  "name": "TDS Deposited",
+                  "type": "decimal",
+                  "seq": 5,
+                  "sumRequired": "N",
+                  "isEditable": false,
+                  "isMandatory": false,
+                  "displayFeedback": false,
+                  "infoCode": "TDS-192",
+                  "validationRegex": []
+                },
+                {
+                  "field": "status",
+                  "name": "Status",
+                  "type": "string",
+                  "seq": 6,
+                  "sumRequired": "N",
+                  "isEditable": false,
+                  "isMandatory": false,
+                  "displayFeedback": false,
+                  "infoCode": "TDS-192",
+                  "validationRegex": []
+                },
+                {
+                  "field": "transFeedback",
+                  "name": "Feedback",
+                  "type": "string",
+                  "seq": 7,
+                  "sumRequired": "N",
+                  "isEditable": false,
+                  "isMandatory": false,
+                  "displayFeedback": false,
+                  "infoCode": null,
+                  "validationRegex": null
+                }
+              ],
+              "columnData": [
+                [
+                  "131230022522451",
+                  "Q1(Apr-Jun)",
+                  "31/05/2023",
+                  "39,147.00",
+                  "0",
+                  "0",
+                  "Active",
+                  "Optional",
+                  null,
+                  "MUMB32767A",
+                  "",
+                  null,
+                  null,
+                  null,
+                  ""
+                ],
+                [
+                  "131230022521193",
+                  "Q1(Apr-Jun)",
+                  "30/04/2023",
+                  "1,86,668.00",
+                  "0",
+                  "0",
+                  "Active",
+                  "Optional",
+                  null,
+                  "MUMB32767A",
+                  "",
+                  null,
+                  null,
+                  null,
+                  ""
+                ]
+              ],
+              "columnDataType": [
+                "String",
+                "string",
+                "date",
+                "decimal",
+                "decimal",
+                "decimal",
+                "string",
+                "String",
+                "decimal",
+                "String",
+                "String",
+                "decimal",
+                "decimal",
+                "decimal",
+                "String"
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "sectionKey": "sft",
+        "title": "Part B2-Information relating to specified financial transaction (SFT)",
+        "heading": "SFT Information",
+        "elements": [
+          {
+            "title": "",
+            "l2": {
+              "columnLabel": [
+                "Information Category",
+                "Information Code",
+                "Information Description",
+                "Information Source",
+                "Count",
+                "Amount",
+                "Information Category Code",
+                "Derived Amount",
+                "Qualifies For"
+              ],
+              "columnDataType": [
+                "String",
+                "string",
+                "string",
+                "string",
+                "numeric",
+                "decimal",
+                "String",
+                "decimal",
+                "String"
+              ]
+            },
+            "l1": null
+          }
+        ]
+      },
+      {
+        "sectionKey": "paymentOfTaxes",
+        "title": "Part B3-Information relating to payment of taxes",
+        "heading": "Payment of Taxes",
+        "elements": [
+          {
+            "title": "",
+            "columnLabel": [
+              "Assessment Year",
+              "Major Head",
+              "Minor Head",
+              "Tax (A)",
+              "Surcharge (B)",
+              "Education Cess (C)",
+              "Others (D)",
+              "Total (A+B+C+D)",
+              "BSR Code",
+              "Date Of Deposit",
+              "Challan Serial Number",
+              "Challan Identification Number"
+            ],
+            "columnData": [],
+            "columnDataType": [
+              "string",
+              "enum",
+              "enum",
+              "decimal",
+              "decimal",
+              "decimal",
+              "decimal",
+              "decimal",
+              "string",
+              "date",
+              "string",
+              "string"
+            ]
+          }
+        ]
+      },
+      {
+        "sectionKey": "demandAndRefund",
+        "title": "Part B4-Information relating to demand and refund",
+        "heading": "Demand and Refund",
+        "subSections": [
+          {
+            "sectionKey": "refund",
+            "title": "Refund",
+            "elements": [
+              {
+                "title": "",
+                "columnLabel": [
+                  "Assessment Year",
+                  "Mode",
+                  "Nature of Refund",
+                  "Refund Amount",
+                  "Date of Payment"
+                ],
+                "columnData": [],
+                "columnDataType": ["enum", "string", "string", "decimal", "date"]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "sectionKey": "other-info",
+        "title": "Part B7-Any other information in relation to sub-rule (2) of rule 114-I",
+        "heading": "Other Information",
+        "elements": [
+          {
+            "title": "",
+            "l2": {
+              "columnLabel": [
+                "Information Category",
+                "Information Code",
+                "Information Description",
+                "Information Source",
+                "Count",
+                "Amount",
+                "Information Category Code",
+                "Derived Amount",
+                "Qualifies For"
+              ],
+              "columnDataType": [
+                "String",
+                "string",
+                "string",
+                "string",
+                "numeric",
+                "decimal",
+                "String",
+                "decimal",
+                "String"
+              ]
+            },
+            "l1": null
+          }
+        ]
+      }
+    ]
+  },
+  "rejectedFeedbacks": null,
+  "footer": {
+    "title": "",
+    "columnLabel": ["Download ID", "IP Address", "Generation Date"],
+    "columnData": ["EHPPS7819B202308081157", "103.196.77.37", "08/08/2023, 11:57:10"]
+  },
+  "fileSize": null
+}

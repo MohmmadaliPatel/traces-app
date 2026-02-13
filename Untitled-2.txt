@@ -1,0 +1,106 @@
+import axios from "axios"
+import { wrapper } from "axios-cookiejar-support"
+import { CookieJar } from "tough-cookie"
+
+const jar = new CookieJar()
+const client = wrapper(
+  axios.create({
+    jar,
+    headers: {
+      accept: "application/json, text/plain, */*",
+      "accept-language": "en-US,en;q=0.9",
+      "cache-control": "no-cache",
+      "content-type": "application/json",
+      pragma: "no-cache",
+      "sec-fetch-dest": "empty",
+      "sec-fetch-mode": "cors",
+      "sec-fetch-site": "same-origin",
+      "sec-gpc": "1",
+      Referer: "https://eportal.incometax.gov.in/iec/foservices/",
+      "Referrer-Policy": "strict-origin-when-cross-origin",
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.82 Safari/537.36",
+    },
+  })
+)
+const verifyPan = async (panNo: string) => {
+  const res = await client.post("https://eportal.incometax.gov.in/iec/loginapi/login", {
+    entity: panNo,
+    serviceName: "wLoginService",
+  })
+  return res.data
+}
+
+const verifyPassword = async (panNo: string, password: string, reqId: string) => {
+  const res = await client.post("https://eportal.incometax.gov.in/iec/loginapi/login", {
+    errors: [],
+    reqId: reqId,
+    entity: panNo,
+    entityType: "PAN",
+    role: "CO",
+    uidValdtnFlg: "true",
+    aadhaarMobileValidated: "false",
+    secAccssMsg: "",
+    secLoginOptions: "",
+    dtoService: "LOGIN",
+    exemptedPan: "false",
+    userConsent: "",
+    imgByte: null,
+    pass: password,
+    passValdtnFlg: null,
+    otpGenerationFlag: null,
+    otp: null,
+    otpValdtnFlg: null,
+    otpSourceFlag: null,
+    contactPan: null,
+    contactMobile: null,
+    contactEmail: null,
+    email: null,
+    mobileNo: null,
+    forgnDirEmailId: null,
+    imagePath: null,
+    serviceName: "loginService",
+  })
+  console.log(res.headers)
+  return res.data
+}
+
+const logout = async (panNo: string) => {
+  const res = await client.post("https://eportal.incometax.gov.in/iec/loginapi/login", {
+    entity: panNo,
+    serviceName: "logoutService",
+    userType: "COM",
+  })
+  return res.data
+}
+
+const getEproceedings = async (pan: string, prcdngStatusFlag: "FYA" | "FYI") => {
+  try {
+    const res = await client.post(
+      "https://eportal.incometax.gov.in/iec/returnservicesapi/auth/getEntity",
+      {
+        serviceName: "getEProceedingsDetail",
+        pan,
+        prcdngStatusFlag,
+        header: { formName: "FO-041_PCDNG" },
+      }
+    )
+    return res.data
+  } catch (error) {
+    console.log(error)
+  }
+}
+
+const main = async () => {
+  const pan = "AAACI6832K"
+  const password = "aXRjbEAxMjM0"
+  await logout(pan)
+  const panResponse = await verifyPan("AAACI6832K")
+  await verifyPassword(pan, password, panResponse.reqId)
+  const proceedingsFYA = await getEproceedings(pan, "FYA")
+  //   const proceedingsFYI = await getEproceedings(pan, 'FYI')
+  console.log(proceedingsFYA)
+  //   console.log(proceedingsFYI);
+}
+
+main()

@@ -1,0 +1,212 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// --------------------------------------
+
+model User {
+  id             Int      @id @default(autoincrement())
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  name           String?
+  email          String   @unique
+  hashedPassword String?
+  role           String   @default("USER")
+
+  tokens   Token[]
+  sessions Session[]
+}
+
+model Session {
+  id                 Int       @id @default(autoincrement())
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  expiresAt          DateTime?
+  handle             String    @unique
+  hashedSessionToken String?
+  antiCSRFToken      String?
+  publicData         String?
+  privateData        String?
+
+  user   User? @relation(fields: [userId], references: [id])
+  userId Int?
+}
+
+model Token {
+  id          Int      @id @default(autoincrement())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  hashedToken String
+  type        String
+  // See note below about TokenType enum
+  // type        TokenType
+  expiresAt   DateTime
+  sentTo      String
+
+  user   User @relation(fields: [userId], references: [id])
+  userId Int
+
+  @@unique([hashedToken, type])
+}
+
+// NOTE: It's highly recommended to use an enum for the token type
+//       but enums only work in Postgres.
+//       See: https://blitzjs.com/docs/database-overview#switch-to-postgre-sql
+// enum TokenType {
+//   RESET_PASSWORD
+// }
+
+model Company {
+  id          Int      @id @default(autoincrement())
+  name        String
+  tan         String   @unique
+  it_password String
+  user_id     String
+  password    String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  tasks       Task[]
+  emails      String?  @default("")
+  groupId     Int?
+  isTemporary Boolean  @default(false)
+
+  History     History[]
+  TldcData    TldcData[]
+  ChallanData ChallanData[]
+}
+
+model History {
+  id         Int      @id @default(autoincrement())
+  company    Company  @relation(fields: [companyTan], references: [tan], onDelete: Cascade)
+  companyTan String
+  path       String
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+model UploadHistory {
+  id            Int      @id @default(autoincrement())
+  companyName   String
+  tan           String
+  status        String // "Success" or "Failed"
+  filePath      String?
+  financialYear String
+  quarter       String
+  errorMessage  String?
+  type          String? // "conso", "form16", "form16a"
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  batchId       Int?
+}
+
+model Task {
+  id         Int        @id @default(autoincrement())
+  company    Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  companyId  Int
+  status     String
+  createdAt  DateTime   @default(now())
+  updatedAt  DateTime   @updatedAt
+  Batch      TaskBatch? @relation(fields: [BatchID], references: [id], onDelete: Cascade)
+  BatchID    Int?
+  retryCount Int?       @default(0)
+  jobType    String?    @default("")
+  module     String?    @default("IT")
+  message    String?
+}
+
+model TaskBatch {
+  id        Int      @id @default(autoincrement())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  Task      Task[]
+  jobTypes  String?
+  module    String?  @default("IT")
+  filters   String?  @default("{}") // JSON string to store filters
+}
+
+model DeducteeMaster {
+  id        Int      @id @default(autoincrement())
+  pan       String   @unique
+  email     String
+  name      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model SmtpConfig {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique // Configuration name
+  host      String
+  port      Int
+  secure    Boolean  @default(true)
+  user      String
+  password  String
+  fromEmail String
+  isActive  Boolean  @default(false) // Only one can be active
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model EmailLog {
+  id            Int      @id @default(autoincrement())
+  pan           String
+  email         String
+  subject       String
+  status        String // "sent", "failed"
+  errorMessage  String?
+  pdfPath       String?
+  financialYear String?
+  quarter       String?
+  formType      String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model TldcData {
+  id                Int       @id @default(autoincrement())
+  company           Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  companyId         Int
+  certNumber        String
+  din               String
+  fy                String
+  pan               String
+  panName           String
+  section           String
+  NatureOfPayment   String
+  tdsAmountLimit    String
+  tdsAmountConsumed String
+  tdsRate           String
+  validFrom         DateTime
+  validTo           DateTime
+  cancelDate        DateTime?
+  isActive          Boolean   @default(true)
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@unique([companyId, certNumber, fy])
+}
+
+model ChallanData {
+  id             Int      @id @default(autoincrement())
+  company        Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  companyId      Int
+  assessmentYear String
+  sectionCode    String
+  sectionDesc    String
+  amount         String
+  pymntRefNum    String?
+  status         String   @default("draft") // draft, created, paid, downloaded
+  filePath       String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([companyId, assessmentYear, sectionCode])
+}
