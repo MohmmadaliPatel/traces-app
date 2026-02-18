@@ -14,7 +14,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   }
 
   try {
-    const { tan, year, credentials, companyId } = req.body
+    const { tan, year, credentials, companyId, recordId } = req.body
 
     if (
       !tan ||
@@ -30,14 +30,24 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       })
     }
 
-    console.log(`API: Fetching TLDC data for TAN: ${tan}, Year: ${year}`)
+    console.log(`API: Updating TLDC data for TAN: ${tan}, Year: ${year}`)
+
+    // If recordId is provided, only update that specific record
+    // Otherwise, update all records with empty panName for the company/FY
+    const whereClause: any = {
+      companyId: parseInt(companyId),
+      fy: year,
+    }
+
+    if (recordId) {
+      whereClause.id = parseInt(recordId)
+    } else {
+      // Only update records with empty or missing panName
+      whereClause.OR = [{ panName: "" }, { panName: null }]
+    }
 
     const tldcDataArr = await db.tldcData.findMany({
-      where: {
-        companyId: parseInt(companyId),
-        fy: year,
-        panName: undefined,
-      },
+      where: whereClause,
     })
 
     console.log("tldcDataArr", tldcDataArr)

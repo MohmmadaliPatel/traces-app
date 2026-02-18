@@ -698,6 +698,7 @@ function Form16Page() {
                           Financial Year
                         </label>
                         <Select
+                          mode="multiple"
                           value={financialYear}
                           onChange={setFinancialYear}
                           placeholder="Select Financial Years"
@@ -711,6 +712,7 @@ function Form16Page() {
                           Quarter
                         </label>
                         <Select
+                          mode="multiple"
                           value={quarter}
                           onChange={setQuarter}
                           placeholder="Select Quarters"
@@ -724,6 +726,7 @@ function Form16Page() {
                           Form Type
                         </label>
                         <Select
+                          mode="multiple"
                           value={formType}
                           onChange={setFormType}
                           placeholder="Select Form Types"

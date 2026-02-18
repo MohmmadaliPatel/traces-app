@@ -429,7 +429,12 @@ export async function downloadChallanPayments(
   // Launch a headless browser
   const browser = await puppeteer.launch({
     headless: false,
-    executablePath: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    executablePath:
+    process.platform === "darwin"
+      ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+      : process.platform === "win32"
+      ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+      : undefined, // Use default for Linux
     args: [
       "--start-maximized", // you can also use '--start-fullscreen'
     ],
@@ -671,14 +676,15 @@ export async function downloadChallanPayments(
 
     // Click the Filter button in the modal to apply filters
     console.log("Clicking filter button to apply filters...")
-    return
     // Wait for the filter button to be visible
     await waitForSecs(1000)
 
     // Search for filter button within the filter-section element
     const filterClicked = await page.evaluate(() => {
       // Find the filter-section container using three-class combination to avoid dummy sections
-      const filterSection = document.querySelector(".filter-section.mt-3.mr-3.ng-star-inserted")
+      // Select the filter section that is NOT hidden (ignores any with the "hidden" attribute)
+      const filterSection = Array.from(document.querySelectorAll(".filter-section.mt-3.mr-3"))
+        .find((el) => !el.hasAttribute("hidden") && ((el as HTMLElement).offsetParent !== null));
       if (!filterSection) {
         console.log("Could not find .filter-section.mt-3.mr-3 element")
         return false

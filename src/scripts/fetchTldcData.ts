@@ -197,26 +197,6 @@ export async function processPdfFiles(downloadedFiles: any[]): Promise<any[]> {
 }
 
 /**
- * Clean up download directory after processing
- * @param downloadDir Directory to delete
- */
-function cleanupDownloadDirectory(downloadDir: string): void {
-  try {
-    // Delete all files in the directory
-    const files = fs.readdirSync(downloadDir)
-    for (const file of files) {
-      const filePath = path.join(downloadDir, file)
-      fs.unlinkSync(filePath)
-    }
-
-    // Delete the directory itself
-    fs.rmdirSync(downloadDir)
-  } catch (error) {
-    console.error(`⚠️ Error cleaning up download directory ${downloadDir}:`, error)
-  }
-}
-
-/**
  * Check if a TLDC record with the given DIN and FY already exists in the database
  * @param rowCertNumber The Cert Number to check
  * @param fy The financial year
@@ -269,7 +249,7 @@ export async function fetchTldcData({
   console.log("⏳ Launching Puppeteer for:", tan, year)
 
   // Create a download directory - use absolute path in temp directory
-  const downloadDir = path.join(os.tmpdir(), "tldc-downloads")
+  const downloadDir = path.resolve(`./public/pdf/tldc-downloads`)
   fs.mkdirSync(downloadDir, { recursive: true })
 
   // Track all downloaded files
@@ -296,7 +276,9 @@ export async function fetchTldcData({
     while (hasMorePages) {
       // Navigate to the DED inbox page (only needed for the first page)
       if (currentPage === 1) {
-        await page.goto("https://www.tdscpc.gov.in/app/ded/dedinbox.xhtml")
+        await page.goto("https://www.tdscpc.gov.in/app/ded/dedinbox.xhtml", {
+          waitUntil: "networkidle2",
+        })
 
         // Wait for category dropdown and select Certificate
         await page.waitForSelector("#commCategory", { visible: true, timeout: 10000 })
@@ -517,9 +499,6 @@ export async function fetchTldcData({
     // Process downloaded PDFs to extract certificate numbers and PAN numbers
     const processedDownloads = await processPdfFiles(allDownloads)
 
-    // Clean up the download directory after processing
-    cleanupDownloadDirectory(downloadDir)
-
     await page.close()
     globalPage = null
 
@@ -541,9 +520,6 @@ export async function fetchTldcData({
       try {
         const processedDownloads = await processPdfFiles(allDownloads)
 
-        // Try to clean up download directory even after error
-        cleanupDownloadDirectory(downloadDir)
-
         return {
           data: {
             success: true,
@@ -556,9 +532,6 @@ export async function fetchTldcData({
         }
       } catch (processingError) {
         console.error("❌ Error processing PDFs:", processingError)
-
-        // Try to clean up download directory even after processing error
-        cleanupDownloadDirectory(downloadDir)
 
         // Fall back to returning unprocessed downloads
         return {
@@ -581,9 +554,6 @@ export async function fetchTldcData({
         }
       }
     }
-
-    // Try to clean up download directory in all error cases
-    cleanupDownloadDirectory(downloadDir)
 
     throw error
   }

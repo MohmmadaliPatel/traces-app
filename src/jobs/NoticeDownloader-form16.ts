@@ -2688,27 +2688,6 @@ export default class NoticeDownloaderForm16 {
                   })
 
                   this.logger.log(`  ✓ PDF generated: ${pdfFileName}`)
-
-                  // Send email with PDF attachment
-                  try {
-                    const { sendForm16AEmail } = await import("src/utils/sendForm16AEmail")
-                    const emailResult = await sendForm16AEmail(
-                      pan,
-                      pdfOutputPath,
-                      finYr,
-                      qrtr,
-                      formType
-                    )
-
-                    if (emailResult.success) {
-                      this.logger.log(`  ✓ Email sent successfully to PAN: ${pan}`)
-                    } else {
-                      this.logger.log(`  ⚠️  Email failed for PAN ${pan}: ${emailResult.error}`)
-                    }
-                  } catch (emailError: any) {
-                    this.logger.log(`  ⚠️  Email error for PAN ${pan}: ${emailError.message}`)
-                    // Don't fail the entire process if email fails
-                  }
                 } catch (pdfError: any) {
                   this.logger.log(
                     `  ❌ Failed to generate PDF for record ${i + 1}: ${pdfError.message}`

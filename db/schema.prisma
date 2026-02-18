@@ -78,9 +78,11 @@ model Company {
   groupId     Int?
   isTemporary Boolean  @default(false)
 
-  History     History[]
-  TldcData    TldcData[]
-  ChallanData ChallanData[]
+  History           History[]
+  TldcData          TldcData[]
+  ChallanData       ChallanData[]
+  OutstandingDemand OutstandingDemand[]
+  ReturnStatus      ReturnStatus[]
 }
 
 model History {
@@ -209,4 +211,39 @@ model ChallanData {
   updatedAt      DateTime @updatedAt
 
   @@unique([companyId, assessmentYear, sectionCode])
+}
+
+model OutstandingDemand {
+  id         Int      @id @default(autoincrement())
+  company    Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  companyId  Int
+  finYr      String
+  fin        String
+  aodmnd     String   @default("0.00") // Assessment Order Demand
+  cpcdmd     String   @default("0.00") // CPC Demand
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([companyId, finYr])
+}
+
+model ReturnStatus {
+  id             Int      @id @default(autoincrement())
+  company        Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  companyId      Int
+  finyear        String
+  quarter        String
+  formtype       String
+  tokenno        String
+  dtoffiling     String
+  status         String
+  dtofprcng      String
+  stmnttype      String
+  remarks        String?
+  reason         String?
+  rejectionMsg   String?  @default("") // Rejection message from API
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([companyId, finyear, quarter, formtype, tokenno])
 }

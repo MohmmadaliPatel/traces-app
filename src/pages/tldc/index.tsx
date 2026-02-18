@@ -36,6 +36,7 @@ import Layout from "src/core/layouts/Layout"
 import getCompanies from "src/companies/queries/getCompanies"
 import getTldcData from "src/tldc/queries/getTldcData"
 import upsertTldcData from "src/tldc/mutations/upsertTldcData"
+import createQuickTldcData from "src/tldc/mutations/createQuickTldcData"
 import deleteTldcData from "src/tldc/mutations/deleteTldcData"
 import { TldcService } from "src/tldc/services/tldcService"
 import dayjs from "dayjs"
@@ -84,9 +85,11 @@ function TldcPage() {
 
   // Table and modal states
   const [isModalVisible, setIsModalVisible] = useState(false)
+  const [isQuickAddMode, setIsQuickAddMode] = useState(false)
   const [currentTldcData, setCurrentTldcData] = useState<any>(null)
   const [searchText, setSearchText] = useState("")
   const [filterCompanyId, setFilterCompanyId] = useState<number | undefined>(undefined)
+  const [updatingRecordId, setUpdatingRecordId] = useState<number | null>(null)
 
   // Pagination state
   const [current, setCurrent] = useState(1)
@@ -128,6 +131,7 @@ function TldcPage() {
   })
 
   const [upsertTldcDataMutation] = useMutation(upsertTldcData)
+  const [createQuickTldcDataMutation] = useMutation(createQuickTldcData)
   const [deleteTldcDataMutation] = useMutation(deleteTldcData)
 
   const [form] = Form.useForm()
@@ -216,14 +220,16 @@ function TldcPage() {
     }
   }
 
-  const handleAddTldcData = () => {
+  const handleAddTldcData = (quickMode = false) => {
     setCurrentTldcData(null)
+    setIsQuickAddMode(quickMode)
     form.resetFields()
     setIsModalVisible(true)
   }
 
   const handleEditTldcData = (tldcData: TldcDataType) => {
     setCurrentTldcData(tldcData)
+    setIsQuickAddMode(false)
 
     // Format dates for form
     const formData = {
@@ -239,6 +245,7 @@ function TldcPage() {
 
   const handleModalCancel = () => {
     setIsModalVisible(false)
+    setIsQuickAddMode(false)
     form.resetFields()
     setCurrentTldcData(null)
   }
@@ -248,27 +255,39 @@ function TldcPage() {
       await form.validateFields()
       const values = form.getFieldsValue()
 
-      // Convert dayjs objects to Date objects for the API
-      const formattedValues = {
-        ...values,
-        validFrom: values.validFrom.toDate(),
-        validTo: values.validTo.toDate(),
-        cancelDate: values.cancelDate ? values.cancelDate.toDate() : null,
+      if (isQuickAddMode && !currentTldcData) {
+        // Quick add mode - only need minimal fields
+        await createQuickTldcDataMutation({
+          companyId: values.companyId,
+          certNumber: values.certNumber,
+          pan: values.pan,
+          fy: values.fy,
+        })
+        messageApi.success("TLDC data created successfully. Use 'Update from Portal' to fetch details.")
+      } else {
+        // Full add/edit mode
+        const formattedValues = {
+          ...values,
+          validFrom: values.validFrom.toDate(),
+          validTo: values.validTo.toDate(),
+          cancelDate: values.cancelDate ? values.cancelDate.toDate() : null,
+        }
+
+        await upsertTldcDataMutation({
+          id: currentTldcData?.id,
+          ...formattedValues,
+        })
+        messageApi.success("TLDC data saved successfully")
       }
 
-      await upsertTldcDataMutation({
-        id: currentTldcData?.id,
-        ...formattedValues,
-      })
-
-      messageApi.success("TLDC data saved successfully")
       setIsModalVisible(false)
+      setIsQuickAddMode(false)
       form.resetFields()
       setCurrentTldcData(null)
       void refetch()
-    } catch (error) {
+    } catch (error: any) {
       console.error("Form validation failed:", error)
-      messageApi.error("Failed to save TLDC data")
+      messageApi.error(error.message || "Failed to save TLDC data")
     }
   }
 
@@ -280,6 +299,51 @@ function TldcPage() {
     } catch (error) {
       console.error("Delete failed:", error)
       messageApi.error("Failed to delete TLDC data")
+    }
+  }
+
+  const handleUpdateFromPortal = async (record: TldcDataType) => {
+    setUpdatingRecordId(record.id)
+    try {
+      const company = savedCompanies.find((c) => c.id === record.companyId)
+      if (!company) {
+        messageApi.error("Company not found")
+        return
+      }
+
+      messageApi.loading({ content: "Updating from portal...", key: "updating", duration: 0 })
+
+      const result = await fetch("/api/tldc/update-data", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          tan: company.tan,
+          year: record.fy,
+          credentials: {
+            userId: company.user_id,
+            password: company.password,
+            tan: company.tan,
+          },
+          companyId: company.id,
+          recordId: record.id,
+        }),
+      })
+
+      const data = await result.json()
+      messageApi.destroy("updating")
+
+      if (data.success) {
+        messageApi.success("TLDC data updated from portal successfully")
+        await refetch()
+      } else {
+        messageApi.error(data.message || "Failed to update from portal")
+      }
+    } catch (error: any) {
+      messageApi.destroy("updating")
+      console.error("Update from portal failed:", error)
+      messageApi.error(error.message || "Failed to update from portal")
+    } finally {
+      setUpdatingRecordId(null)
     }
   }
 
@@ -476,28 +540,40 @@ function TldcPage() {
     {
       title: "Actions",
       key: "actions",
-      width: 150,
+      width: 250,
       fixed: "right",
       render: (_, record: TldcDataType) => (
-        <Space>
-          <Button
-            type="primary"
-            icon={<EditOutlined />}
-            size="small"
-            onClick={() => handleEditTldcData(record)}
-          >
-            Edit
-          </Button>
-          <Popconfirm
-            title="Are you sure you want to delete this record?"
-            onConfirm={() => handleDelete(record.id)}
-            okText="Yes"
-            cancelText="No"
-          >
-            <Button danger icon={<DeleteOutlined />} size="small">
-              Delete
+        <Space direction="vertical" size="small">
+          <Space>
+            <Button
+              type="primary"
+              icon={<EditOutlined />}
+              size="small"
+              onClick={() => handleEditTldcData(record)}
+            >
+              Edit
             </Button>
-          </Popconfirm>
+            <Popconfirm
+              title="Are you sure you want to delete this record?"
+              onConfirm={() => handleDelete(record.id)}
+              okText="Yes"
+              cancelText="No"
+            >
+              <Button danger icon={<DeleteOutlined />} size="small">
+                Delete
+              </Button>
+            </Popconfirm>
+          </Space>
+          <Button
+            type="default"
+            icon={<SyncOutlined />}
+            size="small"
+            loading={updatingRecordId === record.id}
+            onClick={() => handleUpdateFromPortal(record)}
+            style={{ width: "100%" }}
+          >
+            Update from Portal
+          </Button>
         </Space>
       ),
     },
@@ -653,8 +729,11 @@ function TldcPage() {
                 <Button icon={<DownloadOutlined />} onClick={handleDownloadCSV}>
                   Download CSV
                 </Button>
-                <Button type="primary" icon={<PlusOutlined />} onClick={handleAddTldcData}>
-                  Add New
+                <Button type="primary" icon={<PlusOutlined />} onClick={() => handleAddTldcData(true)}>
+                  Quick Add
+                </Button>
+                <Button icon={<PlusOutlined />} onClick={() => handleAddTldcData(false)}>
+                  Add Full Details
                 </Button>
                 <Button onClick={() => refetch()} icon={<SyncOutlined />}>
                   Refresh
@@ -684,12 +763,27 @@ function TldcPage() {
 
         {/* Add/Edit Modal */}
         <Modal
-          title={currentTldcData ? "Edit TLDC Data" : "Add New TLDC Data"}
+          title={
+            currentTldcData
+              ? "Edit TLDC Data"
+              : isQuickAddMode
+              ? "Quick Add TLDC Data"
+              : "Add New TLDC Data"
+          }
           open={isModalVisible}
           onOk={handleModalOk}
           onCancel={handleModalCancel}
           width={800}
         >
+          {isQuickAddMode && !currentTldcData && (
+            <Alert
+              message="Quick Add Mode"
+              description="Enter minimal details (Company, Certificate Number, PAN, Financial Year). Use 'Update from Portal' button after creation to fetch complete details automatically."
+              type="info"
+              showIcon
+              style={{ marginBottom: 16 }}
+            />
+          )}
           <Form form={form} layout="vertical">
             <Row gutter={16}>
               <Col span={12}>
@@ -720,94 +814,103 @@ function TldcPage() {
 
             <Row gutter={16}>
               <Col span={12}>
-                <Form.Item name="din" label="DIN" rules={[{ required: true }]}>
-                  <Input />
-                </Form.Item>
-              </Col>
-              <Col span={12}>
                 <Form.Item name="fy" label="Financial Year" rules={[{ required: true }]}>
-                  <Input placeholder="e.g., 2024-25" />
+                  <Select placeholder="Select Financial Year" options={generateFinancialYears()} />
                 </Form.Item>
               </Col>
-            </Row>
-
-            <Row gutter={16}>
               <Col span={12}>
                 <Form.Item name="pan" label="PAN" rules={[{ required: true }]}>
-                  <Input />
-                </Form.Item>
-              </Col>
-              <Col span={12}>
-                <Form.Item name="panName" label="PAN Name" rules={[{ required: true }]}>
-                  <Input />
+                  <Input placeholder="Enter PAN" />
                 </Form.Item>
               </Col>
             </Row>
 
-            <Row gutter={16}>
-              <Col span={12}>
-                <Form.Item name="section" label="Section" rules={[{ required: true }]}>
-                  <Input />
-                </Form.Item>
-              </Col>
-              <Col span={12}>
+            {!isQuickAddMode && (
+              <>
+                <Row gutter={16}>
+                  <Col span={12}>
+                    <Form.Item name="din" label="DIN" rules={[{ required: true }]}>
+                      <Input />
+                    </Form.Item>
+                  </Col>
+                  <Col span={12}>
+                    <Form.Item name="panName" label="PAN Name" rules={[{ required: true }]}>
+                      <Input />
+                    </Form.Item>
+                  </Col>
+                </Row>
+
+                <Row gutter={16}>
+                  <Col span={12}>
+                    <Form.Item name="section" label="Section" rules={[{ required: true }]}>
+                      <Input />
+                    </Form.Item>
+                  </Col>
+                  <Col span={12}>
+                    <Form.Item
+                      name="NatureOfPayment"
+                      label="Nature of Payment"
+                      rules={[{ required: true }]}
+                    >
+                      <Input />
+                    </Form.Item>
+                  </Col>
+                </Row>
+
+                <Row gutter={16}>
+                  <Col span={8}>
+                    <Form.Item name="tdsRate" label="TDS Rate" rules={[{ required: true }]}>
+                      <Input suffix="%" />
+                    </Form.Item>
+                  </Col>
+                  <Col span={8}>
+                    <Form.Item
+                      name="tdsAmountLimit"
+                      label="TDS Amount Limit"
+                      rules={[{ required: true }]}
+                    >
+                      <Input />
+                    </Form.Item>
+                  </Col>
+                  <Col span={8}>
+                    <Form.Item
+                      name="tdsAmountConsumed"
+                      label="TDS Amount Consumed"
+                      rules={[{ required: true }]}
+                    >
+                      <Input />
+                    </Form.Item>
+                  </Col>
+                </Row>
+
+                <Row gutter={16}>
+                  <Col span={8}>
+                    <Form.Item name="validFrom" label="Valid From" rules={[{ required: true }]}>
+                      <DatePicker style={{ width: "100%" }} />
+                    </Form.Item>
+                  </Col>
+                  <Col span={8}>
+                    <Form.Item name="validTo" label="Valid To" rules={[{ required: true }]}>
+                      <DatePicker style={{ width: "100%" }} />
+                    </Form.Item>
+                  </Col>
+                  <Col span={8}>
+                    <Form.Item name="cancelDate" label="Cancel Date">
+                      <DatePicker style={{ width: "100%" }} />
+                    </Form.Item>
+                  </Col>
+                </Row>
+
                 <Form.Item
-                  name="NatureOfPayment"
-                  label="Nature of Payment"
-                  rules={[{ required: true }]}
+                  name="isActive"
+                  label="Status"
+                  valuePropName="checked"
+                  initialValue={true}
                 >
-                  <Input />
+                  <Switch checkedChildren="Active" unCheckedChildren="Inactive" />
                 </Form.Item>
-              </Col>
-            </Row>
-
-            <Row gutter={16}>
-              <Col span={8}>
-                <Form.Item name="tdsRate" label="TDS Rate" rules={[{ required: true }]}>
-                  <Input suffix="%" />
-                </Form.Item>
-              </Col>
-              <Col span={8}>
-                <Form.Item
-                  name="tdsAmountLimit"
-                  label="TDS Amount Limit"
-                  rules={[{ required: true }]}
-                >
-                  <Input />
-                </Form.Item>
-              </Col>
-              <Col span={8}>
-                <Form.Item
-                  name="tdsAmountConsumed"
-                  label="TDS Amount Consumed"
-                  rules={[{ required: true }]}
-                >
-                  <Input />
-                </Form.Item>
-              </Col>
-            </Row>
-
-            <Row gutter={16}>
-              <Col span={8}>
-                <Form.Item name="validFrom" label="Valid From" rules={[{ required: true }]}>
-                  <DatePicker style={{ width: "100%" }} />
-                </Form.Item>
-              </Col>
-              <Col span={8}>
-                <Form.Item name="validTo" label="Valid To" rules={[{ required: true }]}>
-                  <DatePicker style={{ width: "100%" }} />
-                </Form.Item>
-              </Col>
-              <Col span={8}>
-                <Form.Item name="cancelDate" label="Cancel Date">
-                  <DatePicker style={{ width: "100%" }} />
-                </Form.Item>
-              </Col>
-            </Row>
-
-            <Form.Item name="isActive" label="Status" valuePropName="checked" initialValue={true}>
-              <Switch checkedChildren="Active" unCheckedChildren="Inactive" />
-            </Form.Item>
+              </>
+            )}
           </Form>
         </Modal>
       </Layout>

@@ -43,7 +43,12 @@ export async function downloadChallans(
   // Launch a headless browser
   const browser = await puppeteer.launch({
     headless: false,
-    executablePath: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    executablePath:
+      process.platform === "darwin"
+        ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        : process.platform === "win32"
+        ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+        : undefined, // Use default for Linux
     args: [
       "--start-maximized", // you can also use '--start-fullscreen'
     ],

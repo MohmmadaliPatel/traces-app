@@ -618,6 +618,7 @@ function ConsoFilesPage() {
                             Financial Year
                           </label>
                           <Select
+                            mode="multiple"
                             value={financialYear}
                             onChange={setFinancialYear}
                             placeholder="Select Financial Years"
@@ -631,6 +632,7 @@ function ConsoFilesPage() {
                             Quarter
                           </label>
                           <Select
+                            mode="multiple"
                             value={quarter}
                             onChange={setQuarter}
                             placeholder="Select Quarters"
@@ -644,6 +646,7 @@ function ConsoFilesPage() {
                             Form Type
                           </label>
                           <Select
+                            mode="multiple"
                             value={formType}
                             onChange={setFormType}
                             placeholder="Select Form Types"

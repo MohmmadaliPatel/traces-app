@@ -15,6 +15,7 @@ import {
   FolderOpenOutlined,
   HomeOutlined,
   FundOutlined,
+  DollarOutlined,
 } from "@ant-design/icons"
 import { BlitzLayout } from "@blitzjs/next"
 import { useMutation, useQuery } from "@blitzjs/rpc"
@@ -124,6 +125,20 @@ const Layout: BlitzLayout<{ title?: string; children?: React.ReactNode }> = ({
       "Challan Management",
       "challan-management",
       <TeamOutlined />,
+      undefined,
+      notificationCounts.assessee
+    ),
+    getItem(
+      "Outstanding Demand",
+      "outstanding-demand",
+      <DollarOutlined />,
+      undefined,
+      notificationCounts.assessee
+    ),
+    getItem(
+      "Return Status",
+      "return-status",
+      <FileTextOutlined />,
       undefined,
       notificationCounts.assessee
     ),

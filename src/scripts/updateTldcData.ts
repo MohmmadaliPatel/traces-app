@@ -46,11 +46,14 @@ async function loginToTdsPortal(credentials: {
   const page = await browser.newPage()
 
   // Set extra permissions for downloads
-  const downloadClient = await page.target().createCDPSession()
-  await downloadClient.send("Browser.setDownloadBehavior", {
+  const downloadPath = path.resolve(`./public/pdf/tldc-downloads`)
+  const downloadClient = await page.createCDPSession()
+  if (!fs.existsSync(downloadPath)) {
+    fs.mkdirSync(downloadPath, { recursive: true })
+  }
+  await downloadClient.send("Page.setDownloadBehavior", {
     behavior: "allow",
-    downloadPath: path.join(os.tmpdir(), "tldc-downloads"),
-    eventsEnabled: true,
+    downloadPath,
   })
 
   // Navigate to login page
@@ -109,7 +112,7 @@ async function loginToTdsPortal(credentials: {
 
   await page.click("#clickLogin")
   // Wait for navigation after login
-  await page.waitForNavigation({ timeout: 1200 }) // Increased timeout for manual captcha
+  await page.waitForNavigation({ timeout: 60000 }) // 60 seconds timeout for login navigation
   globalPage = page
   return globalPage
 }
@@ -146,7 +149,9 @@ export async function updateTldcData({
     }
 
     // Navigate to the certificate verification page
-    await page.goto("https://www.tdscpc.gov.in/app/ded/197certiverfication.xhtml")
+    await page.goto("https://www.tdscpc.gov.in/app/ded/197certiverfication.xhtml", {
+      waitUntil: "networkidle2",
+    })
     console.log("✅ Navigated to certificate verification page")
 
     // Process each TLDC record
@@ -168,7 +173,7 @@ export async function updateTldcData({
         console.log(`✅ Entered PAN: ${tldc.pan}`)
 
         await page.waitForSelector("#financialYear", { visible: true, timeout: 5000 })
-        await page.select("#financialYear", year)
+        await page.select("#financialYear", year.split("-")[0] || "")
         console.log(`✅ Selected financial year: ${year}`)
 
         await page.waitForSelector("#certiNo", { visible: true, timeout: 5000 })

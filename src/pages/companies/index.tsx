@@ -14,6 +14,7 @@ import {
   Typography,
   Modal,
   Form,
+  Dropdown,
 } from "antd"
 import type { ColumnsType } from "antd/es/table"
 import {
@@ -22,6 +23,8 @@ import {
   DeleteOutlined,
   SearchOutlined,
   EditOutlined,
+  PlusOutlined,
+  DownloadOutlined,
 } from "@ant-design/icons"
 import { useMutation, useQuery } from "@blitzjs/rpc"
 import Layout from "src/core/layouts/Layout"
@@ -34,6 +37,39 @@ import { ConfigProvider } from "antd"
 import enGB from "antd/lib/locale/en_GB"
 
 const { Title } = Typography
+
+const COMPANY_TEMPLATE_HEADERS = [
+  "Company Name",
+  "Tan",
+  "IT Password",
+  "User ID",
+  "Password",
+]
+const COMPANY_TEMPLATE_CSV =
+  COMPANY_TEMPLATE_HEADERS.join(",") + "\nABC Corporation Ltd,ABCD12345E,ITPass123,ABCD12345E,UserPass456"
+
+function parseFileToCompanies(
+  jsonData: any[],
+  columnMap: Record<string, string>
+): CompanyData[] {
+  return jsonData.map((row, index) => {
+    const name = row[columnMap.name || ""]
+    const tan = row[columnMap.tan || ""]
+    const it_password = row[columnMap.it_password || ""]
+    const user_id = row[columnMap.user_id || ""]
+    const password = row[columnMap.password || ""]
+    if (!name || !tan || !it_password || !user_id || !password) {
+      throw new Error(`Missing required fields in row ${index + 1}`)
+    }
+    return {
+      name: String(name).trim(),
+      tan: String(tan).trim().toUpperCase(),
+      it_password: String(it_password).trim(),
+      user_id: String(user_id).trim(),
+      password: String(password).trim(),
+    }
+  })
+}
 
 interface CompanyData {
   name: string
@@ -88,52 +124,73 @@ function CompaniesPage() {
   })
 
   const handleFileUpload = async (file: File) => {
+    const isCsv = /\.csv$/i.test(file.name)
     try {
       const reader = new FileReader()
       reader.onload = (e) => {
         try {
-          const data = new Uint8Array(e.target?.result as ArrayBuffer)
-          const workbook = XLSX.read(data, { type: "array" })
-          const sheetName = workbook.SheetNames[0]
-          if (!sheetName) {
-            throw new Error("No sheets found in Excel file")
+          let jsonData: any[]
+          if (isCsv) {
+            const text = (e.target?.result as string) || ""
+            const workbook = XLSX.read(text, { type: "string", raw: false })
+            const sheetName = workbook.SheetNames[0]
+            if (!sheetName) throw new Error("No sheets found in file")
+            const worksheet = workbook.Sheets[sheetName]
+            jsonData = XLSX.utils.sheet_to_json(worksheet!) as any[]
+          } else {
+            const data = new Uint8Array(e.target?.result as ArrayBuffer)
+            const workbook = XLSX.read(data, { type: "array" })
+            const sheetName = workbook.SheetNames[0]
+            if (!sheetName) throw new Error("No sheets found in Excel file")
+            const worksheet = workbook.Sheets[sheetName]
+            jsonData = XLSX.utils.sheet_to_json(worksheet!) as any[]
           }
-          const worksheet = workbook.Sheets[sheetName]
-          const jsonData = XLSX.utils.sheet_to_json(worksheet!) as any[]
-
-          // Validate and transform data
-          const companies: CompanyData[] = jsonData.map((row, index) => {
-            if (
-              !row["Company Name"] ||
-              !row["Tan"] ||
-              !row["IT Password"] ||
-              !row["User ID"] ||
-              !row["Password"]
-            ) {
-              throw new Error(`Missing required fields in row ${index + 1}`)
-            }
-
-            return {
-              name: String(row["Company Name"]).trim(),
-              tan: String(row["Tan"]).trim().toUpperCase(),
-              it_password: String(row["IT Password"]).trim(),
-              user_id: String(row["User ID"]).trim(),
-              password: String(row["Password"]).trim(),
-            }
-          })
-
-          // Save companies to database
+          const columnMap = {
+            name: "Company Name",
+            tan: "Tan",
+            it_password: "IT Password",
+            user_id: "User ID",
+            password: "Password",
+          }
+          const companies = parseFileToCompanies(jsonData, columnMap)
           handleSaveCompanies(companies)
         } catch (error: any) {
-          messageApi.error(error.message || "Failed to parse Excel file")
+          messageApi.error(error.message || "Failed to parse file")
           setFileList([])
         }
       }
-      reader.readAsArrayBuffer(file)
+      if (isCsv) {
+        reader.readAsText(file, "UTF-8")
+      } else {
+        reader.readAsArrayBuffer(file)
+      }
     } catch (error: any) {
       messageApi.error(error.message || "Failed to read file")
     }
     return false // Prevent automatic upload
+  }
+
+  const downloadTemplateCSV = () => {
+    const blob = new Blob([COMPANY_TEMPLATE_CSV], { type: "text/csv;charset=utf-8;" })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement("a")
+    a.href = url
+    a.download = "companies-template.csv"
+    a.click()
+    URL.revokeObjectURL(url)
+    messageApi.success("CSV template downloaded")
+  }
+
+  const downloadTemplateExcel = () => {
+    const wsData = [
+      COMPANY_TEMPLATE_HEADERS,
+      ["ABC Corporation Ltd", "ABCD12345E", "ITPass123", "ABCD12345E", "UserPass456"],
+    ]
+    const ws = XLSX.utils.aoa_to_sheet(wsData)
+    const wb = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(wb, ws, "Companies")
+    XLSX.writeFile(wb, "companies-template.xlsx")
+    messageApi.success("Excel template downloaded")
   }
 
   const handleSaveCompanies = async (companies: CompanyData[]) => {
@@ -226,6 +283,31 @@ function CompaniesPage() {
     form.resetFields()
   }
 
+  const handleAddCompany = () => {
+    setEditingCompany(null)
+    form.resetFields()
+    setIsEditModalVisible(true)
+  }
+
+  const handleAddSubmit = async () => {
+    try {
+      const values = await form.validateFields()
+      const companyData: CompanyData = {
+        name: values.name.trim(),
+        tan: values.tan.trim().toUpperCase(),
+        it_password: values.it_password.trim(),
+        user_id: values.user_id.trim(),
+        password: values.password.trim(),
+      }
+      await handleSaveCompanies([companyData])
+      setIsEditModalVisible(false)
+      form.resetFields()
+    } catch (error: any) {
+      if (error.errorFields) return
+      messageApi.error(error.message || "Failed to add company")
+    }
+  }
+
   const columns: ColumnsType<Company> = [
     {
       title: "Company Name",
@@ -304,21 +386,51 @@ function CompaniesPage() {
                   />
                 </Col>
                 <Col>
-                  <Upload
-                    accept=".xlsx,.xls"
-                    fileList={fileList}
-                    beforeUpload={handleFileUpload}
-                    maxCount={1}
-                  >
-                    <Button type="primary" icon={<UploadOutlined />} loading={loading}>
-                      Upload Excel File
+                  <Space wrap>
+                    <Button
+                      type="primary"
+                      icon={<PlusOutlined />}
+                      onClick={handleAddCompany}
+                      loading={loading}
+                    >
+                      Add Company
                     </Button>
-                  </Upload>
+                    <Upload
+                      accept=".xlsx,.xls,.csv"
+                      fileList={fileList}
+                      beforeUpload={handleFileUpload}
+                      maxCount={1}
+                    >
+                      <Button icon={<UploadOutlined />} loading={loading}>
+                        Upload Excel / CSV
+                      </Button>
+                    </Upload>
+                    <Dropdown
+                      menu={{
+                        items: [
+                          {
+                            key: "csv",
+                            label: "Download CSV template",
+                            onClick: downloadTemplateCSV,
+                          },
+                          {
+                            key: "excel",
+                            label: "Download Excel template",
+                            onClick: downloadTemplateExcel,
+                          },
+                        ],
+                      }}
+                    >
+                      <Button icon={<DownloadOutlined />}>
+                        Download template
+                      </Button>
+                    </Dropdown>
+                  </Space>
                 </Col>
               </Row>
               <div style={{ fontSize: "12px", color: "#666" }}>
-                <FileExcelOutlined /> Excel file should contain columns: Company Name, Tan, IT
-                Password, User ID, Password
+                <FileExcelOutlined /> Upload Excel (.xlsx, .xls) or CSV. Columns: Company Name, Tan,
+                IT Password, User ID, Password
               </div>
             </Space>
           </Card>
@@ -339,14 +451,15 @@ function CompaniesPage() {
           </Card>
         </div>
 
-        {/* Edit Company Modal */}
+        {/* Add / Edit Company Modal */}
         <Modal
-          title="Edit Company"
+          title={editingCompany ? "Edit Company" : "Add Company"}
           open={isEditModalVisible}
-          onOk={handleEditSubmit}
+          onOk={editingCompany ? handleEditSubmit : handleAddSubmit}
           onCancel={handleEditCancel}
           confirmLoading={loading}
           width={600}
+          okText={editingCompany ? "Update" : "Add"}
         >
           <Form form={form} layout="vertical" style={{ marginTop: 16 }}>
             <Form.Item
