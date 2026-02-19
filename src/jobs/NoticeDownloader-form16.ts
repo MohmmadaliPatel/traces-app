@@ -341,7 +341,6 @@ export default class NoticeDownloaderForm16 {
         const payload = {
           serviceName: "viewFiledForms",
           entityNum: this.Pan,
-          submitUserId: "",
           formTypeCd: type,
           currentPage: currentPage.toString(),
           pageSize: pageSize.toString(),
@@ -417,7 +416,8 @@ export default class NoticeDownloaderForm16 {
         )
       }
     } catch (error) {
-      this.logger.log(`Error in getReturnsData: ${error.message}`)
+      console.log("error", error)
+      this.logger.log(`Error in getReturnsData: ${error}`)
       throw new Error(`Error in getReturnsData: ${error.message}`)
     }
   }
