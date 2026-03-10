@@ -73,6 +73,8 @@ export async function sendForm16AEmail(
           <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
             <p>Hi,</p>
             <p>Please find herewith TDS Certificates for Quarter ${quarterNumber} of Financial Year ${financialYear}</p>
+            <br/>
+            <p>Thanks &amp; Regards,<br/>Compliance Team</p>
           </div>
         </body>
       </html>

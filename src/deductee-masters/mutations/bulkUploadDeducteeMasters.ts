@@ -2,24 +2,14 @@ import { resolver } from "@blitzjs/rpc"
 import db from "db"
 import { z } from "zod"
 
-const DeducteeMasterDataSchema = z.object({
-  pan: z.string().min(10).max(10),
-  email: z.string().email(),
-  name: z.string().optional(),
-})
-
-const BulkUploadDeducteeMastersSchema = z.object({
-  deducteeMasters: z.array(DeducteeMasterDataSchema),
-})
-
 export default resolver.pipe(
   resolver.authorize(),
-  resolver.zod(BulkUploadDeducteeMastersSchema),
-  async ({ deducteeMasters }) => {
+  async (rawInput, ctx) => {
+    const { deducteeMasters } = rawInput as { deducteeMasters: any[] }
     const saved:any = []
     const updated:any = []
     const errors:any = []
-
+    console.log("deducteeMasters", deducteeMasters)
     for (const master of deducteeMasters) {
       try {
         const existing = await db.deducteeMaster.findUnique({

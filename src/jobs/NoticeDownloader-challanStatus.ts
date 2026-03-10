@@ -8,6 +8,7 @@ import StealthPlugin from "puppeteer-extra-plugin-stealth"
 import * as fs from "fs"
 import * as path from "path"
 import * as XLSX from "xlsx"
+import pdfParse from "pdf-parse"
 puppeteer.use(StealthPlugin())
 
 export default class NoticeDownloaderChallanStatus {
@@ -119,6 +120,90 @@ export default class NoticeDownloaderChallanStatus {
     } catch (error) {
       this.logger.log(`Error in getAllChallanDetailsForCompany: ${error.message}`)
       throw error
+    }
+  }
+
+  /**
+   * Extract challan details from PDFs in the challan management download path:
+   * public/pdf/challans/<CompanyName>/PaymentHistory/*.pdf
+   * Returns the same shape as getAllChallanDetailsForCompany() so the rest of
+   * the flow works unchanged.
+   */
+  async getAllChallanDetailsFromPaymentPdfs(): Promise<any[]> {
+    try {
+      this.logger.log(`Looking for challan PDFs for ${this.company.name}`)
+
+      const challansBase = path.join(process.cwd(), "public", "pdf", "challans")
+      const companyFolder = this.findMatchingCompanyFolder(this.company.name, challansBase)
+
+      if (!companyFolder) {
+        this.logger.log(`No challan management folder found for ${this.company.name}`)
+        return []
+      }
+
+      // Prefer the PaymentHistory subfolder; fall back to the company root
+      const paymentHistoryFolder = path.join(companyFolder, "PaymentHistory")
+      const searchFolder = fs.existsSync(paymentHistoryFolder) ? paymentHistoryFolder : companyFolder
+
+      const pdfFiles = fs
+        .readdirSync(searchFolder)
+        .filter((f) => f.toLowerCase().endsWith(".pdf"))
+        .map((f) => path.join(searchFolder, f))
+
+      if (pdfFiles.length === 0) {
+        this.logger.log(`No PDF files found in ${searchFolder}`)
+        return []
+      }
+
+      this.logger.log(`Found ${pdfFiles.length} challan PDF(s) in ${searchFolder}`)
+
+      // Reusable field extractor matching the pattern used in downloadChallanPayment.ts
+      const extractField = (label: string, text: string): string => {
+        const regex = new RegExp(`${label}\\s*[:]?\\s*([^\\n]+)`, "i")
+        const match = text.match(regex)
+        return match && match[1] ? match[1].trim() : ""
+      }
+
+      const challanDetails: any[] = []
+
+      for (const pdfPath of pdfFiles) {
+        try {
+          this.logger.log(`Parsing: ${path.basename(pdfPath)}`)
+          const dataBuffer = fs.readFileSync(pdfPath)
+          const pdfData = await pdfParse(dataBuffer)
+          const text = pdfData.text
+
+          const bsr = extractField("BSR code", text)
+          const csn = extractField("Challan No", text)
+          // Date is already "DD-MMM-YYYY" (e.g. "04-Dec-2025").
+          // formatDate() returns the string unchanged when it is not 8 chars,
+          // so we can store it as-is and it will be typed directly into the portal.
+          const date = extractField("Date of Deposit", text)
+          const amountRaw =
+            extractField("Amount \\(in Rs\\.\\)", text) || extractField("Amount", text)
+          const challanAmount = parseFloat(amountRaw.replace(/[₹,\s]/g, "")) || 0
+
+          if (bsr && csn && date && challanAmount) {
+            challanDetails.push({ bsr, date, csn, challanAmount })
+            this.logger.log(
+              `  ✓ BSR=${bsr}  CSN=${csn}  Date=${date}  Amount=${challanAmount}`
+            )
+          } else {
+            this.logger.log(
+              `  ⚠ Skipped ${path.basename(pdfPath)} – missing fields ` +
+                `(bsr=${bsr}, csn=${csn}, date=${date}, amount=${challanAmount})`
+            )
+          }
+        } catch (err: any) {
+          this.logger.log(`  ✗ Error parsing ${path.basename(pdfPath)}: ${err.message}`)
+        }
+      }
+
+      this.logger.log(`Total challan details from PDFs: ${challanDetails.length}`)
+      return challanDetails
+    } catch (error: any) {
+      this.logger.log(`Error in getAllChallanDetailsFromPaymentPdfs: ${error.message}`)
+      return []
     }
   }
 
@@ -257,8 +342,15 @@ export default class NoticeDownloaderChallanStatus {
     try {
       this.logger.log(`Starting challan status query for ${this.company.name}`)
 
-      // Get all challan details for the company
-      const challanDetails = await this.getAllChallanDetailsForCompany()
+      // Try challan management PDFs first (public/pdf/challans/<Company>/PaymentHistory/)
+      let challanDetails = await this.getAllChallanDetailsFromPaymentPdfs()
+
+      if (challanDetails.length === 0) {
+        this.logger.log("No PDF challan data found – falling back to TDS return txt files...")
+        challanDetails = await this.getAllChallanDetailsForCompany()
+      } else {
+        this.logger.log(`Using ${challanDetails.length} challan(s) extracted from PDFs`)
+      }
 
       if (challanDetails.length === 0) {
         this.logger.log("No challan details found for this company")

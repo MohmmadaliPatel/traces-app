@@ -102,14 +102,19 @@ function DeducteeMastersPage() {
                 throw new Error(`Missing required fields (PAN, Email) in row ${index + 1}`)
               }
 
+              const rawEmail = String(row["Email"]).trim().toLowerCase()
+              const rawName = row["Name"] ? String(row["Name"]).trim() : undefined
+
               return {
                 pan: String(row["PAN"]).trim().toUpperCase(),
-                email: String(row["Email"]).trim().toLowerCase(),
-                name: row["Name"] ? String(row["Name"]).trim() : undefined,
+                // Strip angle-bracket wrappers e.g. "John Doe <john@x.com>" → "john@x.com"
+                email: rawEmail.replace(/^.*<(.+)>.*$/, "$1").trim(),
+                // Strip < > characters from names that come from some Excel exports
+                name: rawName ? rawName.replace(/[<>]/g, "").trim() || undefined : undefined,
               }
             }
           )
-
+          console.log(masters)
           // Bulk upload
           handleBulkUpload(masters)
         } catch (error: any) {

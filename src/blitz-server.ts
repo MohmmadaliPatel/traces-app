@@ -85,6 +85,7 @@ const securityMiddleware: any = async (req: NextApiRequest, res: NextApiResponse
       "/api/rpc/upsertNotices",
       "/api/rpc/upsertResponses",
       "/api/rpc/upsertProcedding",
+      "/api/rpc/bulkUploadDeducteeMasters",
     ]
 
     const shouldSkipBodyValidation = skipBodyValidationEndpoints.some((endpoint) =>
@@ -108,6 +109,14 @@ const securityMiddleware: any = async (req: NextApiRequest, res: NextApiResponse
     ].filter(Boolean)
 
     if (validationChecks.length > 0) {
+      console.error(
+        `[WAF] Blocked request to ${req.url} — failed checks: ${validationChecks.join(", ")}`,
+        {
+          ip: (req.headers["x-forwarded-for"] as string) || req.socket.remoteAddress,
+          method: req.method,
+          body: req.body ? JSON.stringify(req.body).slice(0, 500) : "(empty)",
+        }
+      )
       res.status(403).json({
         message: `Invalid ${validationChecks.join(", ")} detected`,
       })

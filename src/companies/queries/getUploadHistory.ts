@@ -5,7 +5,7 @@ import { z } from "zod"
 const GetUploadHistorySchema = z.object({
   skip: z.number().optional(),
   take: z.number().optional(),
-  type: z.enum(["conso", "form16", "form16a", "challan_status"]).optional(),
+  type: z.enum(["conso", "form16", "form16a", "challan_status", "justification"]).optional(),
   batchId: z.number().optional(),
 })
 

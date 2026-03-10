@@ -101,6 +101,13 @@ const Layout: BlitzLayout<{ title?: string; children?: React.ReactNode }> = ({
       notificationCounts.assessee
     ),
     getItem(
+      "Justification Report",
+      "justification-report",
+      <FileTextOutlined />,
+      undefined,
+      notificationCounts.assessee
+    ),
+    getItem(
       "form-16",
       "form-16",
       <TeamOutlined />,
