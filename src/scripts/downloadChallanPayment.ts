@@ -499,7 +499,7 @@ export async function downloadChallanPayments(
       console.log("Selecting assessment year:", assessmentYear)
       // Click on the assessment year select by clicking on its value display
       await page.evaluate(() => {
-        const selectValue = document.getElementById("mat-select-value-17")
+        const selectValue = document.getElementById("mat-select-value-8")
         if (selectValue) {
           const parentSelect = selectValue.closest("mat-select")
           if (parentSelect) {
