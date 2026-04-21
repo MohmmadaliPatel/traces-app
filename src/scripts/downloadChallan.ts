@@ -29,16 +29,98 @@ async function login(page: Page, username: string, password: string) {
   } catch (error) {}
 }
 
+/** Open e-File → e-Pay Tax from the header menu (no hash navigation). */
+async function navigateToEpayTaxViaMenu(page: Page) {
+  await waitForSecs(2000)
+  await page.evaluate(() => {
+    try {
+      window["$"]?.("#securityReasonPopup")?.modal?.("hide")
+    } catch {
+      /* ignore */
+    }
+  })
+
+  await page.waitForSelector("#e-File", { visible: true, timeout: 60000 })
+  await page.click("#e-File")
+
+  await page.waitForSelector('.mat-mdc-menu-panel[role="menu"]', { visible: true, timeout: 15000 })
+  await waitForSecs(400)
+
+  const clicked = await page.evaluate(() => {
+    const items = Array.from(
+      document.querySelectorAll('button.mat-mdc-menu-item[role="menuitem"]')
+    ) as HTMLElement[]
+    const epay = items.find((b) => {
+      const label = (b.textContent || "").replace(/\s+/g, " ").trim()
+      if (!/e-Pay\s*Tax/i.test(label)) return false
+      // Prefer leaf item, not "Income Tax Forms" submenu trigger
+      if (b.classList.contains("mat-mdc-menu-item-submenu-trigger")) return false
+      return true
+    })
+    if (epay) {
+      epay.click()
+      return true
+    }
+    const fallback = items.find((b) => /e-Pay\s*Tax/i.test((b.textContent || "").replace(/\s+/g, " ").trim()))
+    if (fallback) {
+      fallback.click()
+      return true
+    }
+    return false
+  })
+
+  if (!clicked) {
+    throw new Error(
+      'Opened e-File menu but could not find "e-Pay Tax" (button.mat-mdc-menu-item).'
+    )
+  }
+
+  await waitForSecs(3000)
+}
+
+export type DownloadChallansOptions = {
+  /**
+   * Old Income-tax Act (actType O): portal goes straight to Continue — do not select
+   * "Income-tax Act, 2025" (`#mat-radio-0`). New Act (N): select that radio, then Continue.
+   * Omit or false when any created challan used the 2025 regime.
+   */
+  skipNewActRadio?: boolean
+}
+
+async function clickContinueAfterEpayLanding(page: Page) {
+  await page.waitForSelector(
+    'button.large-button-primary.iconsAfter.nextIcon[type="button"]',
+    { visible: true, timeout: 120000 }
+  )
+  const continueClicked = await page.evaluate(() => {
+    const btn = Array.from(
+      document.querySelectorAll("button.large-button-primary.iconsAfter.nextIcon")
+    ).find((b) => b.textContent?.trim() === "Continue") as HTMLButtonElement | undefined
+    if (btn) {
+      btn.click()
+      return true
+    }
+    return false
+  })
+  if (!continueClicked) {
+    await page.click('button.large-button-primary.iconsAfter.nextIcon[type="button"]')
+  }
+}
+
 export async function downloadChallans(
   Username: string,
   Password: string,
   companyName: string,
-  downloadCount?: number
+  downloadCount?: number,
+  options?: DownloadChallansOptions
 ) {
+  const skipNewActRadio = options?.skipNewActRadio === true
+
   console.log("USERNAME", Username)
   console.log("PASSWORD", Password)
   console.log("COMPANY NAME", companyName)
   console.log("NUMBER OF CHALLANS TO DOWNLOAD:", downloadCount)
+  console.log("e-pay flow: skip Income-tax Act 2025 radio (old-act only):", skipNewActRadio)
 
   // Launch a headless browser
   const browser = await puppeteer.launch({
@@ -74,17 +156,21 @@ export async function downloadChallans(
   // Click a button that triggers XHR requests
   await login(page, Username, Password)
 
-  await page.evaluate(() => {
-    setTimeout(() => {
-      location.href = "#/dashboard/e-pay-tax/e-pay-tax-dashboard"
-      setTimeout(() => {
-        window["$"]("#securityReasonPopup").modal("hide")
-      }, 1000)
-    }, 5000)
-  })
+  await navigateToEpayTaxViaMenu(page)
+  console.log("Waiting for the radio button to be visible(CHALLANS)")
+  // Old regime (pre-2025): Continue only. New regime (2025): pick Income-tax Act 2025 radio, then Continue.
+  if (skipNewActRadio) {
+    console.log("Old Act — skipping #mat-radio-0, clicking Continue only")
+    await clickContinueAfterEpayLanding(page)
+  } else {
+    console.log("Waiting for Income-tax Act 2025 radio (#mat-radio-0)")
+    await page.waitForSelector("#mat-radio-0", { visible: true, timeout: 120000 })
+    await page.click("#mat-radio-0")
+    console.log("Clicked on the radio button (Income-tax Act 2025)")
+    await clickContinueAfterEpayLanding(page)
+  }
   await page.waitForSelector(".mdc-tab__text-label")
   const elements = await page.$$(".mdc-tab__text-label")
-
   // The original click might not work due to detached DOM or shadow roots.
   // We'll re-query for the tab using explicit selector and evaluate click directly in the browser context.
   await page.evaluate(() => {

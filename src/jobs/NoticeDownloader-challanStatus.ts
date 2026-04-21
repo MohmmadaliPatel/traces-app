@@ -9,6 +9,7 @@ import * as fs from "fs"
 import * as path from "path"
 import * as XLSX from "xlsx"
 import pdfParse from "pdf-parse"
+import { loginWithTracesApiAndPreauth, traces61DedUrl } from "./traces"
 puppeteer.use(StealthPlugin())
 
 export default class NoticeDownloaderChallanStatus {
@@ -371,76 +372,21 @@ export default class NoticeDownloaderChallanStatus {
       const page = await browser.newPage()
       await page.setViewport({ width: 1920, height: 1080 })
 
-      // Step 1: Go to login page
-      this.logger.log("Navigating to login page...")
-      await page.goto("https://www.tdscpc.gov.in/app/login.xhtml?usr=Ded", {
-        waitUntil: "networkidle2",
+      this.logger.log("TRACES API login + preauth (traces61)…")
+      await loginWithTracesApiAndPreauth(page, {
+        userId: this.company.user_id,
+        password: this.company.password,
+        tan: this.company.tan,
       })
-
-      // Step 2: Fill in login credentials
-      this.logger.log("Filling login credentials...")
-      await page.waitForSelector("#userId")
-      await page.type("#userId", this.company.user_id)
-      await page.type("#psw", this.company.password)
-      await page.type("#tanpan", this.company.tan)
-
-      await waitForSecs(2000)
-
-      // Step 3: Handle captcha
-      this.logger.log("Handling captcha...")
-      const captchaElement = await page.$("#captchaImg")
-      if (!captchaElement) {
-        throw new Error("Captcha element not found")
-      }
-      const captchaScreenshot = await captchaElement.screenshot()
-      // Convert Uint8Array to Buffer (Puppeteer returns Uint8Array in newer versions)
-      const captchaImageBuffer = Buffer.from(captchaScreenshot)
-
-      const isManualCaptcha = process.env.IS_CAPTCHA_MANUAL === "true"
-      let captchaValue
-
-      if (isManualCaptcha) {
-        // Manual captcha entry
-        const captchaPath = `./public/temp/captcha_${Date.now()}.png`
-        fs.writeFileSync(captchaPath, captchaImageBuffer as unknown as Uint8Array)
-        this.logger.log(`Captcha saved to ${captchaPath}`)
-
-        captchaValue = await new Promise((resolve) => {
-          const readline = require("readline").createInterface({
-            input: process.stdin,
-            output: process.stdout,
-          })
-          readline.question("Enter captcha: ", (answer: string) => {
-            readline.close()
-            resolve(answer)
-          })
-        })
-      } else {
-        // Automatic captcha decoding
-        const captchaBase64 = captchaImageBuffer.toString("base64")
-        const captchaResponse = await this.axiosClient.post(
-          process.env.SERVER_URL + "/captcha/decode",
-          { captcha: captchaBase64, isSuperAdmin: true }
-        )
-        captchaValue = captchaResponse.data.captcha
-      }
-
-      this.logger.log(`Captcha decoded: ${captchaValue}`)
-
-      // Step 4: Enter captcha and login
-      await page.type("#captcha", captchaValue)
-      await page.click("#clickLogin")
-
-      await waitForSecs(2000)
       this.logger.log("Login successful")
 
-      // Step 5: Navigate to challan status query page
+      // Navigate to challan status query page
       this.logger.log("Navigating to challan status query page...")
-      await page.goto("https://www.tdscpc.gov.in/app/ded/challanstatusquery.xhtml", {
+      await page.goto(traces61DedUrl("challanstatusquery.xhtml"), {
         waitUntil: "networkidle2",
       })
 
-      // Step 6: Click search particular
+      // Click search particular
       this.logger.log("Clicking search particular...")
       await page.waitForSelector("#searchParticular")
       await page.click("#searchParticular")

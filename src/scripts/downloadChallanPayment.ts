@@ -28,6 +28,55 @@ async function login(page: Page, username: string, password: string) {
   } catch (error) {}
 }
 
+/** Open e-File → e-Pay Tax from the header menu (no hash navigation). */
+async function navigateToEpayTaxViaMenu(page: Page) {
+  await waitForSecs(2000)
+  await page.evaluate(() => {
+    try {
+      window["$"]?.("#securityReasonPopup")?.modal?.("hide")
+    } catch {
+      /* ignore */
+    }
+  })
+
+  await page.waitForSelector("#e-File", { visible: true, timeout: 60000 })
+  await page.click("#e-File")
+
+  await page.waitForSelector('.mat-mdc-menu-panel[role="menu"]', { visible: true, timeout: 15000 })
+  await waitForSecs(400)
+
+  const clicked = await page.evaluate(() => {
+    const items = Array.from(
+      document.querySelectorAll('button.mat-mdc-menu-item[role="menuitem"]')
+    ) as HTMLElement[]
+    const epay = items.find((b) => {
+      const label = (b.textContent || "").replace(/\s+/g, " ").trim()
+      if (!/e-Pay\s*Tax/i.test(label)) return false
+      // Prefer leaf item, not "Income Tax Forms" submenu trigger
+      if (b.classList.contains("mat-mdc-menu-item-submenu-trigger")) return false
+      return true
+    })
+    if (epay) {
+      epay.click()
+      return true
+    }
+    const fallback = items.find((b) => /e-Pay\s*Tax/i.test((b.textContent || "").replace(/\s+/g, " ").trim()))
+    if (fallback) {
+      fallback.click()
+      return true
+    }
+    return false
+  })
+
+  if (!clicked) {
+    throw new Error(
+      'Opened e-File menu but could not find "e-Pay Tax" (button.mat-mdc-menu-item).'
+    )
+  }
+
+  await waitForSecs(3000)
+}
+
 /**
  * Parse challan receipt PDF and extract all details
  */
@@ -460,14 +509,30 @@ export async function downloadChallanPayments(
   // Click a button that triggers XHR requests
   await login(page, Username, Password)
 
-  await page.evaluate(() => {
-    setTimeout(() => {
-      location.href = "#/dashboard/e-pay-tax/e-pay-tax-dashboard"
-      setTimeout(() => {
-        window["$"]("#securityReasonPopup").modal("hide")
-      }, 1000)
-    }, 5000)
+  await navigateToEpayTaxViaMenu(page)
+  console.log("Waiting for the radio button to be visible(PAYMENT)")
+  // Click the mat-radio-button host, not #mat-radio-0-input: Material hides the native input
+  // (opacity/size), so visible checks and clicks on the input are unreliable (matches downloadChallan.ts).
+  await page.waitForSelector("#mat-radio-0", { visible: true })
+  await page.click("#mat-radio-0")
+  console.log("Clicked on the radio button(PAYMENT)")
+  await page.waitForSelector(
+    'button.large-button-primary.iconsAfter.nextIcon[type="button"]',
+    { visible: true }
+  )
+  const continueClicked = await page.evaluate(() => {
+    const btn = Array.from(
+      document.querySelectorAll("button.large-button-primary.iconsAfter.nextIcon")
+    ).find((b) => b.textContent?.trim() === "Continue") as HTMLButtonElement | undefined
+    if (btn) {
+      btn.click()
+      return true
+    }
+    return false
   })
+  if (!continueClicked) {
+    await page.click('button.large-button-primary.iconsAfter.nextIcon[type="button"]')
+  }
   await page.waitForSelector(".mdc-tab__text-label")
   const elements = await page.$$(".mdc-tab__text-label")
 

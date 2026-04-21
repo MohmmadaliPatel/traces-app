@@ -33,7 +33,9 @@ import getCompanies from "src/companies/queries/getCompanies"
 import getChallanData from "src/challan/queries/getChallanData"
 import upsertChallanData from "src/challan/mutations/upsertChallanData"
 import deleteChallanData from "src/challan/mutations/deleteChallanData"
-import { secCodes } from "src/challan/utils/secCodes"
+import { secCodes as oldSecCodes } from "src/challan/utils/secCodes"
+import { secCodes as newSecCodes } from "src/challan/utils/newSecCodes"
+import { parseIncomeTaxActCsv, type IncomeTaxActKind } from "src/challan/utils/incomeTaxAct"
 import dayjs from "dayjs"
 
 const { Option } = Select
@@ -64,6 +66,7 @@ const ChallanManagementPage: BlitzPage = () => {
   const [messageApi, contextHolder] = message.useMessage()
   const [selectedCompanyIds, setSelectedCompanyIds] = useState<number[]>([])
   const [assessmentYear, setAssessmentYear] = useState<string>("")
+  const [challanActType, setChallanActType] = useState<IncomeTaxActKind>("old")
   const [selectedSections, setSelectedSections] = useState<
     Array<{ sectionCode: string; amount: string }>
   >([])
@@ -165,6 +168,11 @@ const ChallanManagementPage: BlitzPage = () => {
       return
     }
 
+    const sectionsWithAct = validSections.map((s) => ({
+      ...s,
+      actType: challanActType,
+    }))
+
     setCreateLoading(true)
     try {
       for (const companyId of selectedCompanyIds) {
@@ -174,7 +182,7 @@ const ChallanManagementPage: BlitzPage = () => {
           body: JSON.stringify({
             companyId,
             assessmentYear,
-            sections: validSections,
+            sections: sectionsWithAct,
           }),
         })
 
@@ -339,14 +347,22 @@ const ChallanManagementPage: BlitzPage = () => {
             continue
           }
 
-          // Extract sections with amounts
-          const sections: Array<{ sectionCode: string; amount: string }> = []
+          const rowAct = parseIncomeTaxActCsv(row["Act"])
+
+          // Extract sections with amounts (exclude metadata columns)
+          const sections: Array<{ sectionCode: string; amount: string; actType: IncomeTaxActKind }> =
+            []
           const sectionHeaders = Object.keys(row).filter(
             (key) =>
-              !["Company Code", "Company Name", "Username", "Password", "Assessment Year"].includes(
-                key
-              ) &&
-              key.trim() !== "" && // Exclude empty headers
+              ![
+                "Company Code",
+                "Company Name",
+                "Username",
+                "Password",
+                "Assessment Year",
+                "Act",
+              ].includes(key) &&
+              key.trim() !== "" &&
               row[key]
           )
 
@@ -357,6 +373,7 @@ const ChallanManagementPage: BlitzPage = () => {
               sections.push({
                 sectionCode: trimmedHeader,
                 amount: amount.trim(),
+                actType: rowAct,
               })
             }
           })
@@ -617,12 +634,23 @@ const ChallanManagementPage: BlitzPage = () => {
           }
         >
           <Space direction="vertical" size="middle" style={{ width: "100%" }}>
-            <Input
-              placeholder="Assessment Year (e.g., 2026-27)"
-              value={assessmentYear}
-              onChange={(e) => setAssessmentYear(e.target.value)}
-              style={{ maxWidth: 300 }}
-            />
+            <Space wrap>
+              <Input
+                placeholder="Assessment Year (e.g., 2026-27)"
+                value={assessmentYear}
+                onChange={(e) => setAssessmentYear(e.target.value)}
+                style={{ maxWidth: 300 }}
+              />
+              <Select
+                style={{ minWidth: 280 }}
+                value={challanActType}
+                onChange={(v) => setChallanActType(v)}
+                placeholder="Income-tax Act (section list)"
+              >
+                <Option value="old">Old Act — pre-2025 regime (actType O)</Option>
+                <Option value="new">New Act — Income-tax Act, 2025 (actType N)</Option>
+              </Select>
+            </Space>
 
             {selectedSections.map((section, index) => (
               <Row key={index} gutter={16} align="middle">
@@ -638,7 +666,7 @@ const ChallanManagementPage: BlitzPage = () => {
                       return label.toLowerCase().includes(input.toLowerCase())
                     }}
                   >
-                    {secCodes.map((code) => (
+                    {(challanActType === "new" ? newSecCodes : oldSecCodes).map((code) => (
                       <Option key={code.sec_cd} value={code.sec_cd}>
                         {code.sec_cd} - {code.natr_pymnt_desc}
                       </Option>

@@ -3,7 +3,7 @@ import path from "path"
 import fs from "fs"
 import os from "os"
 import db from "db" // Import database to check for existing records
-import { getAxiostClient } from "../jobs/helper"
+import { loginWithTracesApiAndPreauth, traces61DedUrl } from "../jobs/traces"
 import pdfParse from "pdf-parse"
 
 // Utility function to wait for a specified time
@@ -55,63 +55,11 @@ async function loginToTdsPortal(credentials: {
     eventsEnabled: true,
   })
 
-  // Navigate to login page
-  await page.goto("https://www.tdscpc.gov.in/app/login.xhtml")
-  await page.type("#userId", credentials.userId)
-  await page.type("#psw", credentials.password)
-  await page.type("#tanpan", credentials.tan)
-
-  await delay(3000)
-
-  // Handle captcha
-  console.log("Handling captcha...")
-  const captchaElement = await page.$("#captchaImg")
-  if (!captchaElement) {
-    throw new Error("Captcha element not found")
-  }
-  const captchaScreenshot = await captchaElement.screenshot()
-  // Convert Uint8Array to Buffer (Puppeteer returns Uint8Array in newer versions)
-  const captchaImageBuffer = Buffer.from(captchaScreenshot)
-
-  const isManualCaptcha = process.env.IS_CAPTCHA_MANUAL === "true"
-  let captchaValue
-
-  if (isManualCaptcha) {
-    // Manual captcha entry
-    const captchaPath = `./public/temp/captcha_${Date.now()}.png`
-    fs.mkdirSync("./public/temp", { recursive: true })
-    fs.writeFileSync(captchaPath, captchaImageBuffer as unknown as Uint8Array)
-    console.log(`Captcha saved to ${captchaPath}`)
-
-    captchaValue = await new Promise((resolve) => {
-      const readline = require("readline").createInterface({
-        input: process.stdin,
-        output: process.stdout,
-      })
-      readline.question("Enter captcha: ", (answer: string) => {
-        readline.close()
-        resolve(answer)
-      })
-    })
-  } else {
-    // Automatic captcha decoding
-    const axiosClient = getAxiostClient()
-    const captchaBase64 = captchaImageBuffer.toString("base64")
-    const captchaResponse = await axiosClient.post(process.env.SERVER_URL + "/captcha/decode", {
-      captcha: captchaBase64,
-      isSuperAdmin: true,
-    })
-    captchaValue = captchaResponse.data.captcha
-  }
-
-  console.log(`Captcha decoded: ${captchaValue}`)
-
-  await page.focus("#captcha")
-  await page.type("#captcha", captchaValue as string)
-
-  await page.click("#clickLogin")
-  // Wait for navigation after login
-  await page.waitForNavigation({ timeout: 120000 }) // Increased timeout for manual captcha
+  await loginWithTracesApiAndPreauth(page, {
+    userId: credentials.userId,
+    password: credentials.password,
+    tan: credentials.tan,
+  })
   globalPage = page
   return globalPage
 }
@@ -276,7 +224,7 @@ export async function fetchTldcData({
     while (hasMorePages) {
       // Navigate to the DED inbox page (only needed for the first page)
       if (currentPage === 1) {
-        await page.goto("https://www.tdscpc.gov.in/app/ded/dedinbox.xhtml", {
+        await page.goto(traces61DedUrl("dedinbox.xhtml"), {
           waitUntil: "networkidle2",
         })
 

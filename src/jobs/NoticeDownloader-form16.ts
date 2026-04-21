@@ -20,6 +20,7 @@ import StealthPlugin from "puppeteer-extra-plugin-stealth"
 import * as XLSX from "xlsx"
 import { parseForm16AFile } from "src/utils/form16AParserExact"
 import { generateForm16APdf } from "src/utils/form16APdfGeneratorExact"
+import { loginWithTracesApiAndPreauth, traces61DedUrl } from "./traces"
 puppeteer.use(StealthPlugin())
 
 dayjs.extend(customParseFormat)
@@ -1511,112 +1512,20 @@ export default class NoticeDownloaderForm16 {
       const page = await browser.newPage()
       await page.setViewport({ width: 1920, height: 1080 })
 
-      // Step 1: Go to login page
-      this.logger.log("Navigating to login page...")
-      await page.goto("https://www.tdscpc.gov.in/app/login.xhtml?usr=Ded", {
-        waitUntil: "networkidle2",
+      this.logger.log("TRACES API login + preauth (traces61)…")
+      await loginWithTracesApiAndPreauth(page, {
+        userId: record.user_id,
+        password: record.password,
+        tan: record.tan,
       })
-
-      // Step 2: Fill in login credentials
-      this.logger.log("Filling login credentials...")
-      await page.waitForSelector("#userId")
-      await page.type("#userId", record.user_id)
-      await page.type("#psw", record.password)
-      await page.type("#tanpan", record.tan)
-
-      await waitForSecs(2000)
-
-      // Step 3: Get captcha image and decode it
-      this.logger.log("Decoding captcha...")
-      const captchaElement = await page.$("#captchaImg")
-      if (!captchaElement) {
-        throw new Error("Captcha element not found")
-      }
-      const captchaScreenshot = await captchaElement.screenshot()
-      // Convert Uint8Array to Buffer (Puppeteer returns Uint8Array in newer versions)
-      const captchaImageBuffer = Buffer.from(captchaScreenshot)
-
-      // Decode captcha using your captcha service
-      let captchaValue
-      const isManualCaptcha = process.env.IS_CAPTCHA_MANUAL === "true"
-
-      if (isManualCaptcha) {
-        // Save captcha for manual entry
-        const captchaPath = `./public/temp/captcha_${Date.now()}.png`
-        fs.writeFileSync(captchaPath, captchaImageBuffer)
-        this.logger.log(`Captcha saved to ${captchaPath}`)
-        captchaValue = await new Promise((resolve) => {
-          // You can implement manual captcha entry UI here
-          // For now, just prompt in console
-          const readline = require("readline").createInterface({
-            input: process.stdin,
-            output: process.stdout,
-          })
-          readline.question("Enter captcha: ", (answer: string) => {
-            readline.close()
-            resolve(answer)
-          })
-        })
-      } else {
-        // Use automatic captcha decoding
-        try {
-          const captchaBase64 = captchaImageBuffer.toString("base64")
-          const captchaResponse = await this.axiosClient.post(
-            process.env.SERVER_URL + "/captcha/decode",
-            { captcha: captchaBase64, isSuperAdmin: true }
-          )
-          captchaValue = captchaResponse.data.captcha
-        } catch (e) {
-          if (e.response && e.response.status === 502) {
-            let retryCount = 3
-            while (retryCount > 3) {
-              this.logger.log(
-                `Received 502 while decoding captcha, waiting 30 seconds before retrying... (Retry #${
-                  retryCount + 1
-                })`
-              )
-              await waitForSecs(30000)
-              try {
-                const retryCaptchaResponse = await this.axiosClient.post(
-                  process.env.SERVER_URL + "/captcha/decode",
-                  { captcha: captchaImageBuffer, isSuperAdmin: true }
-                )
-                captchaValue = retryCaptchaResponse.data.captcha
-                break // Success, break out of retry loop
-              } catch (retryError) {
-                if (retryError.response && retryError.response.status === 502) {
-                  retryCount++
-                  continue // Keep retrying
-                } else {
-                  this.logger.log("Error decoding captcha on retry: " + retryError.message)
-                  return
-                }
-              }
-            }
-          } else {
-            this.logger.log("Error decoding captcha: " + e.message)
-            return
-          }
-        }
-      }
-
-      this.logger.log(`Captcha decoded: ${captchaValue}`)
-
-      // Step 4: Enter captcha and click login
-      await page.type("#captcha", captchaValue)
-      await page.click("#clickLogin")
-
-      // Wait for navigation after login
-      await waitForSecs(2000)
       this.logger.log("Login successful")
 
-      // Step 5: Navigate to nsdlconsofile.xhtml
       this.logger.log("Navigating to consolidated file page...")
-      await page.goto("https://www.tdscpc.gov.in/app/ded/filedownload.xhtml", {
+      await page.goto(traces61DedUrl("filedownload.xhtml"), {
         waitUntil: "networkidle2",
       })
 
-      // Step 6: Select financial year, quarter, and form type
+      // Select financial year, quarter, and form type
 
       await waitForSecs(2000)
 
@@ -2041,77 +1950,18 @@ export default class NoticeDownloaderForm16 {
       const page = await browser.newPage()
       await page.setViewport({ width: 1920, height: 1080 })
 
-      // Step 1: Go to login page
-      this.logger.log("Navigating to login page...")
-      await page.goto("https://www.tdscpc.gov.in/app/login.xhtml?usr=Ded", {
-        waitUntil: "networkidle2",
+      this.logger.log("TRACES API login + preauth (traces61)…")
+      await loginWithTracesApiAndPreauth(page, {
+        userId: record.userId,
+        password: record.password,
+        tan: record.tan,
       })
-
-      // Step 2: Fill in login credentials
-      this.logger.log("Filling login credentials...")
-      await page.waitForSelector("#userId")
-      await page.type("#userId", record.userId)
-      await page.type("#psw", record.password)
-      await page.type("#tanpan", record.tan)
-
-      await waitForSecs(2000)
-
-      // Step 3: Get captcha image and decode it
-      this.logger.log("Decoding captcha...")
-      const captchaElement2 = await page.$("#captchaImg")
-      if (!captchaElement2) {
-        throw new Error("Captcha element not found")
-      }
-      const captchaScreenshot2 = await captchaElement2.screenshot()
-      // Convert Uint8Array to Buffer (Puppeteer returns Uint8Array in newer versions)
-      const captchaImageBuffer2 = Buffer.from(captchaScreenshot2)
-
-      // Decode captcha using your captcha service
-      let captchaValue
-      const isManualCaptcha = process.env.IS_CAPTCHA_MANUAL === "true"
-
-      if (isManualCaptcha) {
-        // Save captcha for manual entry
-        const captchaPath = `./public/temp/captcha_${Date.now()}.png`
-        fs.writeFileSync(captchaPath, captchaImageBuffer2)
-        this.logger.log(`Captcha saved to ${captchaPath}`)
-        captchaValue = await new Promise((resolve) => {
-          // You can implement manual captcha entry UI here
-          // For now, just prompt in console
-          const readline = require("readline").createInterface({
-            input: process.stdin,
-            output: process.stdout,
-          })
-          readline.question("Enter captcha: ", (answer: string) => {
-            readline.close()
-            resolve(answer)
-          })
-        })
-      } else {
-        // Use automatic captcha decoding
-        const captchaBase64 = captchaImageBuffer2.toString("base64")
-        const captchaResponse = await this.axiosClient.post(
-          process.env.SERVER_URL + "/captcha/decode",
-          { captcha: captchaBase64, isSuperAdmin: true }
-        )
-        captchaValue = captchaResponse.data.captcha
-      }
-
-      this.logger.log(`Captcha decoded: ${captchaValue}`)
-
-      // Step 4: Enter captcha and click login
-      await page.type("#captcha", captchaValue)
-      await page.click("#clickLogin")
-
-      // Wait for navigation after login
-      await waitForSecs(2000)
       this.logger.log("Login successful")
 
-      // Step 5: Navigate to appropriate form page based on form16Type
       const isForm16A = this.form16Type === "form16a"
       const formUrl = isForm16A
-        ? "https://www.tdscpc.gov.in/app/ded/download16a.xhtml"
-        : "https://www.tdscpc.gov.in/app/ded/download16.xhtml"
+        ? traces61DedUrl("download16a.xhtml")
+        : traces61DedUrl("download16.xhtml")
 
       this.logger.log(`Navigating to ${isForm16A ? "Form 16A" : "Form 16"} download page...`)
       await page.goto(formUrl, {

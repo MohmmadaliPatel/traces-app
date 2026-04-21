@@ -1,8 +1,7 @@
 import puppeteer from "puppeteer"
 import path from "path"
 import os from "os"
-import fs from "fs"
-import { getAxiostClient } from "../jobs/helper"
+import { loginWithTracesApiAndPreauth, traces61DedUrl } from "../jobs/traces"
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -32,60 +31,12 @@ async function loginToTdsPortal(credentials: {
 
   const page = await browser.newPage()
 
-  // Navigate to login page
-  await page.goto("https://www.tdscpc.gov.in/app/login.xhtml")
-  await page.type("#userId", credentials.userId)
-  await page.type("#psw", credentials.password)
-  await page.type("#tanpan", credentials.tan)
+  await loginWithTracesApiAndPreauth(page, {
+    userId: credentials.userId,
+    password: credentials.password,
+    tan: credentials.tan,
+  })
 
-  await delay(3000)
-
-  // Handle captcha
-  console.log("Handling captcha...")
-  const captchaElement = await page.$("#captchaImg")
-  if (!captchaElement) {
-    throw new Error("Captcha element not found")
-  }
-  const captchaScreenshot = await captchaElement.screenshot()
-  const captchaImageBuffer = Buffer.from(captchaScreenshot)
-
-  const isManualCaptcha = process.env.IS_CAPTCHA_MANUAL === "true"
-  let captchaValue
-
-  if (isManualCaptcha) {
-    const captchaPath = `./public/temp/captcha_${Date.now()}.png`
-    fs.mkdirSync("./public/temp", { recursive: true })
-    fs.writeFileSync(captchaPath, captchaImageBuffer as unknown as Uint8Array)
-    console.log(`Captcha saved to ${captchaPath}`)
-
-    captchaValue = await new Promise((resolve) => {
-      const readline = require("readline").createInterface({
-        input: process.stdin,
-        output: process.stdout,
-      })
-      readline.question("Enter captcha: ", (answer: string) => {
-        readline.close()
-        resolve(answer)
-      })
-    })
-  } else {
-    const axiosClient = getAxiostClient()
-    const captchaBase64 = captchaImageBuffer.toString("base64")
-    const captchaResponse = await axiosClient.post(process.env.SERVER_URL + "/captcha/decode", {
-      captcha: captchaBase64,
-      isSuperAdmin: true,
-    })
-    captchaValue = captchaResponse.data.captcha
-  }
-
-  console.log(`Captcha decoded: ${captchaValue}`)
-
-  await page.focus("#captcha")
-  await page.type("#captcha", captchaValue as string)
-
-  await page.click("#clickLogin")
-  await page.waitForNavigation({ timeout: 60000 })
-  
   globalPage = page
   return globalPage
 }
@@ -147,7 +98,7 @@ export async function fetchOutstandingDemand({
 
     // Navigate to outstanding demand page (API will be called on page load)
     console.log("📄 Navigating to Outstanding Demand page...")
-    await page.goto("https://www.tdscpc.gov.in/app/ded/outstandingdemand.xhtml", {
+    await page.goto(traces61DedUrl("outstandingdemand.xhtml"), {
       waitUntil: "networkidle2",
       timeout: 60000,
     })

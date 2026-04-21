@@ -1,7 +1,9 @@
 import { wrapper } from "axios-cookiejar-support"
 import { CookieJar } from "tough-cookie"
 import axios from "axios"
-import { secCodes } from "../challan/utils/secCodes"
+import { secCodes as oldSecCodes } from "../challan/utils/secCodes"
+import { secCodes as newSecCodes } from "../challan/utils/newSecCodes"
+import type { IncomeTaxActKind } from "../challan/utils/incomeTaxAct"
 import { downloadChallans } from "./downloadChallan"
 const axiosRetry = require("axios-retry").default
 
@@ -33,6 +35,8 @@ const axiosClient = wrapper(
   } as any) as any
 )
 axiosRetry(axiosClient, { retries: 3 })
+
+
 
 async function loadLoginPage() {
   try {
@@ -253,13 +257,23 @@ function price_in_words(price: any): string {
   return str
 }
 
+export type { IncomeTaxActKind } from "../challan/utils/incomeTaxAct"
+
 interface CreateChallanParams {
   companyName: string
   companyCode: string
   username: string
   password: string
   assessmentYear: string
-  sections: Array<{ sectionCode: string; amount: string }>
+  sections: Array<{ sectionCode: string; amount: string; actType?: IncomeTaxActKind }>
+}
+
+function actKindToPortalCode(actType: IncomeTaxActKind | undefined): "O" | "N" {
+  return actType === "new" ? "N" : "O"
+}
+
+function secCodesForAct(actType: IncomeTaxActKind | undefined) {
+  return actType === "new" ? newSecCodes : oldSecCodes
 }
 
 export async function createChallan(params: CreateChallanParams) {
@@ -269,6 +283,13 @@ export async function createChallan(params: CreateChallanParams) {
   console.log("PASSWORD", password)
   console.log("ASSESSMENT YEAR", assessmentYear)
   console.log("SECTIONS", sections)
+
+  // await downloadChallans(
+  //   username,
+  //   password,
+  //   companyName || `${username}_${companyCode}`,
+  //   1
+  // )
 
   await login(username.toUpperCase(), Buffer.from(password).toString("base64"))
 
@@ -292,11 +313,13 @@ export async function createChallan(params: CreateChallanParams) {
   console.log("RES", res.data)
 
   for (const section of sections) {
-    const { sectionCode, amount } = section
+    const { sectionCode, amount, actType } = section
+    const portalAct = actKindToPortalCode(actType)
+    const secTable = secCodesForAct(actType)
     try {
-      console.log(`Creating challan for ${sectionCode} ${amount}`)
-      const secCodeData = secCodes.find((s) => s.sec_cd.trim() === sectionCode.trim())
-
+      console.log(`Creating challan for ${sectionCode} ${amount} (Act: ${portalAct})`)
+      const secCodeData = secTable.find((s) => s.sec_cd.trim() === sectionCode.trim())
+      console.log("SEC CODE DATA", secCodeData)
       if (!secCodeData) {
         results.push({
           sectionCode,
@@ -317,19 +340,23 @@ export async function createChallan(params: CreateChallanParams) {
         formData: {
           pan: username.toUpperCase(),
           tileId: "12",
-          majorHead: "0020",
+          majorHead: "0021",
           minorHead: 200,
           majorSlNum: "2",
           minorSlNum: "13",
-          basicTax: Tax,
+          basicTax: Number(Tax),
           surCharge: 0,
           eduCess: 0,
           interest: 0,
           penalty: 0,
           others: 0,
-          totalAmt: totalAmt,
-          assmentYear: assessmentYear,
-          totalAmtWord: `Rupees ${price_in_words(totalAmt)} Only`,
+          totalAmt: Number(totalAmt),
+          ...(actType === "new"
+            ? { taxYear: assessmentYear }
+            : { assmentYear: assessmentYear }),
+          actType: portalAct,
+          // Portal expects sentence-style words (e.g. "Rupees one thousand Only"), not title case.
+          totalAmtWord: `Rupees ${String(price_in_words(totalAmt)).trim().toLowerCase()} Only`,
           subPayMode: "",
           bankCd: "",
           natrPymntDesc: natr_pymnt_desc,
@@ -338,23 +365,24 @@ export async function createChallan(params: CreateChallanParams) {
           pageName: "addTaxBreakupDetails",
           createdByUser: username.toUpperCase(),
         },
+        createdByUser: username.toUpperCase(),
       }
-
+      console.log("DRAFT DATA 1", draftData)
       const res = await axiosClient.post(
         "https://eportal.incometax.gov.in/iec/paymentapi/auth/challan/savedraft",
         draftData
       )
       draftData.formData.pymntRefNum = res.data.pymntRefNum
       draftData.formData.paymentMode = "NER"
-
+      console.log("DRAFT DATA 2")
       await axiosClient.post(
         "https://eportal.incometax.gov.in/iec/paymentapi/auth/challan/savedraft",
         draftData
       )
-      draftData.formData.bankCode = ""
+      draftData.formData.bankCode = "RBIS"
       draftData.formData.subMinorHd = ""
       draftData.formData.loginType = "post"
-
+      console.log("DRAFT DATA 3")
       const response = await axiosClient.post(
         "https://eportal.incometax.gov.in/iec/paymentapi/auth/challan/create",
         {
@@ -367,9 +395,11 @@ export async function createChallan(params: CreateChallanParams) {
             minorHead: draftData.formData.minorHead,
             surCharge: draftData.formData.surCharge,
             totalAmt: draftData.formData.totalAmt,
-            assmentYear: draftData.formData.assmentYear,
+            ...(actType === "new"
+              ? { taxYear: assessmentYear }
+              : { assmentYear: assessmentYear }),
             totalAmtWord: draftData.formData.totalAmtWord,
-            bankCode: "",
+            bankCode: "RBIS",
             basicTax: draftData.formData.basicTax,
             eduCess: draftData.formData.eduCess,
             interest: draftData.formData.interest,
@@ -381,13 +411,14 @@ export async function createChallan(params: CreateChallanParams) {
             majorSlNum: draftData.formData.majorSlNum,
             minorSlNum: draftData.formData.minorSlNum,
             subMinorHd: "",
+            actType: portalAct,
             createdByUser: draftData.formData.createdByUser,
           },
         }
       )
 
       console.log(`Challan created for ${sectionCode} ${amount}`)
-
+      console.log("RESPONSE", response.data)
       results.push({
         sectionCode,
         sectionDesc: sec_desc,
@@ -411,13 +442,19 @@ export async function createChallan(params: CreateChallanParams) {
   const successfulCount = results.filter((r) => r.success).length
 
   if (successfulCount > 0) {
-    console.log(`Downloading ${successfulCount} challans...`)
+    const anySuccessfulNewAct = sections.some(
+      (s, i) => results[i]?.success === true && s.actType === "new"
+    )
+    console.log(
+      `Downloading ${successfulCount} challan(s); Income-tax Act 2025 radio: ${anySuccessfulNewAct ? "yes" : "no (old only)"}`
+    )
     try {
       await downloadChallans(
         username,
         password,
         companyName || `${username}_${companyCode}`,
-        successfulCount
+        successfulCount,
+        { skipNewActRadio: !anySuccessfulNewAct }
       )
       console.log("Challans downloaded successfully")
     } catch (error) {
