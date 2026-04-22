@@ -1,5 +1,9 @@
 import puppeteer from "puppeteer"
-import { loginWithTracesApiAndPreauth, traces61DedUrl } from "../jobs/traces"
+import {
+  loginWithTracesApiAndPreauth,
+  rewriteTracesNewPortalUrlToTraces61,
+  traces61DedUrl,
+} from "../jobs/traces"
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -29,11 +33,15 @@ async function loginToTdsPortal(credentials: {
 
   const page = await browser.newPage()
 
-  await loginWithTracesApiAndPreauth(page, {
-    userId: credentials.userId,
-    password: credentials.password,
-    tan: credentials.tan,
-  })
+  await loginWithTracesApiAndPreauth(
+    page,
+    {
+      userId: credentials.userId,
+      password: credentials.password,
+      tan: credentials.tan,
+    },
+    { redirectGuard: false }
+  )
 
   globalPage = page
   return globalPage
@@ -92,7 +100,12 @@ export async function fetchReturnStatus({
 
     // Allow all requests to continue
     page.on("request", (request: any) => {
-      request.continue()
+      const url = rewriteTracesNewPortalUrlToTraces61(request.url())
+      if (url !== request.url()) {
+        request.continue({ url })
+      } else {
+        request.continue()
+      }
     })
 
     // Navigate to return status page

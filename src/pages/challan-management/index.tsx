@@ -35,7 +35,10 @@ import upsertChallanData from "src/challan/mutations/upsertChallanData"
 import deleteChallanData from "src/challan/mutations/deleteChallanData"
 import { secCodes as oldSecCodes } from "src/challan/utils/secCodes"
 import { secCodes as newSecCodes } from "src/challan/utils/newSecCodes"
-import { parseIncomeTaxActCsv, type IncomeTaxActKind } from "src/challan/utils/incomeTaxAct"
+import {
+  parseIncomeTaxActCsv,
+  type IncomeTaxActKind,
+} from "src/challan/utils/incomeTaxAct"
 import dayjs from "dayjs"
 
 const { Option } = Select
@@ -73,12 +76,14 @@ const ChallanManagementPage: BlitzPage = () => {
   const [createLoading, setCreateLoading] = useState(false)
   const [downloadLoading, setDownloadLoading] = useState(false)
   const [downloadPaymentLoading, setDownloadPaymentLoading] = useState(false)
+  const [downloadGeneratedChallansLoading, setDownloadGeneratedChallansLoading] = useState(false)
   const [isModalVisible, setIsModalVisible] = useState(false)
   const [editingRecord, setEditingRecord] = useState<ChallanDataType | null>(null)
   const [form] = Form.useForm()
   const [paymentDateRange, setPaymentDateRange] = useState<[string, string] | null>(null)
   const [paymentAssessmentYear, setPaymentAssessmentYear] = useState<string>("")
   const [paymentType, setPaymentType] = useState<string>("")
+  const [paymentIncomeTaxAct, setPaymentIncomeTaxAct] = useState<IncomeTaxActKind>("old")
   const [csvProcessing, setCsvProcessing] = useState(false)
   const [csvProgress, setCsvProgress] = useState<{
     current: number
@@ -250,6 +255,7 @@ const ChallanManagementPage: BlitzPage = () => {
             toDate: paymentDateRange?.[1],
             assessmentYear: paymentAssessmentYear || undefined,
             paymentType: paymentType || undefined,
+            incomeTaxAct: paymentIncomeTaxAct,
           }),
         })
 
@@ -264,6 +270,42 @@ const ChallanManagementPage: BlitzPage = () => {
       messageApi.error(error.message || "Failed to download challan payments")
     } finally {
       setDownloadPaymentLoading(false)
+    }
+  }
+
+  const handleDownloadGeneratedChallans = async () => {
+    if (selectedCompanyIds.length === 0) {
+      messageApi.error("Please select at least one company")
+      return
+    }
+
+    setDownloadGeneratedChallansLoading(true)
+    try {
+      for (const companyId of selectedCompanyIds) {
+        const response = await fetch("/api/challan/download-generated-challans", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            companyId,
+            fromDate: paymentDateRange?.[0],
+            toDate: paymentDateRange?.[1],
+            assessmentYear: paymentAssessmentYear || undefined,
+            paymentType: paymentType || undefined,
+            incomeTaxAct: paymentIncomeTaxAct,
+          }),
+        })
+
+        const data = await response.json()
+        if (data.success) {
+          messageApi.success(`Generated challans downloaded for company ${companyId}`)
+        } else {
+          messageApi.error(`Failed to download generated challans for company ${companyId}`)
+        }
+      }
+    } catch (error: any) {
+      messageApi.error(error.message || "Failed to download generated challans")
+    } finally {
+      setDownloadGeneratedChallansLoading(false)
     }
   }
 
@@ -714,19 +756,19 @@ const ChallanManagementPage: BlitzPage = () => {
           </Space>
         </Card>
 
-        {/* Download Payment History Card */}
+        {/* e-Pay: Payment History & Generated Challans (shared filters) */}
         <Card
           title={
             <Space>
               <CloudDownloadOutlined />
-              <span>Download Payment History</span>
+              <span>e-Pay downloads (filtered)</span>
             </Space>
           }
         >
           <Space direction="vertical" size="middle" style={{ width: "100%" }}>
             <Alert
-              message="Download Payment History"
-              description="Download challan payment history for selected companies with optional filters."
+              message="Payment History & Generated Challans"
+              description="Use the same optional filters below, then download either the Payment History tab or the Generated Challans tab from TRACES e-Pay."
               type="info"
               showIcon
             />
@@ -743,6 +785,22 @@ const ChallanManagementPage: BlitzPage = () => {
                     onChange={(e) => setPaymentAssessmentYear(e.target.value)}
                     style={{ width: "100%" }}
                   />
+                </Space>
+              </Col>
+
+              <Col span={12}>
+                <Space direction="vertical" size="small" style={{ width: "100%" }}>
+                  <div>
+                    <strong>Income-tax Act:</strong>
+                  </div>
+                  <Select
+                    style={{ width: "100%" }}
+                    value={paymentIncomeTaxAct}
+                    onChange={(v) => setPaymentIncomeTaxAct(v)}
+                  >
+                    <Option value="old">Income-tax Act, 1961</Option>
+                    <Option value="new">Income-tax Act, 2025</Option>
+                  </Select>
                 </Space>
               </Col>
 
@@ -787,15 +845,23 @@ const ChallanManagementPage: BlitzPage = () => {
               />
             </Space>
 
-            <Space>
+            <Space wrap>
               <Button
                 type="primary"
                 icon={<CloudDownloadOutlined />}
                 onClick={handleDownloadPayments}
                 loading={downloadPaymentLoading}
-                disabled={selectedCompanyIds.length === 0}
+                disabled={selectedCompanyIds.length === 0 || downloadGeneratedChallansLoading}
               >
                 Download Payment History
+              </Button>
+              <Button
+                icon={<CloudDownloadOutlined />}
+                onClick={handleDownloadGeneratedChallans}
+                loading={downloadGeneratedChallansLoading}
+                disabled={selectedCompanyIds.length === 0 || downloadPaymentLoading}
+              >
+                Download Generated Challans
               </Button>
             </Space>
           </Space>

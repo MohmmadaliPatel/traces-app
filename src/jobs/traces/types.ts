@@ -6,5 +6,7 @@ export interface GenerateCaptchaResponse {
 export interface TracesLoginResponse {
   authTokenDto?: {
     accessToken?: string
+    /** Required for `preauthV2` (`RefreshToken` header). */
+    refreshToken?: string
   }
 }

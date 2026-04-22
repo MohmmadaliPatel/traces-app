@@ -18,7 +18,12 @@ import express, { response } from "express"
 import puppeteer from "puppeteer-extra"
 import StealthPlugin from "puppeteer-extra-plugin-stealth"
 import * as XLSX from "xlsx"
-import { loginWithTracesApiAndPreauth, traces61DedUrl } from "./traces"
+import {
+  loginWithTracesApiAndPreauth,
+  TRACES61_ORIGIN,
+  traces61DedUrl,
+  traces61Host,
+} from "./traces"
 puppeteer.use(StealthPlugin())
 
 dayjs.extend(customParseFormat)
@@ -963,14 +968,14 @@ export default class NoticeDownloaderConso {
 
       // Function to get captcha image
       const getCaptchaImage = async () => {
-        return this.axiosClient.get("https://www.tdscpc.gov.in/app/srv/GetCaptchaImg", {
+        return this.axiosClient.get(`${TRACES61_ORIGIN}/app/srv/GetCaptchaImg`, {
           headers: {
             accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
             "accept-encoding": "gzip, deflate, br, zstd",
             "accept-language": "en-US,en;q=0.9",
             connection: "keep-alive",
-            host: "www.tdscpc.gov.in",
-            referer: "https://www.tdscpc.gov.in/app/login.xhtml?usr=Ded",
+            host: traces61Host(),
+            referer: `${TRACES61_ORIGIN}/app/login.xhtml?usr=Ded`,
             "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"Windows"',
@@ -988,7 +993,7 @@ export default class NoticeDownloaderConso {
       const captchaResponse = await getCaptchaImage()
 
       const login = await this.axiosClient.get(
-        "https://www.tdscpc.gov.in/app/login.xhtml?usr=Ded",
+        `${TRACES61_ORIGIN}/app/login.xhtml?usr=Ded`,
         {
           headers: {
             accept:
@@ -996,7 +1001,7 @@ export default class NoticeDownloaderConso {
             "accept-encoding": "gzip, deflate, br, zstd",
             "accept-language": "en-US,en;q=0.9,en-IN;q=0.8",
             connection: "keep-alive",
-            host: "www.tdscpc.gov.in",
+            host: traces61Host(),
             "sec-ch-ua": '"Microsoft Edge";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"Windows"',
@@ -1117,7 +1122,7 @@ export default class NoticeDownloaderConso {
 
       // Attempt authentication with the captcha
       const res = await this.axiosClient.post(
-        "https://www.tdscpc.gov.in/app/j_security_check",
+        `${TRACES61_ORIGIN}/app/j_security_check`,
         formData,
         {
           headers: {
@@ -1128,9 +1133,9 @@ export default class NoticeDownloaderConso {
             "cache-control": "max-age=0",
             connection: "keep-alive",
             "content-type": "application/x-www-form-urlencoded",
-            host: "www.tdscpc.gov.in",
-            origin: "https://www.tdscpc.gov.in",
-            referer: "https://www.tdscpc.gov.in/app/login.xhtml?usr=Ded",
+            host: traces61Host(),
+            origin: TRACES61_ORIGIN,
+            referer: `${TRACES61_ORIGIN}/app/login.xhtml?usr=Ded`,
             "sec-ch-ua": '"Google Chrome";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"Windows"',
@@ -1145,7 +1150,7 @@ export default class NoticeDownloaderConso {
         }
       )
       // Final auth step
-      const res2 = await this.axiosClient.get("https://www.tdscpc.gov.in/app/", {
+      const res2 = await this.axiosClient.get(`${TRACES61_ORIGIN}/app/`, {
         headers: {
           Accept:
             "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -1153,7 +1158,7 @@ export default class NoticeDownloaderConso {
           "Accept-Language": "en-US,en;q=0.9",
           "Cache-Control": "max-age=0",
           Connection: "keep-alive",
-          Host: "www.tdscpc.gov.in",
+          Host: traces61Host(),
           "Sec-Fetch-Dest": "document",
           "Sec-Fetch-Mode": "navigate",
           "Sec-Fetch-Site": "cross-site",
@@ -1168,15 +1173,15 @@ export default class NoticeDownloaderConso {
       })
 
       const reqList = await this.axiosClient.get(
-        `https://www.tdscpc.gov.in/app/srv/GetReqListServlet?reqtype=0&_search=false&nd=${Date.now()}&rows=10&page=1&sidx=reqNo&sord=asc`,
+        `${TRACES61_ORIGIN}/app/srv/GetReqListServlet?reqtype=0&_search=false&nd=${Date.now()}&rows=10&page=1&sidx=reqNo&sord=asc`,
         {
           headers: {
             accept: "application/json, text/javascript, */*; q=0.01",
             "accept-encoding": "gzip, deflate, br, zstd",
             "accept-language": "en-US,en;q=0.9,en-IN;q=0.8",
             connection: "keep-alive",
-            host: "www.tdscpc.gov.in",
-            referer: "https://www.tdscpc.gov.in/app/ded/filedownload.xhtml",
+            host: traces61Host(),
+            referer: `${TRACES61_ORIGIN}/app/ded/filedownload.xhtml`,
             "sec-ch-ua": '"Microsoft Edge";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"Windows"',
@@ -1283,7 +1288,7 @@ export default class NoticeDownloaderConso {
           const formData6 = new URLSearchParams()
           formData6.append("reqNo", reqNo)
           const downloadServlet = await this.axiosClient.post(
-            `https://www.tdscpc.gov.in/app/srv/DownloadServlet`,
+            `${TRACES61_ORIGIN}/app/srv/DownloadServlet`,
             formData6,
             {
               headers: {
@@ -1292,9 +1297,9 @@ export default class NoticeDownloaderConso {
                 "accept-language": "en-US,en;q=0.9,en-IN;q=0.8",
                 connection: "keep-alive",
                 "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-                host: "www.tdscpc.gov.in",
-                origin: "https://www.tdscpc.gov.in",
-                referer: "https://www.tdscpc.gov.in/app/ded/filedownload.xhtml",
+                host: traces61Host(),
+                origin: TRACES61_ORIGIN,
+                referer: `${TRACES61_ORIGIN}/app/ded/filedownload.xhtml`,
                 "sec-ch-ua": '"Microsoft Edge";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
                 "sec-ch-ua-mobile": "?0",
                 "sec-ch-ua-platform": '"Windows"',

@@ -87,7 +87,7 @@ export type DownloadChallansOptions = {
   skipNewActRadio?: boolean
 }
 
-async function clickContinueAfterEpayLanding(page: Page) {
+export async function clickContinueAfterEpayLanding(page: Page) {
   await page.waitForSelector(
     'button.large-button-primary.iconsAfter.nextIcon[type="button"]',
     { visible: true, timeout: 120000 }

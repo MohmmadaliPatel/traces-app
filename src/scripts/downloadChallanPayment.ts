@@ -4,6 +4,10 @@ import fs from "fs"
 import StealthPlugin from "puppeteer-extra-plugin-stealth"
 import { Page } from "puppeteer"
 import { waitForSecs } from "src/utils/promises"
+import {
+  clickContinueAfterEpayLanding,
+  type DownloadChallansOptions,
+} from "./downloadChallan"
 import path from "path"
 import pdfParse from "pdf-parse"
 import * as XLSX from "xlsx"
@@ -458,16 +462,30 @@ async function convertPdfsToExcel(
   }
 }
 
-export async function downloadChallanPayments(
+/** Tab + output folder for the shared e-Pay filter + pagination + PDF download flow. */
+export type EpayFilteredDownloadTabConfig = {
+  tabText: "Payment History" | "Generated Challans"
+  storageSubdir: string
+  flowLabel: string
+}
+
+async function runChallanEpayFilterDownload(
   Username: string,
   Password: string,
   companyName: string,
-  fromDate?: string,
-  toDate?: string,
-  assessmentYear?: string,
-  paymentType?: string
+  fromDate: string | undefined,
+  toDate: string | undefined,
+  assessmentYear: string | undefined,
+  paymentType: string | undefined,
+  options: DownloadChallansOptions | undefined,
+  kind: EpayFilteredDownloadTabConfig
 ) {
-  console.log("Downloading challan payments for company:", companyName)
+  const skipNewActRadio = options?.skipNewActRadio === true
+  console.log(`Downloading e-Pay (${kind.flowLabel}) for company:`, companyName)
+  console.log(
+    `e-pay ${kind.flowLabel} flow: skip Income-tax Act 2025 radio (old only):`,
+    skipNewActRadio
+  )
   console.log("Username:", Username)
   console.log("Password:", Password)
   console.log("From Date:", fromDate)
@@ -493,7 +511,7 @@ export async function downloadChallanPayments(
   const page = await browser.newPage()
 
   // Set the download behavior to use the custom download path
-  const downloadPath = path.resolve(`./public/pdf/challans/${companyName}/PaymentHistory`)
+  const downloadPath = path.resolve(`./public/pdf/challans/${companyName}/${kind.storageSubdir}`)
   const client = await page.createCDPSession()
   if (!fs.existsSync(downloadPath)) {
     fs.mkdirSync(downloadPath, { recursive: true })
@@ -510,28 +528,15 @@ export async function downloadChallanPayments(
   await login(page, Username, Password)
 
   await navigateToEpayTaxViaMenu(page)
-  console.log("Waiting for the radio button to be visible(PAYMENT)")
-  // Click the mat-radio-button host, not #mat-radio-0-input: Material hides the native input
-  // (opacity/size), so visible checks and clicks on the input are unreliable (matches downloadChallan.ts).
-  await page.waitForSelector("#mat-radio-0", { visible: true })
-  await page.click("#mat-radio-0")
-  console.log("Clicked on the radio button(PAYMENT)")
-  await page.waitForSelector(
-    'button.large-button-primary.iconsAfter.nextIcon[type="button"]',
-    { visible: true }
-  )
-  const continueClicked = await page.evaluate(() => {
-    const btn = Array.from(
-      document.querySelectorAll("button.large-button-primary.iconsAfter.nextIcon")
-    ).find((b) => b.textContent?.trim() === "Continue") as HTMLButtonElement | undefined
-    if (btn) {
-      btn.click()
-      return true
-    }
-    return false
-  })
-  if (!continueClicked) {
-    await page.click('button.large-button-primary.iconsAfter.nextIcon[type="button"]')
+  if (skipNewActRadio) {
+    console.log(`Old Act — skipping #mat-radio-0, Continue only (${kind.flowLabel})`)
+    await clickContinueAfterEpayLanding(page)
+  } else {
+    console.log(`Waiting for Income-tax Act 2025 radio (#mat-radio-0) (${kind.flowLabel})`)
+    await page.waitForSelector("#mat-radio-0", { visible: true, timeout: 120000 })
+    await page.click("#mat-radio-0")
+    console.log(`Clicked on the radio button (${kind.flowLabel})`)
+    await clickContinueAfterEpayLanding(page)
   }
   await page.waitForSelector(".mdc-tab__text-label")
   const elements = await page.$$(".mdc-tab__text-label")
@@ -541,9 +546,7 @@ export async function downloadChallanPayments(
     // Get the text content of each element
     const text = await page.evaluate((el) => el.textContent?.trim(), element)
 
-    // Check if the text content is "Generated Challans"
-    if (text === "Payment History") {
-      // Click the element if it matches
+    if (text === kind.tabText) {
       await element.click()
     }
   }
@@ -871,4 +874,63 @@ export async function downloadChallanPayments(
   } else {
     console.log("⚠️ Could not convert PDFs to Excel")
   }
+}
+
+/** Payment History tab: same filters, pagination, PDF download, and Excel merge as legacy flow. */
+export async function downloadChallanPayments(
+  Username: string,
+  Password: string,
+  companyName: string,
+  fromDate?: string,
+  toDate?: string,
+  assessmentYear?: string,
+  paymentType?: string,
+  options?: DownloadChallansOptions
+) {
+  return runChallanEpayFilterDownload(
+    Username,
+    Password,
+    companyName,
+    fromDate,
+    toDate,
+    assessmentYear,
+    paymentType,
+    options,
+    {
+      tabText: "Payment History",
+      storageSubdir: "PaymentHistory",
+      flowLabel: "Payment History",
+    }
+  )
+}
+
+/**
+ * Same as {@link downloadChallanPayments} (filters, date range, assessment year, payment type,
+ * `skipNewActRadio`, multi-page PDF downloads, PDF→Excel) but opens the **Generated Challans** tab.
+ */
+export async function downloadGeneratedChallansWithFilters(
+  Username: string,
+  Password: string,
+  companyName: string,
+  fromDate?: string,
+  toDate?: string,
+  assessmentYear?: string,
+  paymentType?: string,
+  options?: DownloadChallansOptions
+) {
+  return runChallanEpayFilterDownload(
+    Username,
+    Password,
+    companyName,
+    fromDate,
+    toDate,
+    assessmentYear,
+    paymentType,
+    options,
+    {
+      tabText: "Generated Challans",
+      storageSubdir: "GeneratedChallansFiltered",
+      flowLabel: "Generated Challans",
+    }
+  )
 }

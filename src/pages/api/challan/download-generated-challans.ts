@@ -1,6 +1,6 @@
 import { NextApiRequest, NextApiResponse } from "next"
 import db from "db"
-import { downloadChallanPayments } from "src/scripts/downloadChallanPayment"
+import { downloadGeneratedChallansWithFilters } from "src/scripts/downloadChallanPayment"
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "POST") {
@@ -14,7 +14,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       return res.status(400).json({ error: "Missing company ID" })
     }
 
-    // Get company details
     const company = await db.company.findUnique({
       where: { id: parseInt(companyId) },
     })
@@ -23,10 +22,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       return res.status(404).json({ error: "Company not found" })
     }
 
-    // Download challan payments with filters
     const skipNewActRadio = incomeTaxAct !== "new"
 
-    const result = await downloadChallanPayments(
+    const result = await downloadGeneratedChallansWithFilters(
       company.tan,
       company.it_password,
       company.name,
@@ -39,9 +37,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     return res.status(200).json({ success: true, result })
   } catch (error: any) {
-    console.error("Error downloading challan payments:", error)
+    console.error("Error downloading generated challans:", error)
     return res.status(500).json({
-      error: error.message || "Failed to download challan payments",
+      error: error.message || "Failed to download generated challans",
     })
   }
 }

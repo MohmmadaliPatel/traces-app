@@ -1,7 +1,11 @@
 import puppeteer from "puppeteer"
 import path from "path"
 import os from "os"
-import { loginWithTracesApiAndPreauth, traces61DedUrl } from "../jobs/traces"
+import {
+  loginWithTracesApiAndPreauth,
+  rewriteTracesNewPortalUrlToTraces61,
+  traces61DedUrl,
+} from "../jobs/traces"
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -31,11 +35,15 @@ async function loginToTdsPortal(credentials: {
 
   const page = await browser.newPage()
 
-  await loginWithTracesApiAndPreauth(page, {
-    userId: credentials.userId,
-    password: credentials.password,
-    tan: credentials.tan,
-  })
+  await loginWithTracesApiAndPreauth(
+    page,
+    {
+      userId: credentials.userId,
+      password: credentials.password,
+      tan: credentials.tan,
+    },
+    { redirectGuard: false }
+  )
 
   globalPage = page
   return globalPage
@@ -93,7 +101,12 @@ export async function fetchOutstandingDemand({
 
     // Allow all requests to continue
     page.on("request", (request: any) => {
-      request.continue()
+      const url = rewriteTracesNewPortalUrlToTraces61(request.url())
+      if (url !== request.url()) {
+        request.continue({ url })
+      } else {
+        request.continue()
+      }
     })
 
     // Navigate to outstanding demand page (API will be called on page load)
