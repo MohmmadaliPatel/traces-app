@@ -526,7 +526,7 @@ async function runChallanEpayFilterDownload(
 
   // Click a button that triggers XHR requests
   await login(page, Username, Password)
-
+  
   await navigateToEpayTaxViaMenu(page)
   if (skipNewActRadio) {
     console.log(`Old Act — skipping #mat-radio-0, Continue only (${kind.flowLabel})`)

@@ -92,6 +92,8 @@ const ChallanManagementPage: BlitzPage = () => {
     status: string
   } | null>(null)
   const [csvFileList, setCsvFileList] = useState<any[]>([])
+  const [companyPickerCsvFileList, setCompanyPickerCsvFileList] = useState<any[]>([])
+  const [companyPickerCsvLoading, setCompanyPickerCsvLoading] = useState(false)
 
   // Fetch companies
   const [companiesResponse] = useQuery(getCompanies, {
@@ -351,6 +353,69 @@ const ChallanManagementPage: BlitzPage = () => {
       reader.onerror = () => reject(new Error("Failed to read file"))
       reader.readAsText(file)
     })
+  }
+
+  /** Same CSV as batch create: match each row by TAN (`Username`). Replaces current company selection. */
+  const handleCompanySelectCsvUpload = async (file: File) => {
+    if (!file.name.endsWith(".csv")) {
+      messageApi.error("Please upload a CSV file")
+      setCompanyPickerCsvFileList([])
+      return false
+    }
+
+    setCompanyPickerCsvLoading(true)
+    try {
+      const csvData = await parseCsvFile(file)
+      if (csvData.length === 0) {
+        messageApi.error("No rows with Company Name found in CSV")
+        setCompanyPickerCsvFileList([])
+        return false
+      }
+
+      const seen = new Set<number>()
+      const ids: number[] = []
+      const notFound: string[] = []
+
+      for (const row of csvData) {
+        const companyName = String(row["Company Name"] ?? "").trim()
+        const tan = String(row["Username"] ?? "").trim()
+        if (!companyName && !tan) continue
+
+        const company = tan
+          ? savedCompanies.find((c: { tan: string }) => c.tan === tan)
+          : undefined
+
+        if (!company) {
+          notFound.push(companyName || tan || "Unknown row")
+          continue
+        }
+        if (!seen.has(company.id)) {
+          seen.add(company.id)
+          ids.push(company.id)
+        }
+      }
+
+      setSelectedCompanyIds(ids)
+
+      if (ids.length === 0) {
+        messageApi.error("No companies matched. Check that Username (TAN) matches your saved companies.")
+      } else {
+        messageApi.success(`Selected ${ids.length} compan${ids.length === 1 ? "y" : "ies"} from CSV`)
+      }
+      if (notFound.length > 0) {
+        messageApi.warning(
+          `${notFound.length} row(s) had no matching company (by TAN). First: ${notFound[0]}`
+        )
+      }
+
+      setCompanyPickerCsvFileList([])
+    } catch (error: any) {
+      messageApi.error(error.message || "Failed to read CSV")
+      setCompanyPickerCsvFileList([])
+    } finally {
+      setCompanyPickerCsvLoading(false)
+    }
+    return false
   }
 
   const handleCsvUpload = async (file: File) => {
@@ -618,6 +683,13 @@ const ChallanManagementPage: BlitzPage = () => {
         {/* Company Selection Card */}
         <Card title="Select Companies">
           <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+            <Alert
+              message="Select manually or load from CSV"
+              description="Use the same CSV template as batch create (Company Name and Username/TAN columns required per row). Other columns are ignored. Upload replaces the current selection."
+              type="info"
+              showIcon
+            />
+
             <Select
               mode="multiple"
               style={{ width: "100%" }}
@@ -638,7 +710,23 @@ const ChallanManagementPage: BlitzPage = () => {
               ))}
             </Select>
 
-            <Space>
+            <Space wrap align="center">
+              <Upload
+                accept=".csv"
+                fileList={companyPickerCsvFileList}
+                beforeUpload={handleCompanySelectCsvUpload}
+                onChange={({ fileList }) => setCompanyPickerCsvFileList(fileList)}
+                maxCount={1}
+                disabled={companyPickerCsvLoading || savedCompanies.length === 0}
+              >
+                <Button
+                  icon={<UploadOutlined />}
+                  loading={companyPickerCsvLoading}
+                  disabled={companyPickerCsvLoading || savedCompanies.length === 0}
+                >
+                  Select companies from CSV
+                </Button>
+              </Upload>
               <Button onClick={handleSelectAll} disabled={savedCompanies.length === 0}>
                 Select All
               </Button>
