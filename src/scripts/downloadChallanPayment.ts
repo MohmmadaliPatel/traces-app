@@ -81,6 +81,166 @@ async function navigateToEpayTaxViaMenu(page: Page) {
   await waitForSecs(3000)
 }
 
+const CAL_HEADER_MONTHS = [
+  "JAN",
+  "FEB",
+  "MAR",
+  "APR",
+  "MAY",
+  "JUN",
+  "JUL",
+  "AUG",
+  "SEP",
+  "OCT",
+  "NOV",
+  "DEC",
+] as const
+
+const ABBR_TO_MONTH_INDEX: Record<string, number> = {
+  jan: 0,
+  feb: 1,
+  mar: 2,
+  apr: 3,
+  may: 4,
+  jun: 5,
+  jul: 6,
+  aug: 7,
+  sep: 8,
+  oct: 9,
+  nov: 10,
+  dec: 11,
+}
+
+const MONTH_INDEX_TO_FULL_NAME = [
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
+] as const
+
+function parseTracesPaymentDateString(dateStr: string) {
+  const datePart = dateStr.split(" ")[0]
+  if (!datePart) throw new Error(`Invalid payment date (empty): ${dateStr}`)
+  const parts = datePart.split("-")
+  const day = parseInt(parts[0]!, 10)
+  const monRaw = parts[1]?.toLowerCase().replace(/\./g, "") ?? ""
+  const monKey = monRaw.slice(0, 3)
+  const year = parseInt(parts[2]!, 10)
+  const monthIndex = ABBR_TO_MONTH_INDEX[monKey]
+  if (Number.isNaN(day) || monthIndex === undefined || Number.isNaN(year)) {
+    throw new Error(`Invalid payment date: ${dateStr}`)
+  }
+  return {
+    day,
+    monthIndex,
+    year,
+    fullMonth: MONTH_INDEX_TO_FULL_NAME[monthIndex],
+  }
+}
+
+function parseMatCalendarPeriodLabel(label: string): { monthIndex: number; year: number } | null {
+  const m = label.trim().match(/^([A-Za-z]+)\s+(\d{4})$/)
+  if (!m) return null
+  const tok = m[1]!.toUpperCase().slice(0, 3)
+  const idx = CAL_HEADER_MONTHS.indexOf(tok as (typeof CAL_HEADER_MONTHS)[number])
+  const year = parseInt(m[2]!, 10)
+  if (idx < 0 || Number.isNaN(year)) return null
+  return { monthIndex: idx, year }
+}
+
+/**
+ * The TRACES filter uses Angular Material datepickers that open on the current month.
+ * Day cells for other months are not present (or not the right month), so we must
+ * navigate with prev/next until the target month/year is visible, then click the day.
+ */
+async function selectDateInOpenMatCalendar(page: Page, dateStr: string) {
+  const { day, monthIndex, year, fullMonth } = parseTracesPaymentDateString(dateStr)
+  const maxSteps = 120
+
+  for (let step = 0; step < maxSteps; step++) {
+    const headerText = await page.evaluate(() => {
+      const span = document.querySelector(
+        ".mat-datepicker-content .mat-calendar-period-button .mdc-button__label span[aria-hidden='true']"
+      )
+      return span?.textContent?.trim() ?? null
+    })
+    if (!headerText) {
+      throw new Error("Material datepicker calendar header not found (is the popup open?)")
+    }
+
+    const view = parseMatCalendarPeriodLabel(headerText)
+    if (!view) {
+      throw new Error(`Could not parse Material calendar period: "${headerText}"`)
+    }
+
+    if (view.monthIndex === monthIndex && view.year === year) {
+      const clicked = await page.evaluate(
+        ({ fullMonth, day: d, year: y }) => {
+          const targetLabel = `${fullMonth} ${d}, ${y}`
+          const buttons = Array.from(
+            document.querySelectorAll(
+              ".mat-datepicker-content button.mat-calendar-body-cell[aria-label]"
+            )
+          ) as HTMLButtonElement[]
+          const match = buttons.find((b) => b.getAttribute("aria-label") === targetLabel)
+          if (match && !match.disabled && !match.classList.contains("mat-calendar-body-disabled")) {
+            match.click()
+            return true
+          }
+          if (match) {
+            match.click()
+            return true
+          }
+          return false
+        },
+        { fullMonth, day, year }
+      )
+      if (!clicked) {
+        throw new Error(
+          `Could not find selectable calendar day ${fullMonth} ${day}, ${year} (header ${headerText})`
+        )
+      }
+      return
+    }
+
+    const viewOrdinal = view.year * 12 + view.monthIndex
+    const targetOrdinal = year * 12 + monthIndex
+    const prev = await page.$(
+      ".mat-datepicker-content .mat-calendar-previous-button:not(.mat-mdc-button-disabled)"
+    )
+    const next = await page.$(
+      ".mat-datepicker-content .mat-calendar-next-button:not(.mat-mdc-button-disabled)"
+    )
+
+    if (viewOrdinal > targetOrdinal) {
+      if (!prev) {
+        throw new Error(
+          `Cannot go to earlier month for ${dateStr}: previous control disabled at ${headerText}`
+        )
+      }
+      await prev.click()
+    } else {
+      if (!next) {
+        throw new Error(
+          `Cannot go to later month for ${dateStr}: next control disabled at ${headerText}`
+        )
+      }
+      await next.click()
+    }
+    await waitForSecs(300)
+  }
+
+  throw new Error(`Material calendar navigation exceeded ${maxSteps} steps for ${dateStr}`)
+}
+
 /**
  * Parse challan receipt PDF and extract all details
  */
@@ -462,11 +622,18 @@ async function convertPdfsToExcel(
   }
 }
 
+/** Date input ids differ by tab (creation vs payment dates). Mat-selects use formcontrolname — not mat-select-value-N (unstable). */
+export type EpayFilterModalDomIds = {
+  fromDateInputId: string
+  toDateInputId: string
+}
+
 /** Tab + output folder for the shared e-Pay filter + pagination + PDF download flow. */
 export type EpayFilteredDownloadTabConfig = {
   tabText: "Payment History" | "Generated Challans"
   storageSubdir: string
   flowLabel: string
+  filterModalDomIds: EpayFilterModalDomIds
 }
 
 async function runChallanEpayFilterDownload(
@@ -481,6 +648,7 @@ async function runChallanEpayFilterDownload(
   kind: EpayFilteredDownloadTabConfig
 ) {
   const skipNewActRadio = options?.skipNewActRadio === true
+  const dom = kind.filterModalDomIds
   console.log(`Downloading e-Pay (${kind.flowLabel}) for company:`, companyName)
   console.log(
     `e-pay ${kind.flowLabel} flow: skip Income-tax Act 2025 radio (old only):`,
@@ -562,67 +730,82 @@ async function runChallanEpayFilterDownload(
     await page.click("button.defaultButton.filterButton")
     await waitForSecs(2000)
 
+    const openMatSelectInFilterModal = async (formControlName: "assessmentYear" | "typeOfPayment") => {
+      const opened = await page.evaluate((name) => {
+        const modalBody =
+          document.querySelector(".modal.show .modal-body") ??
+          Array.from(document.querySelectorAll(".modal-body")).find(
+            (b) => (b as HTMLElement).offsetParent !== null
+          ) ??
+          null
+        const sel = modalBody?.querySelector(
+          `mat-select[formcontrolname="${name}"]`
+        ) as HTMLElement | null
+        if (!sel) return false
+        sel.click()
+        return true
+      }, formControlName)
+      if (!opened) {
+        console.log(`Warning: mat-select[formcontrolname=${formControlName}] not found in filter modal`)
+      }
+      await waitForSecs(400)
+      try {
+        await page.waitForSelector(".cdk-overlay-container mat-option", { visible: true, timeout: 8000 })
+      } catch {
+        console.log(`Warning: mat-option panel did not appear for ${formControlName}`)
+      }
+    }
+
+    const clickMatOptionByExactLabel = async (label: string) => {
+      const clicked = await page.evaluate((want) => {
+        const norm = (s: string) => s.replace(/\s+/g, " ").trim()
+        const wantNorm = norm(want)
+        const options = Array.from(
+          document.querySelectorAll(".cdk-overlay-container mat-option")
+        ) as HTMLElement[]
+        const target = options.find((opt) => norm(opt.textContent || "") === wantNorm)
+        if (target) {
+          target.click()
+          return true
+        }
+        const loose = options.find((opt) => norm(opt.textContent || "").includes(wantNorm))
+        if (loose) {
+          loose.click()
+          return true
+        }
+        return false
+      }, label)
+      if (!clicked) {
+        console.log(`Warning: no mat-option matched label: "${label}"`)
+      }
+      await waitForSecs(600)
+    }
+
     // Fill in Assessment Year if provided
     if (assessmentYear) {
       console.log("Selecting assessment year:", assessmentYear)
-      // Click on the assessment year select by clicking on its value display
-      await page.evaluate(() => {
-        const selectValue = document.getElementById("mat-select-value-8")
-        if (selectValue) {
-          const parentSelect = selectValue.closest("mat-select")
-          if (parentSelect) {
-            ;(parentSelect as HTMLElement).click()
-          }
-        }
-      })
-      await waitForSecs(1000)
-
-      // Find and click the option with matching text
-      await page.evaluate((year) => {
-        const options = Array.from(document.querySelectorAll("mat-option"))
-        const targetOption = options.find((opt) => opt.textContent?.trim() === year)
-        if (targetOption) {
-          ;(targetOption as HTMLElement).click()
-        }
-      }, assessmentYear)
-      await waitForSecs(1000)
+      await openMatSelectInFilterModal("assessmentYear")
+      await clickMatOptionByExactLabel(assessmentYear)
     }
 
     // Fill in Type of Payment if provided
     if (paymentType) {
       console.log("Selecting payment type:", paymentType)
-      // Click on the payment type select by clicking on its value display
-      await page.evaluate(() => {
-        const selectValue = document.getElementById("mat-select-value-19")
-        if (selectValue) {
-          const parentSelect = selectValue.closest("mat-select")
-          if (parentSelect) {
-            ;(parentSelect as HTMLElement).click()
-          }
-        }
-      })
-      await waitForSecs(1000)
-
-      // Find and click the option with matching text
-      await page.evaluate((type) => {
-        const options = Array.from(document.querySelectorAll("mat-option"))
-        const targetOption = options.find((opt) => opt.textContent?.trim() === type)
-        if (targetOption) {
-          ;(targetOption as HTMLElement).click()
-        }
-      }, paymentType)
-      await waitForSecs(1000)
+      await openMatSelectInFilterModal("typeOfPayment")
+      await clickMatOptionByExactLabel(paymentType)
     }
 
-    // Fill in Payment Date Range if provided
+    // Fill in date range (Payment Date on Payment History tab; Date of Creation on Generated Challans)
     if (fromDate && toDate) {
       console.log("Selecting date range:", fromDate, "to", toDate)
 
+      const fromInputId = dom.fromDateInputId
+      const toInputId = dom.toDateInputId
+
       // Click the calendar toggle button for "From" date
-      await page.evaluate(() => {
-        const fromInput = document.getElementById("frompayment")
+      await page.evaluate((inputId) => {
+        const fromInput = document.getElementById(inputId)
         if (fromInput) {
-          // Find the calendar toggle button (mat-datepicker-toggle)
           const parent = fromInput.closest("mat-form-field")
           const calendarButton = parent?.querySelector(
             'mat-datepicker-toggle button[aria-label="Open calendar"]'
@@ -631,59 +814,16 @@ async function runChallanEpayFilterDownload(
             ;(calendarButton as HTMLElement).click()
           }
         }
-      })
+      }, fromInputId)
       await waitForSecs(1000)
 
-      // Select the from date from the calendar
-      await page.evaluate((dateStr) => {
-        // Parse the date string (format: DD-MMM-YYYY HH:mm:ss or DD-MMM-YYYY)
-        const datePart = dateStr.split(" ")[0]
-        if (!datePart) return
-
-        const parts = datePart.split("-")
-        const day = parts[0]
-        const month = parts[1]
-        const year = parts[2]
-
-        if (!day || !month || !year) return
-
-        // Convert month abbreviation to full name for aria-label matching
-        const monthMap = {
-          Jan: "January",
-          Feb: "February",
-          Mar: "March",
-          Apr: "April",
-          May: "May",
-          Jun: "June",
-          Jul: "July",
-          Aug: "August",
-          Sep: "September",
-          Oct: "October",
-          Nov: "November",
-          Dec: "December",
-        }
-        const fullMonth = monthMap[month]
-
-        // Find and click the date button in the calendar
-        // Format: "December 23, 2025"
-        const dateButtons = Array.from(
-          document.querySelectorAll("button.mat-calendar-body-cell[aria-label]")
-        )
-        for (const btn of dateButtons) {
-          const ariaLabel = btn.getAttribute("aria-label")
-          if (ariaLabel && ariaLabel === `${fullMonth} ${parseInt(day)}, ${year}`) {
-            ;(btn as HTMLElement).click()
-            break
-          }
-        }
-      }, fromDate)
-      await waitForSecs(1000)
+      await selectDateInOpenMatCalendar(page, fromDate)
+      await waitForSecs(500)
 
       // Click the calendar toggle button for "To" date
-      await page.evaluate(() => {
-        const toInput = document.getElementById("topayment")
+      await page.evaluate((inputId) => {
+        const toInput = document.getElementById(inputId)
         if (toInput) {
-          // Find the calendar toggle button (mat-datepicker-toggle)
           const parent = toInput.closest("mat-form-field")
           const calendarButton = parent?.querySelector(
             'mat-datepicker-toggle button[aria-label="Open calendar"]'
@@ -692,54 +832,11 @@ async function runChallanEpayFilterDownload(
             ;(calendarButton as HTMLElement).click()
           }
         }
-      })
+      }, toInputId)
       await waitForSecs(1000)
 
-      // Select the to date from the calendar
-      await page.evaluate((dateStr) => {
-        // Parse the date string (format: DD-MMM-YYYY HH:mm:ss or DD-MMM-YYYY)
-        const datePart = dateStr.split(" ")[0]
-        if (!datePart) return
-
-        const parts = datePart.split("-")
-        const day = parts[0]
-        const month = parts[1]
-        const year = parts[2]
-
-        if (!day || !month || !year) return
-
-        // Convert month abbreviation to full name for aria-label matching
-        const monthMap = {
-          Jan: "January",
-          Feb: "February",
-          Mar: "March",
-          Apr: "April",
-          May: "May",
-          Jun: "June",
-          Jul: "July",
-          Aug: "August",
-          Sep: "September",
-          Oct: "October",
-          Nov: "November",
-          Dec: "December",
-        }
-        const fullMonth = monthMap[month]
-
-        // Find and click the date button in the calendar
-        // Format: "December 23, 2025"
-        const dateButtons = Array.from(
-          document.querySelectorAll("button.mat-calendar-body-cell[aria-label]")
-        )
-        for (const btn of dateButtons) {
-          const ariaLabel = btn.getAttribute("aria-label")
-          console.log(ariaLabel,  `${fullMonth} ${parseInt(day)}, ${year}`)
-          if (ariaLabel && ariaLabel === `${fullMonth} ${parseInt(day)}, ${year}`) {
-            (btn as HTMLElement).click()
-            break
-          }
-        }
-      }, toDate)
-      await waitForSecs(1000)
+      await selectDateInOpenMatCalendar(page, toDate)
+      await waitForSecs(500)
     }
 
     // Click the Filter button in the modal to apply filters
@@ -900,6 +997,10 @@ export async function downloadChallanPayments(
       tabText: "Payment History",
       storageSubdir: "PaymentHistory",
       flowLabel: "Payment History",
+      filterModalDomIds: {
+        fromDateInputId: "frompayment",
+        toDateInputId: "topayment",
+      },
     }
   )
 }
@@ -931,6 +1032,10 @@ export async function downloadGeneratedChallansWithFilters(
       tabText: "Generated Challans",
       storageSubdir: "GeneratedChallansFiltered",
       flowLabel: "Generated Challans",
+      filterModalDomIds: {
+        fromDateInputId: "fromchallan",
+        toDateInputId: "tochallan",
+      },
     }
   )
 }

@@ -19,6 +19,7 @@ import {
   Modal,
   Typography,
   Upload,
+  Tooltip,
 } from "antd"
 import {
   CloudDownloadOutlined,
@@ -39,10 +40,21 @@ import {
   parseIncomeTaxActCsv,
   type IncomeTaxActKind,
 } from "src/challan/utils/incomeTaxAct"
+import { runWithConcurrency } from "src/challan/utils/runWithConcurrency"
 import dayjs from "dayjs"
 
 const { Option } = Select
-const { Title } = Typography
+const { Title, Text } = Typography
+
+type EpayDownloadFlow = "payment" | "generated"
+
+type EpayDownloadResultRow = {
+  companyId: number
+  companyName: string
+  tan: string
+  success: boolean
+  errorMessage?: string
+}
 const { RangePicker } = DatePicker
 
 interface ChallanDataType {
@@ -94,6 +106,21 @@ const ChallanManagementPage: BlitzPage = () => {
   const [csvFileList, setCsvFileList] = useState<any[]>([])
   const [companyPickerCsvFileList, setCompanyPickerCsvFileList] = useState<any[]>([])
   const [companyPickerCsvLoading, setCompanyPickerCsvLoading] = useState(false)
+
+  const [epayConcurrency, setEpayConcurrency] = useState(1)
+  const [epayDownloadProgress, setEpayDownloadProgress] = useState<{
+    current: number
+    total: number
+  } | null>(null)
+  const [epayResultsModalOpen, setEpayResultsModalOpen] = useState(false)
+  const [lastEpayDownloadRun, setLastEpayDownloadRun] = useState<{
+    flow: EpayDownloadFlow
+    startedAt: string
+    results: EpayDownloadResultRow[]
+  } | null>(null)
+  const [epayRetryRowKeys, setEpayRetryRowKeys] = useState<number[]>([])
+
+  const epayDownloadBusy = downloadPaymentLoading || downloadGeneratedChallansLoading
 
   // Fetch companies
   const [companiesResponse] = useQuery(getCompanies, {
@@ -239,40 +266,115 @@ const ChallanManagementPage: BlitzPage = () => {
     }
   }
 
+  const resolveCompanyMeta = (companyId: number) => {
+    const c = savedCompanies.find((x: any) => x.id === companyId)
+    return {
+      companyName: c?.name ?? `Company ${companyId}`,
+      tan: c?.tan ?? "—",
+    }
+  }
+
+  const runEpayDownloadBatch = async (flow: EpayDownloadFlow, companyIds: number[]) => {
+    if (companyIds.length === 0) return
+
+    const limit = Math.min(7, Math.max(1, epayConcurrency), companyIds.length)
+    const setLoading =
+      flow === "payment" ? setDownloadPaymentLoading : setDownloadGeneratedChallansLoading
+
+    let completed = 0
+    const bumpProgress = () => {
+      completed += 1
+      setEpayDownloadProgress({ current: completed, total: companyIds.length })
+    }
+
+    setEpayDownloadProgress({ current: 0, total: companyIds.length })
+    setLoading(true)
+
+    const flowLabel = flow === "payment" ? "Payment History" : "Generated Challans"
+
+    try {
+      const results = await runWithConcurrency(companyIds, limit, async (companyId) => {
+        const endpoint =
+          flow === "payment"
+            ? "/api/challan/download-payment"
+            : "/api/challan/download-generated-challans"
+        const meta = resolveCompanyMeta(companyId)
+        const body = {
+          companyId,
+          fromDate: paymentDateRange?.[0],
+          toDate: paymentDateRange?.[1],
+          assessmentYear: paymentAssessmentYear || undefined,
+          paymentType: paymentType || undefined,
+          incomeTaxAct: paymentIncomeTaxAct,
+        }
+
+        try {
+          const response = await fetch(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          })
+
+          let data: { success?: boolean; error?: string } = {}
+          try {
+            data = await response.json()
+          } catch {
+            /* non-JSON body */
+          }
+
+          const row: EpayDownloadResultRow = {
+            companyId,
+            companyName: meta.companyName,
+            tan: meta.tan,
+            success: response.ok && data.success === true,
+            errorMessage:
+              response.ok && data.success === true
+                ? undefined
+                : data.error || `Request failed (HTTP ${response.status})`,
+          }
+          return row
+        } catch (e: any) {
+          return {
+            companyId,
+            companyName: meta.companyName,
+            tan: meta.tan,
+            success: false,
+            errorMessage: e?.message || "Network error",
+          }
+        } finally {
+          bumpProgress()
+        }
+      })
+
+      setLastEpayDownloadRun({
+        flow,
+        startedAt: new Date().toISOString(),
+        results,
+      })
+      setEpayRetryRowKeys(results.filter((r) => !r.success).map((r) => r.companyId))
+      setEpayResultsModalOpen(true)
+
+      const ok = results.filter((r) => r.success).length
+      const bad = results.length - ok
+      messageApi.open({
+        type: ok === results.length ? "success" : bad === results.length ? "error" : "warning",
+        content: `e-Pay ${flowLabel}: ${ok} succeeded, ${bad} failed`,
+        duration: 5,
+      })
+    } catch (error: any) {
+      messageApi.error(error.message || `Failed to run ${flowLabel} downloads`)
+    } finally {
+      setLoading(false)
+      setEpayDownloadProgress(null)
+    }
+  }
+
   const handleDownloadPayments = async () => {
     if (selectedCompanyIds.length === 0) {
       messageApi.error("Please select at least one company")
       return
     }
-
-    setDownloadPaymentLoading(true)
-    try {
-      for (const companyId of selectedCompanyIds) {
-        const response = await fetch("/api/challan/download-payment", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            companyId,
-            fromDate: paymentDateRange?.[0],
-            toDate: paymentDateRange?.[1],
-            assessmentYear: paymentAssessmentYear || undefined,
-            paymentType: paymentType || undefined,
-            incomeTaxAct: paymentIncomeTaxAct,
-          }),
-        })
-
-        const data = await response.json()
-        if (data.success) {
-          messageApi.success(`Challan payments downloaded for company ${companyId}`)
-        } else {
-          messageApi.error(`Failed to download challan payments for company ${companyId}`)
-        }
-      }
-    } catch (error: any) {
-      messageApi.error(error.message || "Failed to download challan payments")
-    } finally {
-      setDownloadPaymentLoading(false)
-    }
+    await runEpayDownloadBatch("payment", selectedCompanyIds)
   }
 
   const handleDownloadGeneratedChallans = async () => {
@@ -280,35 +382,17 @@ const ChallanManagementPage: BlitzPage = () => {
       messageApi.error("Please select at least one company")
       return
     }
+    await runEpayDownloadBatch("generated", selectedCompanyIds)
+  }
 
-    setDownloadGeneratedChallansLoading(true)
-    try {
-      for (const companyId of selectedCompanyIds) {
-        const response = await fetch("/api/challan/download-generated-challans", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            companyId,
-            fromDate: paymentDateRange?.[0],
-            toDate: paymentDateRange?.[1],
-            assessmentYear: paymentAssessmentYear || undefined,
-            paymentType: paymentType || undefined,
-            incomeTaxAct: paymentIncomeTaxAct,
-          }),
-        })
-
-        const data = await response.json()
-        if (data.success) {
-          messageApi.success(`Generated challans downloaded for company ${companyId}`)
-        } else {
-          messageApi.error(`Failed to download generated challans for company ${companyId}`)
-        }
-      }
-    } catch (error: any) {
-      messageApi.error(error.message || "Failed to download generated challans")
-    } finally {
-      setDownloadGeneratedChallansLoading(false)
+  const handleEpayRetrySelected = async () => {
+    if (!lastEpayDownloadRun) return
+    if (epayRetryRowKeys.length === 0) {
+      messageApi.warning("Select at least one company to retry")
+      return
     }
+    setEpayResultsModalOpen(false)
+    await runEpayDownloadBatch(lastEpayDownloadRun.flow, epayRetryRowKeys)
   }
 
   const handleDelete = async (id: number) => {
@@ -628,6 +712,116 @@ const ChallanManagementPage: BlitzPage = () => {
   return (
     <Layout title="Challan Management">
       {contextHolder}
+      <Modal
+        title={
+          lastEpayDownloadRun
+            ? `e-Pay results — ${
+                lastEpayDownloadRun.flow === "payment"
+                  ? "Payment History"
+                  : "Generated Challans"
+              }`
+            : "e-Pay results"
+        }
+        open={epayResultsModalOpen}
+        onCancel={() => setEpayResultsModalOpen(false)}
+        width={840}
+        destroyOnClose={false}
+        footer={[
+          <Button key="close" onClick={() => setEpayResultsModalOpen(false)}>
+            Close
+          </Button>,
+          <Button
+            key="retry"
+            type="primary"
+            onClick={handleEpayRetrySelected}
+            disabled={
+              epayRetryRowKeys.length === 0 ||
+              downloadPaymentLoading ||
+              downloadGeneratedChallansLoading
+            }
+            loading={downloadPaymentLoading || downloadGeneratedChallansLoading}
+          >
+            Retry selected
+          </Button>,
+        ]}
+      >
+        {lastEpayDownloadRun && (
+          <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+            <div>
+              <Text>
+                <strong>{lastEpayDownloadRun.results.filter((r) => r.success).length}</strong>{" "}
+                succeeded,{" "}
+                <strong>{lastEpayDownloadRun.results.filter((r) => !r.success).length}</strong>{" "}
+                failed
+              </Text>
+              <Text type="secondary"> · {dayjs(lastEpayDownloadRun.startedAt).format("YYYY-MM-DD HH:mm:ss")}</Text>
+            </div>
+            <Space wrap>
+              <Button
+                size="small"
+                onClick={() =>
+                  setEpayRetryRowKeys(
+                    lastEpayDownloadRun.results.filter((r) => !r.success).map((r) => r.companyId)
+                  )
+                }
+              >
+                Select failed only
+              </Button>
+              <Button
+                size="small"
+                onClick={() =>
+                  setEpayRetryRowKeys(lastEpayDownloadRun.results.map((r) => r.companyId))
+                }
+              >
+                Select all
+              </Button>
+              <Button size="small" onClick={() => setEpayRetryRowKeys([])}>
+                Clear
+              </Button>
+            </Space>
+            <Table<EpayDownloadResultRow>
+              size="small"
+              rowKey="companyId"
+              pagination={false}
+              scroll={{ y: 360 }}
+              dataSource={lastEpayDownloadRun.results}
+              rowSelection={{
+                selectedRowKeys: epayRetryRowKeys,
+                onChange: (keys) => setEpayRetryRowKeys(keys as number[]),
+              }}
+              columns={[
+                { title: "Company", dataIndex: "companyName", key: "companyName", ellipsis: true },
+                { title: "TAN", dataIndex: "tan", key: "tan", width: 130 },
+                {
+                  title: "Status",
+                  key: "status",
+                  width: 100,
+                  render: (_, row) =>
+                    row.success ? (
+                      <Tag color="success">Success</Tag>
+                    ) : (
+                      <Tag color="error">Failed</Tag>
+                    ),
+                },
+                {
+                  title: "Error / detail",
+                  dataIndex: "errorMessage",
+                  key: "errorMessage",
+                  ellipsis: { showTitle: false },
+                  render: (msg: string | undefined) =>
+                    msg ? (
+                      <Tooltip title={msg}>
+                        <span>{msg}</span>
+                      </Tooltip>
+                    ) : (
+                      "—"
+                    ),
+                },
+              ]}
+            />
+          </Space>
+        )}
+      </Modal>
       <Space direction="vertical" size="large" style={{ width: "100%", padding: "24px" }}>
         <Title level={2}>Challan Management</Title>
 
@@ -911,6 +1105,30 @@ const ChallanManagementPage: BlitzPage = () => {
                   </Select>
                 </Space>
               </Col>
+
+              <Col span={12}>
+                <Space direction="vertical" size="small" style={{ width: "100%" }}>
+                  <div>
+                    <strong>Concurrent Chrome sessions:</strong>
+                  </div>
+                  <Text type="secondary" style={{ fontSize: 12, display: "block" }}>
+                    Each value runs that many companies at once (max 7). Each job opens its own
+                    Chrome window.
+                  </Text>
+                  <Select
+                    style={{ width: "100%" }}
+                    value={epayConcurrency}
+                    onChange={(v) => setEpayConcurrency(v)}
+                    disabled={epayDownloadBusy}
+                  >
+                    {[1, 2, 3, 4, 5, 6, 7].map((n) => (
+                      <Option key={n} value={n}>
+                        {n}
+                      </Option>
+                    ))}
+                  </Select>
+                </Space>
+              </Col>
             </Row>
 
             <Space direction="vertical" size="small" style={{ width: "100%" }}>
@@ -932,6 +1150,12 @@ const ChallanManagementPage: BlitzPage = () => {
                 style={{ width: "100%" }}
               />
             </Space>
+
+            {epayDownloadBusy && epayDownloadProgress && (
+              <Text type="secondary">
+                Progress: {epayDownloadProgress.current} / {epayDownloadProgress.total} companies
+              </Text>
+            )}
 
             <Space wrap>
               <Button
