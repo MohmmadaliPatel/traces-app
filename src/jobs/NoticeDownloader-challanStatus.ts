@@ -10,6 +10,13 @@ import * as path from "path"
 import * as XLSX from "xlsx"
 import pdfParse from "pdf-parse"
 import { loginWithTracesApiAndPreauth, traces61DedUrl } from "./traces"
+import {
+  auditPaymentPdfChallanStatusCoverage,
+  isChallanInExcelRows,
+  loadChallanStatusExcelRows,
+  saveChallanStatusCoverageReport,
+  writeChallanStatusExcel,
+} from "src/challan/utils/challanStatusExcel"
 puppeteer.use(StealthPlugin())
 
 export default class NoticeDownloaderChallanStatus {
@@ -18,7 +25,8 @@ export default class NoticeDownloaderChallanStatus {
   constructor(
     private company: Company,
     private logger: { log: (msg: string) => void },
-    private taskId: number
+    private taskId: number,
+    private options: { onlyPaymentPdfNotInExcel?: boolean } = {}
   ) {
     this.axiosClient = getAxiostClient()
   }
@@ -176,6 +184,7 @@ export default class NoticeDownloaderChallanStatus {
 
           const bsr = extractField("BSR code", text)
           const csn = extractField("Challan No", text)
+          const cin = extractField("CIN", text)
           // Date is already "DD-MMM-YYYY" (e.g. "04-Dec-2025").
           // formatDate() returns the string unchanged when it is not 8 chars,
           // so we can store it as-is and it will be typed directly into the portal.
@@ -183,9 +192,16 @@ export default class NoticeDownloaderChallanStatus {
           const amountRaw =
             extractField("Amount \\(in Rs\\.\\)", text) || extractField("Amount", text)
           const challanAmount = parseFloat(amountRaw.replace(/[₹,\s]/g, "")) || 0
+          const cinFromFile = path.basename(pdfPath).replace(/_ChallanReceipt\.pdf$/i, "")
 
           if (bsr && csn && date && challanAmount) {
-            challanDetails.push({ bsr, date, csn, challanAmount })
+            challanDetails.push({
+              bsr,
+              date,
+              csn,
+              challanAmount,
+              cin: cin || cinFromFile,
+            })
             this.logger.log(
               `  ✓ BSR=${bsr}  CSN=${csn}  Date=${date}  Amount=${challanAmount}`
             )
@@ -343,10 +359,19 @@ export default class NoticeDownloaderChallanStatus {
     try {
       this.logger.log(`Starting challan status query for ${this.company.name}`)
 
+      const onlyPaymentPdfNotInExcel = this.options.onlyPaymentPdfNotInExcel === true
+
       // Try challan management PDFs first (public/pdf/challans/<Company>/PaymentHistory/)
       let challanDetails = await this.getAllChallanDetailsFromPaymentPdfs()
 
-      if (challanDetails.length === 0) {
+      if (onlyPaymentPdfNotInExcel) {
+        this.logger.log(
+          "Mode: payment PDFs only — skipping TDS return txt fallback; TRACES only for PDFs not in status Excel"
+        )
+        if (challanDetails.length > 0) {
+          this.logger.log(`Using ${challanDetails.length} challan(s) from payment PDFs`)
+        }
+      } else if (challanDetails.length === 0) {
         this.logger.log("No PDF challan data found – falling back to TDS return txt files...")
         challanDetails = await this.getAllChallanDetailsForCompany()
       } else {
@@ -362,48 +387,62 @@ export default class NoticeDownloaderChallanStatus {
         }
       }
 
-      this.logger.log(`Found ${challanDetails.length} challan details to query`)
+      const existingExcelRows = loadChallanStatusExcelRows(this.company.name)
+      const challansToQuery = challanDetails.filter(
+        (c) =>
+          !isChallanInExcelRows(existingExcelRows, {
+            bsr: c.bsr,
+            csn: c.csn,
+            challanAmount: c.challanAmount,
+          })
+      )
+      const skippedInExcel = challanDetails.length - challansToQuery.length
 
-      const browser = await puppeteer.launch({
-        headless: false,
-        args: ["--start-maximized"],
-      })
+      this.logger.log(`Found ${challanDetails.length} challan(s) from PDFs`)
+      this.logger.log(
+        `${skippedInExcel} already in challan status Excel — skipping TRACES query for those`
+      )
+      this.logger.log(`${challansToQuery.length} challan(s) to query on TRACES`)
 
-      const page = await browser.newPage()
-      await page.setViewport({ width: 1920, height: 1080 })
-
-      this.logger.log("TRACES API login + preauth (traces61)…")
-      await loginWithTracesApiAndPreauth(page, {
-        userId: this.company.user_id,
-        password: this.company.password,
-        tan: this.company.tan,
-      })
-      this.logger.log("Login successful")
-
-      // Navigate to challan status query page
-      this.logger.log("Navigating to challan status query page...")
-      await page.goto(traces61DedUrl("challanstatusquery.xhtml"), {
-        waitUntil: "networkidle2",
-      })
-
-      // Click search particular
-      this.logger.log("Clicking search particular...")
-      await page.waitForSelector("#searchParticular")
-      await page.click("#searchParticular")
-      await waitForSecs(1000)
-
-      // Step 7: Click initial Go button
-      this.logger.log("Clicking initial Go button...")
-      await page.waitForSelector("#ClickGo")
-      await page.click("#ClickGo")
-      await waitForSecs(2000)
-
-      // Step 8: Loop through all challan details and query status
       const results: any[] = []
 
-      for (let i = 0; i < challanDetails.length; i++) {
-        const challan = challanDetails[i]
-        this.logger.log(`\nQuerying challan ${i + 1}/${challanDetails.length}`)
+      if (challansToQuery.length === 0) {
+        this.logger.log("All challans already in Excel — skipping TRACES browser session")
+      } else {
+        const browser = await puppeteer.launch({
+          headless: false,
+          args: ["--start-maximized"],
+        })
+
+        const page = await browser.newPage()
+        await page.setViewport({ width: 1920, height: 1080 })
+
+        this.logger.log("TRACES API login + preauth (traces61)…")
+        await loginWithTracesApiAndPreauth(page, {
+          userId: this.company.user_id,
+          password: this.company.password,
+          tan: this.company.tan,
+        })
+        this.logger.log("Login successful")
+
+        this.logger.log("Navigating to challan status query page...")
+        await page.goto(traces61DedUrl("challanstatusquery.xhtml"), {
+          waitUntil: "networkidle2",
+        })
+
+        this.logger.log("Clicking search particular...")
+        await page.waitForSelector("#searchParticular")
+        await page.click("#searchParticular")
+        await waitForSecs(1000)
+
+        this.logger.log("Clicking initial Go button...")
+        await page.waitForSelector("#ClickGo")
+        await page.click("#ClickGo")
+        await waitForSecs(2000)
+
+      for (let i = 0; i < challansToQuery.length; i++) {
+        const challan = challansToQuery[i]
+        this.logger.log(`\nQuerying challan ${i + 1}/${challansToQuery.length}`)
         this.logger.log(
           `BSR: ${challan.bsr}, Date: ${challan.date}, CSN: ${challan.csn}, Amount: ${challan.challanAmount}`
         )
@@ -604,44 +643,49 @@ export default class NoticeDownloaderChallanStatus {
         }
       }
 
-      // Close browser
-      await browser.close()
-
-      // Create Excel file with all challan data
-      if (results.length > 0) {
-        this.logger.log(`\n=== Creating Excel File ===`)
-        this.logger.log(`Total records: ${results.length}`)
-
-        const outputDir = path.join(process.cwd(), "public", "pdf", "challan_status_results")
-        if (!fs.existsSync(outputDir)) {
-          fs.mkdirSync(outputDir, { recursive: true })
-        }
-
-        const workbook = XLSX.utils.book_new()
-        const worksheet = XLSX.utils.json_to_sheet(results)
-        XLSX.utils.book_append_sheet(workbook, worksheet, "Challan Status")
-
-        const outputFilePath = path.join(
-          outputDir,
-          `${this.company.name.replace(/[/\\?%*:|"<>]/g, "_")}_challan_status.xlsx`
-        )
-        XLSX.writeFile(workbook, outputFilePath)
-
-        this.logger.log(`✓ Excel file created: ${outputFilePath}`)
-      } else {
-        this.logger.log(`⚠ No data extracted, Excel file not created`)
+        await browser.close()
       }
 
+      const mergedRows = [...existingExcelRows, ...results] as Record<string, unknown>[]
+
+      if (mergedRows.length > 0) {
+        this.logger.log(`\n=== Writing Excel File ===`)
+        this.logger.log(
+          `Rows: ${existingExcelRows.length} existing + ${results.length} new = ${mergedRows.length} total`
+        )
+        const outputFilePath = writeChallanStatusExcel(this.company.name, mergedRows)
+        this.logger.log(`✓ Excel file saved: ${outputFilePath}`)
+      } else {
+        this.logger.log(`⚠ No Excel rows to write`)
+      }
+
+      this.logger.log(`\n=== Auditing PDF vs Excel coverage ===`)
+      const coverageReport = await auditPaymentPdfChallanStatusCoverage(this.company.name)
+      saveChallanStatusCoverageReport(this.company.name, coverageReport)
+      this.logger.log(
+        `PDFs parsed: ${coverageReport.totalPdfsParsed}, in Excel: ${coverageReport.inExcel}, not in Excel: ${coverageReport.notInExcel}`
+      )
+
       this.logger.log(`\n=== Query Summary ===`)
-      this.logger.log(`Total challans queried: ${challanDetails.length}`)
-      this.logger.log(`Total records extracted: ${results.length}`)
+      this.logger.log(`Total challans from PDFs: ${challanDetails.length}`)
+      this.logger.log(`Skipped (already in Excel): ${skippedInExcel}`)
+      this.logger.log(`Queried on TRACES: ${challansToQuery.length}`)
+      this.logger.log(`New records extracted: ${results.length}`)
 
       return {
         success: true,
         company: this.company.name,
         tan: this.company.tan,
         totalChallans: challanDetails.length,
-        totalRecords: results.length,
+        skippedAlreadyInExcel: skippedInExcel,
+        queriedOnTraces: challansToQuery.length,
+        totalRecords: mergedRows.length,
+        newRecords: results.length,
+        coverage: {
+          totalPdfsParsed: coverageReport.totalPdfsParsed,
+          inExcel: coverageReport.inExcel,
+          notInExcel: coverageReport.notInExcel,
+        },
       }
     } catch (error) {
       this.logger.log(`Error in queryChallanStatusPuppeteer: ${error.message}`)

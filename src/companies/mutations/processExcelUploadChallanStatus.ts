@@ -22,6 +22,8 @@ const ProcessExcelUploadSchema = z.object({
   jobTypes: z.array(z.string()),
   sendToAllPeriods: z.boolean().optional(),
   challanStatusType: z.enum(["challan_status"]).optional(),
+  /** Only query TRACES for payment-history PDFs not already in challan status Excel (no txt fallback). */
+  onlyPaymentPdfNotInExcel: z.boolean().optional(),
 })
 
 // Helper function to find matching company folder
@@ -96,7 +98,13 @@ function getChallanDetailsCount(companyName: string): number {
 
 export default resolver.pipe(
   resolver.zod(ProcessExcelUploadSchema),
-  async ({ companies, actionType, jobTypes, challanStatusType = "challan_status" }) => {
+  async ({
+    companies,
+    actionType,
+    jobTypes,
+    challanStatusType = "challan_status",
+    onlyPaymentPdfNotInExcel = false,
+  }) => {
     // Create task batch
     const taskBatch = await db.taskBatch.create({
       data: {
@@ -105,6 +113,7 @@ export default resolver.pipe(
         filters: JSON.stringify({
           actionType,
           challanStatusType,
+          onlyPaymentPdfNotInExcel,
         }),
       },
     })

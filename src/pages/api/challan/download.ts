@@ -1,6 +1,7 @@
 import { NextApiRequest, NextApiResponse } from "next"
 import db from "db"
 import { downloadChallans } from "src/scripts/downloadChallan"
+import { secCodes as newSecCodes } from "src/challan/utils/newSecCodes"
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "POST") {
@@ -23,11 +24,23 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       return res.status(404).json({ error: "Company not found" })
     }
 
-    // Download challans
+    const challans = await db.challanData.findMany({
+      where: { companyId: parseInt(companyId) },
+      select: { pymntRefNum: true, sectionCode: true },
+    })
+    const downloadCount =
+      new Set(challans.map((c) => c.pymntRefNum).filter((ref): ref is string => !!ref)).size ||
+      undefined
+    const usesNewRegime = challans.some((c) =>
+      newSecCodes.some((s) => s.sec_cd.trim() === c.sectionCode.trim())
+    )
+
     const result = await downloadChallans(
       company.tan,
       company.it_password,
       company.name,
+      downloadCount,
+      { skipNewActRadio: !usesNewRegime }
     )
 
     return res.status(200).json({ success: true, result })

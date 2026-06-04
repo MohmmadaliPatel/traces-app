@@ -1,5 +1,18 @@
 import React, { useState } from "react"
-import { Button, Table, Card, Space, message, Upload, Tag, Alert, Radio, Select } from "antd"
+import {
+  Button,
+  Table,
+  Card,
+  Space,
+  message,
+  Upload,
+  Tag,
+  Alert,
+  Radio,
+  Select,
+  Switch,
+  Typography,
+} from "antd"
 import type { ColumnsType } from "antd/es/table"
 import {
   UploadOutlined,
@@ -59,6 +72,7 @@ function ChallanStatusPage() {
   const [dataSource, setDataSource] = useState<"excel" | "companies">("companies")
   const [loading, setLoading] = useState(false)
   const [fileList, setFileList] = useState<any[]>([])
+  const [onlyPaymentPdfNotInExcel, setOnlyPaymentPdfNotInExcel] = useState(false)
 
   const [companiesResponse] = useQuery(getCompanies, {
     orderBy: { name: "asc" },
@@ -157,6 +171,7 @@ function ChallanStatusPage() {
         actionType: "download_file",
         sendToAllPeriods: false,
         jobTypes: ["DownloadChallanStatus"],
+        onlyPaymentPdfNotInExcel,
       })
 
       messageApi.success("Challan status download jobs added to queue successfully")
@@ -444,6 +459,26 @@ function ChallanStatusPage() {
                   </>
                 )}
 
+                <Space direction="vertical" style={{ width: "100%", marginTop: 16 }}>
+                  <Space>
+                    <Switch
+                      checked={onlyPaymentPdfNotInExcel}
+                      onChange={setOnlyPaymentPdfNotInExcel}
+                    />
+                    <Typography.Text>
+                      Only payment PDFs not in challan status Excel
+                    </Typography.Text>
+                  </Space>
+                  {onlyPaymentPdfNotInExcel && (
+                    <Alert
+                      type="info"
+                      showIcon
+                      message="Restricted mode"
+                      description="Uses payment receipt PDFs only (no TDS return txt fallback). TRACES is queried only for challans not already in the status Excel file."
+                    />
+                  )}
+                </Space>
+
                 <Button
                   type="primary"
                   size="large"
@@ -486,6 +521,26 @@ function ChallanStatusPage() {
                     showIcon
                   />
                 )}
+
+                <Space direction="vertical" style={{ width: "100%", marginTop: 16 }}>
+                  <Space>
+                    <Switch
+                      checked={onlyPaymentPdfNotInExcel}
+                      onChange={setOnlyPaymentPdfNotInExcel}
+                    />
+                    <Typography.Text>
+                      Only payment PDFs not in challan status Excel
+                    </Typography.Text>
+                  </Space>
+                  {onlyPaymentPdfNotInExcel && (
+                    <Alert
+                      type="info"
+                      showIcon
+                      message="Restricted mode"
+                      description="Uses payment receipt PDFs only (no TDS return txt fallback). TRACES is queried only for challans not already in the status Excel file."
+                    />
+                  )}
+                </Space>
 
                 <Button
                   type="primary"

@@ -25,6 +25,16 @@ const NoticeDownloaderChallanStatusQueue = new Queue<{
         include: { company: true, Batch: true },
       })
 
+      let onlyPaymentPdfNotInExcel = false
+      if (task?.Batch?.filters) {
+        try {
+          const filters = JSON.parse(task.Batch.filters) as { onlyPaymentPdfNotInExcel?: boolean }
+          onlyPaymentPdfNotInExcel = filters.onlyPaymentPdfNotInExcel === true
+        } catch {
+          // ignore invalid filters JSON
+        }
+      }
+
       if (!task || !task.company) {
         throw new Error("Task or company not found")
       }
@@ -36,6 +46,7 @@ const NoticeDownloaderChallanStatusQueue = new Queue<{
         task.company,
         logger,
         parseInt(id),
+        { onlyPaymentPdfNotInExcel }
       )
 
       await noticeDownloaderChallanStatus.process()

@@ -266,6 +266,190 @@ interface CreateChallanParams {
   password: string
   assessmentYear: string
   sections: Array<{ sectionCode: string; amount: string; actType?: IncomeTaxActKind }>
+  skipDownload?: boolean
+}
+
+type ChallanCreateResult = {
+  sectionCode: string
+  sectionDesc: string
+  amount: string
+  success: boolean
+  pymntRefNum?: string
+  error?: string
+}
+
+function countChallansToDownload(results: ChallanCreateResult[]): number {
+  const keys = results
+    .filter((r) => r.success)
+    .map((r) => r.pymntRefNum ?? `${r.sectionCode}:${r.amount}`)
+  return new Set(keys).size
+}
+
+async function createNewRegimeCombinedChallan(
+  username: string,
+  assessmentYear: string,
+  sections: Array<{ sectionCode: string; amount: string }>
+): Promise<ChallanCreateResult[]> {
+  const pan = username.toUpperCase()
+  const secTable = newSecCodes
+  const natrOfPymntSections: Array<{
+    nature_pymnt: string
+    total_amt: number
+    sur_charge: number
+    basic_tax: number
+    edu_cess: number
+  }> = []
+  const sectionMeta: Array<{ sectionCode: string; sectionDesc: string; amount: string }> = []
+  const results: ChallanCreateResult[] = []
+
+  for (const section of sections) {
+    const { sectionCode, amount } = section
+    const secCodeData = secTable.find((s) => s.sec_cd.trim() === sectionCode.trim())
+    if (!secCodeData) {
+      results.push({
+        sectionCode,
+        sectionDesc: "",
+        amount,
+        success: false,
+        error: "Invalid section code",
+      })
+      continue
+    }
+    const amt = Number(amount)
+    natrOfPymntSections.push({
+      nature_pymnt: secCodeData.sec_cd,
+      total_amt: amt,
+      sur_charge: 0,
+      basic_tax: amt,
+      edu_cess: 0,
+    })
+    sectionMeta.push({ sectionCode, sectionDesc: secCodeData.sec_desc, amount })
+  }
+
+  if (natrOfPymntSections.length === 0) {
+    return results
+  }
+
+  const basicTax = natrOfPymntSections.reduce((s, x) => s + x.basic_tax, 0)
+  const surCharge = natrOfPymntSections.reduce((s, x) => s + x.sur_charge, 0)
+  const eduCess = natrOfPymntSections.reduce((s, x) => s + x.edu_cess, 0)
+  const interest = 0
+  const penalty = 0
+  const others = 0
+  const totalAmt = basicTax + surCharge + eduCess + interest + penalty + others
+
+  const draftData: any = {
+    header: { formName: "PO-03-PYMNT" },
+    formData: {
+      loggedInUserId: pan,
+      pan,
+      tileId: "12",
+      majorHead: "0020",
+      minorHead: "200",
+      majorSlNum: "1",
+      minorSlNum: "13",
+      basicTax,
+      surCharge,
+      eduCess,
+      interest,
+      penalty,
+      others,
+      totalAmt,
+      taxYear: assessmentYear,
+      totalAmtWord: `Rupees ${String(price_in_words(totalAmt)).trim().toLowerCase()} Only`,
+      paymentMode: "",
+      subPayMode: "",
+      bankCd: "",
+      natrOfPymntSections,
+      resStatus: "R",
+      res_st: "R",
+      effBankDetails: "",
+      pageName: "addTaxApplicableDetails",
+      actType: "N",
+      createdByUser: pan,
+    },
+    createdByUser: pan,
+  }
+
+  try {
+    console.log(
+      `Creating combined new-regime challan for ${sectionMeta.length} section(s):`,
+      sectionMeta.map((s) => s.sectionCode).join(", ")
+    )
+    const res = await axiosClient.post(
+      "https://eportal.incometax.gov.in/iec/paymentapi/auth/challan/savedraft",
+      draftData
+    )
+    draftData.formData.pymntRefNum = res.data.pymntRefNum
+    draftData.formData.paymentMode = "NER"
+    await axiosClient.post(
+      "https://eportal.incometax.gov.in/iec/paymentapi/auth/challan/savedraft",
+      draftData
+    )
+    draftData.formData.bankCode = "RBIS"
+    draftData.formData.subMinorHd = ""
+    draftData.formData.loginType = "post"
+    await axiosClient.post(
+      "https://eportal.incometax.gov.in/iec/paymentapi/auth/challan/savedraft",
+      draftData
+    )
+    const response = await axiosClient.post(
+      "https://eportal.incometax.gov.in/iec/paymentapi/auth/challan/create",
+      {
+        header: { formName: "PO-03-PYMNT" },
+        formData: {
+          pan: draftData.formData.pan,
+          paymentMode: draftData.formData.paymentMode,
+          subPayMode: "",
+          majorHead: draftData.formData.majorHead,
+          minorHead: draftData.formData.minorHead,
+          surCharge: draftData.formData.surCharge,
+          totalAmt: draftData.formData.totalAmt,
+          taxYear: assessmentYear,
+          totalAmtWord: draftData.formData.totalAmtWord,
+          bankCode: "RBIS",
+          basicTax: draftData.formData.basicTax,
+          eduCess: draftData.formData.eduCess,
+          interest: draftData.formData.interest,
+          penalty: draftData.formData.penalty,
+          others: draftData.formData.others,
+          pymntRefNum: draftData.formData.pymntRefNum,
+          tileId: draftData.formData.tileId,
+          loginType: "post",
+          majorSlNum: draftData.formData.majorSlNum,
+          minorSlNum: draftData.formData.minorSlNum,
+          subMinorHd: "",
+          actType: "N",
+          natrOfPymntSections: draftData.formData.natrOfPymntSections,
+          createdByUser: draftData.formData.createdByUser,
+        },
+      }
+    )
+    console.log("Combined new-regime challan created", response.data)
+    const pymntRefNum = draftData.formData.pymntRefNum
+    for (const meta of sectionMeta) {
+      results.push({
+        sectionCode: meta.sectionCode,
+        sectionDesc: meta.sectionDesc,
+        amount: meta.amount,
+        success: true,
+        pymntRefNum,
+      })
+    }
+  } catch (error: any) {
+    console.error("Error creating combined new-regime challan:", error)
+    for (const meta of sectionMeta) {
+      results.push({
+        sectionCode: meta.sectionCode,
+        sectionDesc: meta.sectionDesc,
+        amount: meta.amount,
+        success: false,
+        error: error.message || "Failed to create challan",
+      })
+    }
+  }
+
+  return results
 }
 
 function actKindToPortalCode(actType: IncomeTaxActKind | undefined): "O" | "N" {
@@ -277,30 +461,24 @@ function secCodesForAct(actType: IncomeTaxActKind | undefined) {
 }
 
 export async function createChallan(params: CreateChallanParams) {
-  const { username, password, assessmentYear, sections, companyName, companyCode } = params
+  const {
+    username,
+    password,
+    assessmentYear,
+    sections,
+    companyName,
+    companyCode,
+    skipDownload = false,
+  } = params
 
   console.log("USERNAME", username)
   console.log("PASSWORD", password)
   console.log("ASSESSMENT YEAR", assessmentYear)
   console.log("SECTIONS", sections)
 
-  // await downloadChallans(
-  //   username,
-  //   password,
-  //   companyName || `${username}_${companyCode}`,
-  //   1
-  // )
-
   await login(username.toUpperCase(), Buffer.from(password).toString("base64"))
 
-  const results: Array<{
-    sectionCode: string
-    sectionDesc: string
-    amount: string
-    success: boolean
-    pymntRefNum?: string
-    error?: string
-  }> = []
+  const results: ChallanCreateResult[] = []
 
   const res = await axiosClient.post(
     "https://eportal.incometax.gov.in/iec/servicesapi/auth/saveEntity",
@@ -312,7 +490,19 @@ export async function createChallan(params: CreateChallanParams) {
 
   console.log("RES", res.data)
 
-  for (const section of sections) {
+  const newRegimeSections = sections.filter((s) => s.actType === "new")
+  const otherSections = sections.filter((s) => s.actType !== "new")
+
+  if (newRegimeSections.length > 0) {
+    const combinedResults = await createNewRegimeCombinedChallan(
+      username,
+      assessmentYear,
+      newRegimeSections
+    )
+    results.push(...combinedResults)
+  }
+
+  for (const section of otherSections) {
     const { sectionCode, amount, actType } = section
     const portalAct = actKindToPortalCode(actType)
     const secTable = secCodesForAct(actType)
@@ -438,22 +628,21 @@ export async function createChallan(params: CreateChallanParams) {
     }
   }
 
-  // Download the created challans
-  const successfulCount = results.filter((r) => r.success).length
+  const downloadCount = countChallansToDownload(results)
 
-  if (successfulCount > 0) {
-    const anySuccessfulNewAct = sections.some(
-      (s, i) => results[i]?.success === true && s.actType === "new"
+  if (!skipDownload && downloadCount > 0) {
+    const anySuccessfulNewAct = newRegimeSections.some((s) =>
+      results.some((r) => r.success && r.sectionCode === s.sectionCode)
     )
     console.log(
-      `Downloading ${successfulCount} challan(s); Income-tax Act 2025 radio: ${anySuccessfulNewAct ? "yes" : "no (old only)"}`
+      `Downloading ${downloadCount} challan PDF(s); Income-tax Act 2025 radio: ${anySuccessfulNewAct ? "yes" : "no (old only)"}`
     )
     try {
       await downloadChallans(
         username,
         password,
         companyName || `${username}_${companyCode}`,
-        successfulCount,
+        downloadCount,
         { skipNewActRadio: !anySuccessfulNewAct }
       )
       console.log("Challans downloaded successfully")

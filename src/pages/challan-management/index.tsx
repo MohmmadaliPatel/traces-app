@@ -55,7 +55,36 @@ type EpayDownloadResultRow = {
   success: boolean
   errorMessage?: string
 }
+
+type CreateBatchItem = {
+  companyId: number
+  companyName: string
+  assessmentYear: string
+  sections: Array<{ sectionCode: string; amount: string; actType?: IncomeTaxActKind }>
+}
+
+type CreateResultRow = {
+  companyId: number
+  companyName: string
+  tan: string
+  success: boolean
+  errorMessage?: string
+  sectionsCreated?: number
+}
 const { RangePicker } = DatePicker
+
+function findDuplicateSectionCode(
+  sections: Array<{ sectionCode: string }>
+): string | null {
+  const seen = new Set<string>()
+  for (const { sectionCode } of sections) {
+    const code = sectionCode.trim()
+    if (!code) continue
+    if (seen.has(code)) return code
+    seen.add(code)
+  }
+  return null
+}
 
 interface ChallanDataType {
   id: number
@@ -120,7 +149,19 @@ const ChallanManagementPage: BlitzPage = () => {
   } | null>(null)
   const [epayRetryRowKeys, setEpayRetryRowKeys] = useState<number[]>([])
 
+  const [createProgress, setCreateProgress] = useState<{ current: number; total: number } | null>(
+    null
+  )
+  const [createResultsModalOpen, setCreateResultsModalOpen] = useState(false)
+  const [lastCreateRun, setLastCreateRun] = useState<{
+    startedAt: string
+    items: CreateBatchItem[]
+    results: CreateResultRow[]
+  } | null>(null)
+  const [createRetryRowKeys, setCreateRetryRowKeys] = useState<number[]>([])
+
   const epayDownloadBusy = downloadPaymentLoading || downloadGeneratedChallansLoading
+  const createBusy = createLoading || csvProcessing
 
   // Fetch companies
   const [companiesResponse] = useQuery(getCompanies, {
@@ -172,6 +213,15 @@ const ChallanManagementPage: BlitzPage = () => {
   }
 
   const handleSectionChange = (index: number, field: "sectionCode" | "amount", value: string) => {
+    if (
+      field === "sectionCode" &&
+      challanActType === "new" &&
+      selectedSections.some((s, i) => i !== index && s.sectionCode.trim() === value.trim())
+    ) {
+      messageApi.error("Each section can only be added once for the new regime")
+      return
+    }
+
     const newSections = [...selectedSections]
     const section = newSections[index]
     if (section) {
@@ -202,39 +252,33 @@ const ChallanManagementPage: BlitzPage = () => {
       return
     }
 
+    if (challanActType === "new") {
+      const duplicateCode = findDuplicateSectionCode(validSections)
+      if (duplicateCode) {
+        messageApi.error(
+          `Section ${duplicateCode} is listed more than once. New regime allows only one line per section in a combined challan.`
+        )
+        return
+      }
+    }
+
     const sectionsWithAct = validSections.map((s) => ({
       ...s,
       actType: challanActType,
     }))
 
-    setCreateLoading(true)
-    try {
-      for (const companyId of selectedCompanyIds) {
-        const response = await fetch("/api/challan/create", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            companyId,
-            assessmentYear,
-            sections: sectionsWithAct,
-          }),
-        })
-
-        const data = await response.json()
-        if (data.success) {
-          messageApi.success(`Challans created for company ${companyId}`)
-        } else {
-          messageApi.error(`Failed to create challans for company ${companyId}`)
-        }
+    const items: CreateBatchItem[] = selectedCompanyIds.map((companyId) => {
+      const meta = resolveCompanyMeta(companyId)
+      return {
+        companyId,
+        companyName: meta.companyName,
+        assessmentYear,
+        sections: sectionsWithAct,
       }
+    })
 
-      await refetch()
-      setSelectedSections([])
-    } catch (error: any) {
-      messageApi.error(error.message || "Failed to create challans")
-    } finally {
-      setCreateLoading(false)
-    }
+    await runCreateBatch(items)
+    setSelectedSections([])
   }
 
   const handleDownloadChallans = async () => {
@@ -272,6 +316,135 @@ const ChallanManagementPage: BlitzPage = () => {
       companyName: c?.name ?? `Company ${companyId}`,
       tan: c?.tan ?? "—",
     }
+  }
+
+  const evaluateCreateApiResponse = (
+    response: Response,
+    data: {
+      success?: boolean
+      error?: string
+      results?: Array<{ success?: boolean }>
+    },
+    meta: { companyId: number; companyName: string; tan: string }
+  ): CreateResultRow => {
+    const sectionResults = data.results ?? []
+    const successCount = sectionResults.filter((r) => r.success).length
+    const totalSections = sectionResults.length
+    const success = response.ok && data.success === true && successCount > 0
+
+    let errorMessage: string | undefined
+    if (!success) {
+      errorMessage =
+        data.error ||
+        (totalSections > 0
+          ? `0/${totalSections} sections created`
+          : `Request failed (HTTP ${response.status})`)
+    } else if (successCount < totalSections) {
+      errorMessage = `${totalSections - successCount}/${totalSections} sections failed`
+    }
+
+    return {
+      companyId: meta.companyId,
+      companyName: meta.companyName,
+      tan: meta.tan,
+      success,
+      errorMessage,
+      sectionsCreated: successCount,
+    }
+  }
+
+  const runCreateBatch = async (items: CreateBatchItem[]) => {
+    if (items.length === 0) return
+
+    const limit = 1
+    let completed = 0
+    const bumpProgress = () => {
+      completed += 1
+      setCreateProgress({ current: completed, total: items.length })
+    }
+
+    setCreateProgress({ current: 0, total: items.length })
+    setCreateLoading(true)
+
+    try {
+      const results = await runWithConcurrency(items, limit, async (item) => {
+        const meta = {
+          companyId: item.companyId,
+          companyName: item.companyName || resolveCompanyMeta(item.companyId).companyName,
+          tan: resolveCompanyMeta(item.companyId).tan,
+        }
+
+        try {
+          const response = await fetch("/api/challan/create", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              companyId: item.companyId,
+              assessmentYear: item.assessmentYear,
+              sections: item.sections,
+              skipDownload: false,
+            }),
+          })
+
+          let data: {
+            success?: boolean
+            error?: string
+            results?: Array<{ success?: boolean }>
+          } = {}
+          try {
+            data = await response.json()
+          } catch {
+            /* non-JSON body */
+          }
+
+          return evaluateCreateApiResponse(response, data, meta)
+        } catch (e: any) {
+          return {
+            companyId: meta.companyId,
+            companyName: meta.companyName,
+            tan: meta.tan,
+            success: false,
+            errorMessage: e?.message || "Network error",
+          }
+        } finally {
+          bumpProgress()
+        }
+      })
+
+      setLastCreateRun({
+        startedAt: new Date().toISOString(),
+        items,
+        results,
+      })
+      setCreateRetryRowKeys(results.filter((r) => !r.success).map((r) => r.companyId))
+      setCreateResultsModalOpen(true)
+
+      const ok = results.filter((r) => r.success).length
+      const bad = results.length - ok
+      messageApi.open({
+        type: ok === results.length ? "success" : bad === results.length ? "error" : "warning",
+        content: `Challan create: ${ok} succeeded, ${bad} failed`,
+        duration: 5,
+      })
+
+      await refetch()
+    } catch (error: any) {
+      messageApi.error(error.message || "Failed to create challans")
+    } finally {
+      setCreateLoading(false)
+      setCreateProgress(null)
+    }
+  }
+
+  const handleCreateRetrySelected = async () => {
+    if (!lastCreateRun) return
+    if (createRetryRowKeys.length === 0) {
+      messageApi.warning("Select at least one company to retry")
+      return
+    }
+    setCreateResultsModalOpen(false)
+    const items = lastCreateRun.items.filter((item) => createRetryRowKeys.includes(item.companyId))
+    await runCreateBatch(items)
   }
 
   const runEpayDownloadBatch = async (flow: EpayDownloadFlow, companyIds: number[]) => {
@@ -518,107 +691,84 @@ const ChallanManagementPage: BlitzPage = () => {
         return
       }
 
-      // Process companies sequentially
-      for (let i = 0; i < csvData.length; i++) {
-        const row = csvData[i]
-        const companyName = row["Company Name"]
+      const workItems: CreateBatchItem[] = []
 
-        setCsvProgress({
-          current: i + 1,
-          total: csvData.length,
-          currentCompany: companyName,
-          status: "Processing...",
+      for (const row of csvData) {
+        const companyName = row["Company Name"]
+        const company = savedCompanies.find((c) => c.tan === row["Username"])
+        if (!company) {
+          messageApi.warning(`Company ${companyName} not found in system, skipping...`)
+          continue
+        }
+
+        const rowAct = parseIncomeTaxActCsv(row["Act"])
+        const sections: Array<{ sectionCode: string; amount: string; actType: IncomeTaxActKind }> =
+          []
+        const sectionHeaders = Object.keys(row).filter(
+          (key) =>
+            ![
+              "Company Code",
+              "Company Name",
+              "Username",
+              "Password",
+              "Assessment Year",
+              "Act",
+            ].includes(key) &&
+            key.trim() !== "" &&
+            row[key]
+        )
+
+        sectionHeaders.forEach((header) => {
+          const amount = row[header]
+          const trimmedHeader = header.trim()
+          if (amount && amount.trim() !== "" && trimmedHeader !== "") {
+            sections.push({
+              sectionCode: trimmedHeader,
+              amount: amount.trim(),
+              actType: rowAct,
+            })
+          }
         })
 
-        try {
-          // Find company by TAN
-          const company = savedCompanies.find((c) => c.tan === row["Username"])
-          if (!company) {
-            messageApi.warning(`Company ${companyName} not found in system, skipping...`)
-            continue
-          }
-
-          const rowAct = parseIncomeTaxActCsv(row["Act"])
-
-          // Extract sections with amounts (exclude metadata columns)
-          const sections: Array<{ sectionCode: string; amount: string; actType: IncomeTaxActKind }> =
-            []
-          const sectionHeaders = Object.keys(row).filter(
-            (key) =>
-              ![
-                "Company Code",
-                "Company Name",
-                "Username",
-                "Password",
-                "Assessment Year",
-                "Act",
-              ].includes(key) &&
-              key.trim() !== "" &&
-              row[key]
-          )
-
-          sectionHeaders.forEach((header) => {
-            const amount = row[header]
-            const trimmedHeader = header.trim()
-            if (amount && amount.trim() !== "" && trimmedHeader !== "") {
-              sections.push({
-                sectionCode: trimmedHeader,
-                amount: amount.trim(),
-                actType: rowAct,
-              })
-            }
-          })
-
-          console.log(`Extracted sections for ${companyName}:`, sections)
-
-          if (sections.length === 0) {
-            messageApi.warning(`No sections found for ${companyName}, skipping...`)
-            continue
-          }
-
-          // Create challans
-          setCsvProgress({
-            current: i + 1,
-            total: csvData.length,
-            currentCompany: companyName,
-            status: "Creating challans...",
-          })
-
-          const createResponse = await fetch("/api/challan/create", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              companyId: company.id,
-              assessmentYear: row["Assessment Year"],
-              sections,
-            }),
-          })
-
-          const createData = await createResponse.json()
-          console.log(`Create response for ${companyName}:`, createData)
-
-          if (!createData.success) {
-            const errorMsg = createData.error || "Unknown error"
-            messageApi.error(`Failed to create challans for ${companyName}: ${errorMsg}`)
-            console.error(`Failed to create challans for ${companyName}:`, errorMsg)
-            continue
-          }
-
-          messageApi.success(
-            `Challans created for ${companyName} - ${createData.results?.length || 0} challans`
-          )
-
-          // Wait a bit before moving to next company
-          await new Promise((resolve) => setTimeout(resolve, 2000))
-        } catch (error: any) {
-          messageApi.error(`Error processing ${companyName}: ${error.message}`)
+        if (sections.length === 0) {
+          messageApi.warning(`No sections found for ${companyName}, skipping...`)
+          continue
         }
+
+        if (rowAct === "new") {
+          const duplicateCode = findDuplicateSectionCode(sections)
+          if (duplicateCode) {
+            messageApi.warning(
+              `Duplicate section ${duplicateCode} for ${companyName} (new regime). Skipping row...`
+            )
+            continue
+          }
+        }
+
+        workItems.push({
+          companyId: company.id,
+          companyName: company.name,
+          assessmentYear: row["Assessment Year"],
+          sections,
+        })
       }
 
+      if (workItems.length === 0) {
+        messageApi.error("No valid companies to process in CSV")
+        return
+      }
+
+      setCsvProgress({
+        current: 0,
+        total: workItems.length,
+        currentCompany: "",
+        status: "Creating challans...",
+      })
+
+      await runCreateBatch(workItems)
+
       setCsvProgress(null)
-      messageApi.success("CSV processing completed!")
       setCsvFileList([])
-      await refetch()
     } catch (error: any) {
       messageApi.error(error.message || "Failed to process CSV")
       setCsvFileList([])
@@ -822,6 +972,112 @@ const ChallanManagementPage: BlitzPage = () => {
           </Space>
         )}
       </Modal>
+      <Modal
+        title="Challan create results"
+        open={createResultsModalOpen}
+        onCancel={() => setCreateResultsModalOpen(false)}
+        width={840}
+        destroyOnClose={false}
+        footer={[
+          <Button key="close" onClick={() => setCreateResultsModalOpen(false)}>
+            Close
+          </Button>,
+          <Button
+            key="retry"
+            type="primary"
+            onClick={handleCreateRetrySelected}
+            disabled={createRetryRowKeys.length === 0 || createLoading}
+            loading={createLoading}
+          >
+            Retry selected
+          </Button>,
+        ]}
+      >
+        {lastCreateRun && (
+          <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+            <div>
+              <Text>
+                <strong>{lastCreateRun.results.filter((r) => r.success).length}</strong> succeeded,{" "}
+                <strong>{lastCreateRun.results.filter((r) => !r.success).length}</strong> failed
+              </Text>
+              <Text type="secondary">
+                {" "}
+                · {dayjs(lastCreateRun.startedAt).format("YYYY-MM-DD HH:mm:ss")}
+              </Text>
+            </div>
+            <Space wrap>
+              <Button
+                size="small"
+                onClick={() =>
+                  setCreateRetryRowKeys(
+                    lastCreateRun.results.filter((r) => !r.success).map((r) => r.companyId)
+                  )
+                }
+              >
+                Select failed only
+              </Button>
+              <Button
+                size="small"
+                onClick={() =>
+                  setCreateRetryRowKeys(lastCreateRun.results.map((r) => r.companyId))
+                }
+              >
+                Select all
+              </Button>
+              <Button size="small" onClick={() => setCreateRetryRowKeys([])}>
+                Clear
+              </Button>
+            </Space>
+            <Table<CreateResultRow>
+              size="small"
+              rowKey="companyId"
+              pagination={false}
+              scroll={{ y: 360 }}
+              dataSource={lastCreateRun.results}
+              rowSelection={{
+                selectedRowKeys: createRetryRowKeys,
+                onChange: (keys) => setCreateRetryRowKeys(keys as number[]),
+              }}
+              columns={[
+                { title: "Company", dataIndex: "companyName", key: "companyName", ellipsis: true },
+                { title: "TAN", dataIndex: "tan", key: "tan", width: 130 },
+                {
+                  title: "Sections",
+                  dataIndex: "sectionsCreated",
+                  key: "sectionsCreated",
+                  width: 90,
+                  render: (n: number | undefined) => (n != null ? n : "—"),
+                },
+                {
+                  title: "Status",
+                  key: "status",
+                  width: 100,
+                  render: (_, row) =>
+                    row.success ? (
+                      <Tag color="success">Success</Tag>
+                    ) : (
+                      <Tag color="error">Failed</Tag>
+                    ),
+                },
+                {
+                  title: "Error / detail",
+                  dataIndex: "errorMessage",
+                  key: "errorMessage",
+                  ellipsis: { showTitle: false },
+                  render: (msg: string | undefined) =>
+                    msg ? (
+                      <Tooltip title={msg}>
+                        <span>{msg}</span>
+                      </Tooltip>
+                    ) : (
+                      "—"
+                    ),
+                },
+              ]}
+            />
+          </Space>
+        )}
+      </Modal>
       <Space direction="vertical" size="large" style={{ width: "100%", padding: "24px" }}>
         <Title level={2}>Challan Management</Title>
 
@@ -837,7 +1093,7 @@ const ChallanManagementPage: BlitzPage = () => {
           <Space direction="vertical" size="middle" style={{ width: "100%" }}>
             <Alert
               message="Upload CSV File"
-              description="Upload a CSV file with company data to automatically create and download challans for multiple companies. The system will process one company at a time."
+              description="Upload a CSV file with company data to create challans for multiple companies concurrently. Use Download Payment History afterward to fetch payment PDFs."
               type="info"
               showIcon
             />
@@ -854,18 +1110,17 @@ const ChallanManagementPage: BlitzPage = () => {
               </Button>
             </Upload>
 
-            {csvProgress && (
+            {(csvProgress || createProgress) && (
               <Alert
-                message={`Processing ${csvProgress.current} of ${csvProgress.total}`}
+                message={`Creating ${createProgress?.current ?? csvProgress?.current ?? 0} of ${
+                  createProgress?.total ?? csvProgress?.total ?? 0
+                }`}
                 description={
-                  <div>
-                    <div>
-                      <strong>Current Company:</strong> {csvProgress.currentCompany}
-                    </div>
+                  csvProgress?.status ? (
                     <div>
                       <strong>Status:</strong> {csvProgress.status}
                     </div>
-                  </div>
+                  ) : undefined
                 }
                 type="info"
                 showIcon
@@ -958,6 +1213,13 @@ const ChallanManagementPage: BlitzPage = () => {
           }
         >
           <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+            <Alert
+              message="Create and download challan PDFs"
+              description="Each company is processed one at a time. After a challan is created on the portal, its Generated Challan PDF is downloaded automatically."
+              type="info"
+              showIcon
+            />
+
             <Space wrap>
               <Input
                 placeholder="Assessment Year (e.g., 2026-27)"
@@ -990,11 +1252,18 @@ const ChallanManagementPage: BlitzPage = () => {
                       return label.toLowerCase().includes(input.toLowerCase())
                     }}
                   >
-                    {(challanActType === "new" ? newSecCodes : oldSecCodes).map((code) => (
-                      <Option key={code.sec_cd} value={code.sec_cd}>
-                        {code.sec_cd} - {code.natr_pymnt_desc}
-                      </Option>
-                    ))}
+                    {(challanActType === "new" ? newSecCodes : oldSecCodes).map((code) => {
+                      const alreadySelected =
+                        challanActType === "new" &&
+                        selectedSections.some(
+                          (s, i) => i !== index && s.sectionCode.trim() === code.sec_cd.trim()
+                        )
+                      return (
+                        <Option key={code.sec_cd} value={code.sec_cd} disabled={alreadySelected}>
+                          {code.sec_cd} - {code.natr_pymnt_desc}
+                        </Option>
+                      )
+                    })}
                   </Select>
                 </Col>
                 <Col span={10}>
@@ -1018,7 +1287,7 @@ const ChallanManagementPage: BlitzPage = () => {
             ))}
 
             <Space>
-              <Button icon={<PlusOutlined />} onClick={handleAddSection}>
+              <Button icon={<PlusOutlined />} onClick={handleAddSection} disabled={createBusy}>
                 Add Section
               </Button>
               <Button
@@ -1027,6 +1296,7 @@ const ChallanManagementPage: BlitzPage = () => {
                 onClick={handleCreateChallans}
                 loading={createLoading}
                 disabled={
+                  createBusy ||
                   selectedCompanyIds.length === 0 ||
                   !assessmentYear ||
                   selectedSections.length === 0
@@ -1035,6 +1305,14 @@ const ChallanManagementPage: BlitzPage = () => {
                 Create Challans
               </Button>
             </Space>
+
+            {createProgress && (
+              <Alert
+                message={`Creating ${createProgress.current} of ${createProgress.total}`}
+                type="info"
+                showIcon
+              />
+            )}
           </Space>
         </Card>
 

@@ -11,7 +11,34 @@ import {
 import path from "path"
 import pdfParse from "pdf-parse"
 import * as XLSX from "xlsx"
+import {
+  groupMissingByPaymentDay,
+  loadMissingFromGapsJson,
+  paymentHistoryPdfExists as paymentHistoryPdfExistsForCompany,
+} from "src/challan/utils/paymentHistoryFiles"
 puppeteer.use(StealthPlugin())
+
+const PAYMENT_HISTORY_API_PATH = "/paymentapi/auth/challan/paymenthistory"
+
+type PaymentHistoryApiResponse = {
+  paymentList?: {
+    content?: Array<{ cin?: string }>
+    last?: boolean
+  }
+}
+
+function parsePaymentHistoryCins(json: unknown): string[] {
+  const data = json as PaymentHistoryApiResponse
+  const content = data?.paymentList?.content
+  if (!Array.isArray(content)) return []
+  return content
+    .map((item) => item.cin)
+    .filter((cin): cin is string => typeof cin === "string" && cin.length > 0)
+}
+
+function isPaymentHistoryApiUrl(url: string): boolean {
+  return url.includes(PAYMENT_HISTORY_API_PATH)
+}
 
 async function login(page: Page, username: string, password: string) {
   await page.waitForSelector('input[name="panAdhaarUserId"]') // Replace with your button selector
@@ -636,6 +663,465 @@ export type EpayFilteredDownloadTabConfig = {
   filterModalDomIds: EpayFilterModalDomIds
 }
 
+export type PaymentHistoryDownloadStats = {
+  totalSeen: number
+  skipped: number
+  downloaded: number
+  pages: number
+}
+
+export type PaymentHistoryDownloadTarget = {
+  cin: string
+  paymentTime?: string
+}
+
+/** Download challan receipts for specific rows (match by payment date text + CIN in row). */
+async function downloadPaymentHistoryRowsForCins(
+  page: Page,
+  targets: PaymentHistoryDownloadTarget[]
+): Promise<{ downloaded: number; notFound: string[] }> {
+  if (targets.length === 0) return { downloaded: 0, notFound: [] }
+
+  return page.evaluate(async (missingTargets) => {
+    function waitForSecs(timeout = 5000) {
+      return new Promise((resolve) => setTimeout(() => resolve(true), timeout))
+    }
+
+    const notFound: string[] = []
+    let downloaded = 0
+
+    for (const target of missingTargets) {
+      const cin = target.cin
+      const datePart = target.paymentTime?.trim().split(/\s+/)[0] ?? ""
+      const rows = Array.from(
+        document.querySelectorAll("ag-grid-angular .ag-row")
+      ) as HTMLElement[]
+      const row = rows.find((r) => {
+        const text = r.textContent || ""
+        if (datePart && !text.includes(datePart)) return false
+        return text.includes(cin)
+      })
+      if (!row) {
+        notFound.push(cin)
+        continue
+      }
+      const actionButton = row.querySelector(
+        "app-e-pay-tax-actions .mat-mdc-icon-button"
+      ) as HTMLElement | null
+      if (!actionButton) {
+        notFound.push(cin)
+        continue
+      }
+      actionButton.click()
+      await waitForSecs(500)
+      ;(
+        document.querySelector(".mat-mdc-menu-item.mat-focus-indicator") as HTMLElement | null
+      )?.click()
+      await waitForSecs(5000)
+      downloaded++
+    }
+
+    return { downloaded, notFound }
+  }, targets)
+}
+
+/** Fallback: download every row on the current page (legacy behavior). */
+async function downloadAllPaymentHistoryRowsOnPage(page: Page): Promise<void> {
+  await page.evaluate(async () => {
+    function waitForSecs(timeout = 5000) {
+      return new Promise((resolve) => setTimeout(() => resolve(true), timeout))
+    }
+
+    const actionButtons = [
+      ...Array.from(
+        document.querySelectorAll("app-e-pay-tax-actions .mat-mdc-icon-button")
+      ),
+    ]
+
+    for (const btn of actionButtons) {
+      ;(btn as HTMLElement).click()
+      await waitForSecs(500)
+      ;(
+        document.querySelector(".mat-mdc-menu-item.mat-focus-indicator") as HTMLElement | null
+      )?.click()
+      await waitForSecs(5000)
+    }
+  })
+}
+
+async function clickNextPaymentHistoryPage(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const nextPageButtons = Array.from(
+      document.querySelectorAll("button.buttonPag.mdc-icon-button.mat-mdc-icon-button")
+    )
+    const nextButton = nextPageButtons.find((btn) => {
+      const img = btn.querySelector('img[alt="right arrow"]')
+      return img !== null && !btn.hasAttribute("disabled")
+    })
+    if (nextButton) {
+      ;(nextButton as HTMLElement).click()
+      return true
+    }
+    return false
+  })
+}
+
+type PaymentHistoryCapture = ReturnType<typeof createPaymentHistoryResponseCapture>
+
+function createPaymentHistoryResponseCapture(page: Page) {
+  let pending: { url: string; json: unknown } | null = null
+  let lastConsumedUrl = ""
+
+  const onResponse = async (response: { url: () => string; json: () => Promise<unknown> }) => {
+    const url = response.url()
+    if (!isPaymentHistoryApiUrl(url)) return
+    try {
+      pending = { url, json: await response.json() }
+    } catch {
+      /* ignore parse errors */
+    }
+  }
+
+  page.on("response", onResponse)
+
+  const take = async (timeoutMs = 60000): Promise<string[]> => {
+    const start = Date.now()
+    while (Date.now() - start < timeoutMs) {
+      if (pending && pending.url !== lastConsumedUrl) {
+        lastConsumedUrl = pending.url
+        const json = pending.json
+        pending = null
+        return parsePaymentHistoryCins(json)
+      }
+      await waitForSecs(200)
+    }
+    return []
+  }
+
+  const reset = () => {
+    pending = null
+    lastConsumedUrl = ""
+  }
+
+  const dispose = () => page.off("response", onResponse)
+
+  return { take, dispose, reset }
+}
+
+type PaymentHistoryInterceptOptions = {
+  /** Only attempt downloads for these CINs (used with payment-date filter batches). */
+  targetCins?: Set<string>
+  /** Map CIN → paymentTime from gaps JSON for row matching. */
+  targetPaymentTimes?: Map<string, string>
+}
+
+function targetsStillMissing(companyName: string, cins: Set<string>): PaymentHistoryDownloadTarget[] {
+  return Array.from(cins)
+    .filter((cin) => !paymentHistoryPdfExistsForCompany(companyName, cin))
+    .map((cin) => ({ cin }))
+}
+
+/** Payment History: intercept API for CINs, skip existing PDFs, download only missing. */
+async function runPaymentHistoryDownloadWithIntercept(
+  page: Page,
+  companyName: string,
+  capture: PaymentHistoryCapture,
+  options?: PaymentHistoryInterceptOptions
+): Promise<PaymentHistoryDownloadStats> {
+  const stats: PaymentHistoryDownloadStats = {
+    totalSeen: 0,
+    skipped: 0,
+    downloaded: 0,
+    pages: 0,
+  }
+
+  let pageNum = 0
+  while (true) {
+    pageNum++
+    stats.pages = pageNum
+    console.log(`Processing Payment History page ${pageNum}...`)
+
+    const cins = await capture.take(pageNum === 1 ? 60000 : 30000)
+
+    if (cins.length === 0) {
+      console.log(
+        `No CINs from paymenthistory intercept on page ${pageNum} — falling back to download all rows`
+      )
+      await downloadAllPaymentHistoryRowsOnPage(page)
+      const rowCount = await page.evaluate(
+        () => document.querySelectorAll("app-e-pay-tax-actions .mat-mdc-icon-button").length
+      )
+      stats.downloaded += rowCount
+      stats.totalSeen += rowCount
+    } else {
+      stats.totalSeen += cins.length
+      let missingCins = cins.filter((cin) => !paymentHistoryPdfExistsForCompany(companyName, cin))
+      if (options?.targetCins) {
+        missingCins = missingCins.filter((cin) => options.targetCins!.has(cin))
+      }
+      const skippedOnPage = cins.length - missingCins.length
+      stats.skipped += skippedOnPage
+
+      console.log(
+        `Page ${pageNum}: ${cins.length} payments, ${skippedOnPage} skipped on page, ${missingCins.length} to download`
+      )
+
+      if (missingCins.length > 0) {
+        const targets: PaymentHistoryDownloadTarget[] = missingCins.map((cin) => ({
+          cin,
+          paymentTime: options?.targetPaymentTimes?.get(cin),
+        }))
+        const result = await downloadPaymentHistoryRowsForCins(page, targets)
+        stats.downloaded += result.downloaded
+        if (result.notFound.length > 0) {
+          console.log(
+            `Warning: CIN(s) not found in grid on page ${pageNum}: ${result.notFound.join(", ")}`
+          )
+        }
+      }
+
+      if (options?.targetCins) {
+        const pending = targetsStillMissing(companyName, options.targetCins)
+        if (pending.length === 0) {
+          console.log("All target CINs for this date range have PDFs — stopping pagination")
+          break
+        }
+      }
+    }
+
+    const hasNext = await clickNextPaymentHistoryPage(page)
+    if (!hasNext) {
+      console.log("No more Payment History pages")
+      break
+    }
+    await waitForSecs(3000)
+  }
+
+  console.log(
+    `Payment History summary: ${stats.totalSeen} seen, ${stats.skipped} skipped (existing PDF), ${stats.downloaded} downloaded, ${stats.pages} pages`
+  )
+  return stats
+}
+
+const PAYMENT_HISTORY_FILTER_DOM: EpayFilterModalDomIds = {
+  fromDateInputId: "frompayment",
+  toDateInputId: "topayment",
+}
+
+/** Apply Payment History tab filters (payment date range required for missing-PDF batch downloads). */
+async function applyPaymentHistoryFilters(
+  page: Page,
+  params: {
+    fromDate?: string
+    toDate?: string
+    assessmentYear?: string
+    paymentType?: string
+  }
+) {
+  const { fromDate, toDate, assessmentYear, paymentType } = params
+  const dom = PAYMENT_HISTORY_FILTER_DOM
+
+  if (!assessmentYear && !paymentType && !(fromDate && toDate)) {
+    return
+  }
+
+  console.log("Applying Payment History filters...", { fromDate, toDate, assessmentYear, paymentType })
+
+  await page.waitForSelector("button.defaultButton.filterButton")
+  await page.click("button.defaultButton.filterButton")
+  await waitForSecs(2000)
+
+  const openMatSelectInFilterModal = async (formControlName: "assessmentYear" | "typeOfPayment") => {
+    const opened = await page.evaluate((name) => {
+      const modalBody =
+        document.querySelector(".modal.show .modal-body") ??
+        Array.from(document.querySelectorAll(".modal-body")).find(
+          (b) => (b as HTMLElement).offsetParent !== null
+        ) ??
+        null
+      const sel = modalBody?.querySelector(
+        `mat-select[formcontrolname="${name}"]`
+      ) as HTMLElement | null
+      if (!sel) return false
+      sel.click()
+      return true
+    }, formControlName)
+    if (!opened) {
+      console.log(`Warning: mat-select[formcontrolname=${formControlName}] not found in filter modal`)
+    }
+    await waitForSecs(400)
+    try {
+      await page.waitForSelector(".cdk-overlay-container mat-option", { visible: true, timeout: 8000 })
+    } catch {
+      console.log(`Warning: mat-option panel did not appear for ${formControlName}`)
+    }
+  }
+
+  const clickMatOptionByExactLabel = async (label: string) => {
+    const clicked = await page.evaluate((want) => {
+      const norm = (s: string) => s.replace(/\s+/g, " ").trim()
+      const wantNorm = norm(want)
+      const options = Array.from(
+        document.querySelectorAll(".cdk-overlay-container mat-option")
+      ) as HTMLElement[]
+      const target = options.find((opt) => norm(opt.textContent || "") === wantNorm)
+      if (target) {
+        target.click()
+        return true
+      }
+      const loose = options.find((opt) => norm(opt.textContent || "").includes(wantNorm))
+      if (loose) {
+        loose.click()
+        return true
+      }
+      return false
+    }, label)
+    if (!clicked) {
+      console.log(`Warning: no mat-option matched label: "${label}"`)
+    }
+    await waitForSecs(600)
+  }
+
+  if (assessmentYear) {
+    await openMatSelectInFilterModal("assessmentYear")
+    await clickMatOptionByExactLabel(assessmentYear)
+  }
+
+  if (paymentType) {
+    await openMatSelectInFilterModal("typeOfPayment")
+    await clickMatOptionByExactLabel(paymentType)
+  }
+
+  if (fromDate && toDate) {
+    const fromInputId = dom.fromDateInputId
+    const toInputId = dom.toDateInputId
+
+    await page.evaluate((inputId) => {
+      const fromInput = document.getElementById(inputId)
+      if (fromInput) {
+        const parent = fromInput.closest("mat-form-field")
+        const calendarButton = parent?.querySelector(
+          'mat-datepicker-toggle button[aria-label="Open calendar"]'
+        )
+        if (calendarButton) {
+          ;(calendarButton as HTMLElement).click()
+        }
+      }
+    }, fromInputId)
+    await waitForSecs(1000)
+    await selectDateInOpenMatCalendar(page, fromDate)
+    await waitForSecs(500)
+
+    await page.evaluate((inputId) => {
+      const toInput = document.getElementById(inputId)
+      if (toInput) {
+        const parent = toInput.closest("mat-form-field")
+        const calendarButton = parent?.querySelector(
+          'mat-datepicker-toggle button[aria-label="Open calendar"]'
+        )
+        if (calendarButton) {
+          ;(calendarButton as HTMLElement).click()
+        }
+      }
+    }, toInputId)
+    await waitForSecs(1000)
+    await selectDateInOpenMatCalendar(page, toDate)
+    await waitForSecs(500)
+  }
+
+  await waitForSecs(1000)
+  const filterClicked = await page.evaluate(() => {
+    const filterSection = Array.from(document.querySelectorAll(".filter-section.mt-3.mr-3")).find(
+      (el) => !el.hasAttribute("hidden") && ((el as HTMLElement).offsetParent !== null)
+    )
+    if (!filterSection) return false
+
+    const modalFooter = filterSection.querySelector(".modal-footer")
+    if (modalFooter) {
+      const buttons = Array.from(modalFooter.querySelectorAll("button"))
+      const filterButton = buttons.find((btn) => btn.textContent?.trim() === "Filter")
+      if (filterButton) {
+        ;(filterButton as HTMLElement).click()
+        return true
+      }
+    }
+
+    const filterButtons = Array.from(
+      filterSection.querySelectorAll("button.defaultButton.primaryButton")
+    )
+    const filterButton = filterButtons.find((btn) => btn.textContent?.trim() === "Filter")
+    if (filterButton) {
+      ;(filterButton as HTMLElement).click()
+      return true
+    }
+    return false
+  })
+
+  if (!filterClicked) {
+    console.log("Warning: Could not click Filter in modal")
+  }
+  await waitForSecs(3000)
+}
+
+/** Generated Challans: download all rows on every page (unchanged legacy behavior). */
+async function runGeneratedChallansDownloadAllPages(page: Page): Promise<void> {
+  await page.evaluate(async () => {
+    function waitForSecs(timeout = 5000) {
+      return new Promise((resolve) => {
+        setTimeout(() => resolve(true), timeout)
+      })
+    }
+
+    let pageCount = 0
+    while (true) {
+      pageCount++
+      console.log(`Processing page ${pageCount}...`)
+
+      const actionButtons = [
+        ...Array.from(
+          document.querySelectorAll("app-e-pay-tax-actions .mat-mdc-icon-button")
+        ),
+      ]
+
+      if (actionButtons.length === 0) {
+        console.log("No records found on this page")
+        break
+      }
+
+      console.log(`Found ${actionButtons.length} records on page ${pageCount}`)
+
+      for (const btn of actionButtons) {
+        ;(btn as HTMLElement).click()
+        await waitForSecs(500)
+        ;(
+          document.querySelector(".mat-mdc-menu-item.mat-focus-indicator") as HTMLElement | null
+        )?.click()
+        await waitForSecs(5000)
+      }
+
+      const nextPageButtons = Array.from(
+        document.querySelectorAll("button.buttonPag.mdc-icon-button.mat-mdc-icon-button")
+      )
+
+      const nextButton = nextPageButtons.find((btn) => {
+        const img = btn.querySelector('img[alt="right arrow"]')
+        return img !== null && !btn.hasAttribute("disabled")
+      })
+
+      if (nextButton) {
+        console.log("Moving to next page...")
+        ;(nextButton as HTMLElement).click()
+        await waitForSecs(3000)
+      } else {
+        console.log("No more pages or next button is disabled")
+        break
+      }
+    }
+
+    console.log(`Completed processing ${pageCount} pages`)
+  })
+}
+
 async function runChallanEpayFilterDownload(
   Username: string,
   Password: string,
@@ -646,7 +1132,7 @@ async function runChallanEpayFilterDownload(
   paymentType: string | undefined,
   options: DownloadChallansOptions | undefined,
   kind: EpayFilteredDownloadTabConfig
-) {
+): Promise<PaymentHistoryDownloadStats | void> {
   const skipNewActRadio = options?.skipNewActRadio === true
   const dom = kind.filterModalDomIds
   console.log(`Downloading e-Pay (${kind.flowLabel}) for company:`, companyName)
@@ -709,6 +1195,11 @@ async function runChallanEpayFilterDownload(
   await page.waitForSelector(".mdc-tab__text-label")
   const elements = await page.$$(".mdc-tab__text-label")
 
+  const isPaymentHistory = kind.tabText === "Payment History"
+  const paymentHistoryCapture = isPaymentHistory
+    ? createPaymentHistoryResponseCapture(page)
+    : null
+
   await waitForSecs(6000)
   for (let element of elements) {
     // Get the text content of each element
@@ -721,15 +1212,14 @@ async function runChallanEpayFilterDownload(
 
   await waitForSecs(5000)
 
-  // Apply filters using the portal's filter modal
-  if (assessmentYear || paymentType || (fromDate && toDate)) {
+  if (isPaymentHistory) {
+    await applyPaymentHistoryFilters(page, { fromDate, toDate, assessmentYear, paymentType })
+  } else if (assessmentYear || paymentType || (fromDate && toDate)) {
     console.log("Applying filters using the portal's filter modal...")
-
-    // Click the Filter button to open modal
     await page.waitForSelector("button.defaultButton.filterButton")
     await page.click("button.defaultButton.filterButton")
     await waitForSecs(2000)
-
+    // Generated Challans tab keeps inline filter logic (different date input ids via dom)
     const openMatSelectInFilterModal = async (formControlName: "assessmentYear" | "typeOfPayment") => {
       const opened = await page.evaluate((name) => {
         const modalBody =
@@ -781,28 +1271,17 @@ async function runChallanEpayFilterDownload(
       await waitForSecs(600)
     }
 
-    // Fill in Assessment Year if provided
     if (assessmentYear) {
-      console.log("Selecting assessment year:", assessmentYear)
       await openMatSelectInFilterModal("assessmentYear")
       await clickMatOptionByExactLabel(assessmentYear)
     }
-
-    // Fill in Type of Payment if provided
     if (paymentType) {
-      console.log("Selecting payment type:", paymentType)
       await openMatSelectInFilterModal("typeOfPayment")
       await clickMatOptionByExactLabel(paymentType)
     }
-
-    // Fill in date range (Payment Date on Payment History tab; Date of Creation on Generated Challans)
     if (fromDate && toDate) {
-      console.log("Selecting date range:", fromDate, "to", toDate)
-
       const fromInputId = dom.fromDateInputId
       const toInputId = dom.toDateInputId
-
-      // Click the calendar toggle button for "From" date
       await page.evaluate((inputId) => {
         const fromInput = document.getElementById(inputId)
         if (fromInput) {
@@ -816,11 +1295,8 @@ async function runChallanEpayFilterDownload(
         }
       }, fromInputId)
       await waitForSecs(1000)
-
       await selectDateInOpenMatCalendar(page, fromDate)
       await waitForSecs(500)
-
-      // Click the calendar toggle button for "To" date
       await page.evaluate((inputId) => {
         const toInput = document.getElementById(inputId)
         if (toInput) {
@@ -834,60 +1310,38 @@ async function runChallanEpayFilterDownload(
         }
       }, toInputId)
       await waitForSecs(1000)
-
       await selectDateInOpenMatCalendar(page, toDate)
       await waitForSecs(500)
     }
 
-    // Click the Filter button in the modal to apply filters
-    console.log("Clicking filter button to apply filters...")
-    // Wait for the filter button to be visible
     await waitForSecs(1000)
-
-    // Search for filter button within the filter-section element
     const filterClicked = await page.evaluate(() => {
-      // Find the filter-section container using three-class combination to avoid dummy sections
-      // Select the filter section that is NOT hidden (ignores any with the "hidden" attribute)
-      const filterSection = Array.from(document.querySelectorAll(".filter-section.mt-3.mr-3"))
-        .find((el) => !el.hasAttribute("hidden") && ((el as HTMLElement).offsetParent !== null));
-      if (!filterSection) {
-        console.log("Could not find .filter-section.mt-3.mr-3 element")
-        return false
-      }
-
-      // Approach 1: Find button with text "Filter" in modal footer within filter-section
+      const filterSection = Array.from(document.querySelectorAll(".filter-section.mt-3.mr-3")).find(
+        (el) => !el.hasAttribute("hidden") && ((el as HTMLElement).offsetParent !== null)
+      )
+      if (!filterSection) return false
       const modalFooter = filterSection.querySelector(".modal-footer")
       if (modalFooter) {
         const buttons = Array.from(modalFooter.querySelectorAll("button"))
         const filterButton = buttons.find((btn) => btn.textContent?.trim() === "Filter")
         if (filterButton) {
-          console.log("Found filter button in modal footer")
           ;(filterButton as HTMLElement).click()
           return true
         }
       }
-
-      // Approach 2: Find by class combination within filter-section
       const filterButtons = Array.from(
         filterSection.querySelectorAll("button.defaultButton.primaryButton")
       )
       const filterButton = filterButtons.find((btn) => btn.textContent?.trim() === "Filter")
       if (filterButton) {
-        console.log("Found filter button by class combination")
         ;(filterButton as HTMLElement).click()
         return true
       }
-
-      console.log("Could not find filter button in filter-section")
       return false
     })
-
-    if (filterClicked) {
-      console.log("Filter button clicked successfully")
-    } else {
+    if (!filterClicked) {
       console.log("Warning: Could not find filter button")
     }
-
     await waitForSecs(3000)
   }
 
@@ -899,64 +1353,17 @@ async function runChallanEpayFilterDownload(
     )
   })
 
-  // Download all filtered payments across all pages
-  await page.evaluate(async () => {
-    function waitForSecs(timeout = 5000) {
-      return new Promise((resolve) => {
-        setTimeout(() => {
-          resolve(true)
-        }, timeout)
-      })
-    }
-
-    let pageCount = 0
-    while (true) {
-      pageCount++
-      console.log(`Processing page ${pageCount}...`)
-
-      const actionButtons = [
-        ...Array.from(
-          document.querySelectorAll("app-e-pay-tax-actions .mat-mdc-icon-button")
-        ),
-      ]
-
-      if (actionButtons.length === 0) {
-        console.log("No records found on this page")
-        break
-      }
-
-      console.log(`Found ${actionButtons.length} records on page ${pageCount}`)
-
-      // Download all records on this page
-      for (const btn of actionButtons) {
-        ;(btn as any).click()
-        await waitForSecs(500)
-        ;(document.querySelector(".mat-mdc-menu-item.mat-focus-indicator") as any)?.click()
-        await waitForSecs(5000)
-      }
-
-      // Check if next page button is enabled
-      const nextPageButtons = Array.from(
-        document.querySelectorAll("button.buttonPag.mdc-icon-button.mat-mdc-icon-button")
-      )
-
-      const nextButton = nextPageButtons.find((btn) => {
-        const img = btn.querySelector('img[alt="right arrow"]')
-        return img !== null && !btn.hasAttribute("disabled")
-      })
-
-      if (nextButton) {
-        console.log("Moving to next page...")
-        ;(nextButton as HTMLElement).click()
-        await waitForSecs(3000)
-      } else {
-        console.log("No more pages or next button is disabled")
-        break
-      }
-    }
-
-    console.log(`Completed processing ${pageCount} pages`)
-  })
+  let paymentHistoryStats: PaymentHistoryDownloadStats | undefined
+  if (isPaymentHistory && paymentHistoryCapture) {
+    paymentHistoryStats = await runPaymentHistoryDownloadWithIntercept(
+      page,
+      companyName,
+      paymentHistoryCapture
+    )
+    paymentHistoryCapture.dispose()
+  } else {
+    await runGeneratedChallansDownloadAllPages(page)
+  }
 
   // Wait a bit for all downloads to complete
   await waitForSecs(10000)
@@ -970,6 +1377,168 @@ async function runChallanEpayFilterDownload(
     console.log(`✅ Successfully converted PDFs to Excel: ${excelPath}`)
   } else {
     console.log("⚠️ Could not convert PDFs to Excel")
+  }
+
+  return paymentHistoryStats
+}
+
+export type MissingPaymentPdfDownloadResult = PaymentHistoryDownloadStats & {
+  dateRangesProcessed: number
+  stillMissing: number
+  dayGroups: Array<{ dayKey: string; count: number }>
+}
+
+/**
+ * Download only missing Payment History PDFs using payment-date filters per day
+ * (from payment_history_gaps.json `paymentTime` field). No CIN search on portal.
+ */
+export async function downloadMissingPaymentHistoryPdfs(
+  Username: string,
+  Password: string,
+  companyName: string,
+  options?: DownloadChallansOptions & {
+    missing?: Array<{ cin: string; paymentTime?: string; assessmentYear?: string; paymentType?: string }>
+  }
+): Promise<MissingPaymentPdfDownloadResult> {
+  const skipNewActRadio = options?.skipNewActRadio === true
+
+  let missingRows = options?.missing ?? loadMissingFromGapsJson(companyName)
+  missingRows = missingRows.filter((r) => !paymentHistoryPdfExistsForCompany(companyName, r.cin))
+
+  if (missingRows.length === 0) {
+    console.log("[downloadMissingPaymentHistoryPdfs] No missing PDFs to download")
+    return {
+      totalSeen: 0,
+      skipped: 0,
+      downloaded: 0,
+      pages: 0,
+      dateRangesProcessed: 0,
+      stillMissing: 0,
+      dayGroups: [],
+    }
+  }
+
+  const dayGroups = groupMissingByPaymentDay(companyName, missingRows).map((g) => ({
+    ...g,
+    items: g.items.filter((i) => !paymentHistoryPdfExistsForCompany(companyName, i.cin)),
+    cins: g.cins.filter((cin) => !paymentHistoryPdfExistsForCompany(companyName, cin)),
+  })).filter((g) => g.cins.length > 0)
+
+  console.log(
+    `[downloadMissingPaymentHistoryPdfs] ${missingRows.length} missing PDFs across ${dayGroups.length} payment date(s)`
+  )
+
+  const browser = await puppeteer.launch({
+    headless: false,
+    executablePath:
+      process.platform === "darwin"
+        ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        : process.platform === "win32"
+        ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+        : undefined,
+    args: ["--start-maximized"],
+  })
+
+  const page = await browser.newPage()
+  const downloadPath = path.resolve(`./public/pdf/challans/${companyName}/PaymentHistory`)
+  const client = await page.createCDPSession()
+  if (!fs.existsSync(downloadPath)) {
+    fs.mkdirSync(downloadPath, { recursive: true })
+  }
+  await client.send("Page.setDownloadBehavior", { behavior: "allow", downloadPath })
+
+  const capture = createPaymentHistoryResponseCapture(page)
+  const aggregate: PaymentHistoryDownloadStats = {
+    totalSeen: 0,
+    skipped: 0,
+    downloaded: 0,
+    pages: 0,
+  }
+
+  try {
+    await page.goto("https://eportal.incometax.gov.in/iec/foservices/#/login")
+    await login(page, Username, Password)
+    await navigateToEpayTaxViaMenu(page)
+
+    if (skipNewActRadio) {
+      await clickContinueAfterEpayLanding(page)
+    } else {
+      await page.waitForSelector("#mat-radio-0", { visible: true, timeout: 120000 })
+      await page.click("#mat-radio-0")
+      await clickContinueAfterEpayLanding(page)
+    }
+
+    await page.waitForSelector(".mdc-tab__text-label")
+    const elements = await page.$$(".mdc-tab__text-label")
+    await waitForSecs(6000)
+    for (const element of elements) {
+      const text = await page.evaluate((el) => el.textContent?.trim(), element)
+      if (text === "Payment History") {
+        await element.click()
+      }
+    }
+    await waitForSecs(5000)
+
+    for (let i = 0; i < dayGroups.length; i++) {
+      const group = dayGroups[i]!
+      console.log(
+        `\n[downloadMissingPaymentHistoryPdfs] Date batch ${i + 1}/${dayGroups.length}: ${group.dayKey} (${group.cins.length} CINs)`
+      )
+
+      capture.reset()
+      await applyPaymentHistoryFilters(page, {
+        fromDate: group.fromDate,
+        toDate: group.toDate,
+        assessmentYear: group.assessmentYear,
+        paymentType: group.paymentType,
+      })
+
+      await page.evaluate(() => {
+        ;[...Array.from(document.querySelectorAll("ag-grid-angular .ag-row.ag-row-first"))].forEach(
+          (e) => {
+            e.children[e.children.length - 1]?.scrollIntoView()
+          }
+        )
+      })
+
+      const targetPaymentTimes = new Map<string, string>()
+      for (const item of group.items) {
+        if (item.paymentTime) {
+          targetPaymentTimes.set(item.cin, item.paymentTime)
+        }
+      }
+
+      const dayStats = await runPaymentHistoryDownloadWithIntercept(page, companyName, capture, {
+        targetCins: new Set(group.cins),
+        targetPaymentTimes,
+      })
+
+      aggregate.totalSeen += dayStats.totalSeen
+      aggregate.skipped += dayStats.skipped
+      aggregate.downloaded += dayStats.downloaded
+      aggregate.pages += dayStats.pages
+    }
+
+    await waitForSecs(10000)
+    await convertPdfsToExcel(downloadPath, companyName)
+  } finally {
+    capture.dispose()
+    await browser.close()
+  }
+
+  const stillMissing = missingRows.filter(
+    (r) => !paymentHistoryPdfExistsForCompany(companyName, r.cin)
+  ).length
+
+  console.log(
+    `[downloadMissingPaymentHistoryPdfs] Done: downloaded ${aggregate.downloaded}, still missing ${stillMissing}`
+  )
+
+  return {
+    ...aggregate,
+    dateRangesProcessed: dayGroups.length,
+    stillMissing,
+    dayGroups: dayGroups.map((g) => ({ dayKey: g.dayKey, count: g.cins.length })),
   }
 }
 
