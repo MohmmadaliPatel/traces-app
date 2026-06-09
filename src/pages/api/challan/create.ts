@@ -10,6 +10,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   try {
     const { companyId, assessmentYear, sections, skipDownload = false } = req.body
 
+    // createChallan now creates a fresh isolated AxiosInstance + CookieJar per call
+    // (via createIncomeTaxAxiosClient + loginIncomeTaxPortal from the shared util).
+    // This makes concurrent creation across companies safe (no shared session state).
+    // The UI batch create path (challan-management) now passes skipDownload: true
+    // so that no post-create Puppeteer download of Generated Challans happens inside
+    // the create step. Users are expected to create first (concurrently, with knob),
+    // then separately download Payment History / Generated Challans (which already
+    // support their own concurrency sliders and runWithConcurrency).
+    // Direct callers or future use-cases can still pass skipDownload: false to get
+    // the embedded download behavior for a single invocation.
     if (!companyId || !assessmentYear || !sections || sections.length === 0) {
       return res.status(400).json({ error: "Missing required fields" })
     }

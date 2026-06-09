@@ -31,16 +31,23 @@ dayjs.extend(customParseFormat)
 export default class NoticeDownloaderConso {
   axiosClient: AxiosInstance
   profileDetails: any
+  private financialYear: string = ""
+  private quarter: string = ""
+  private formType: string = ""
 
   constructor(
     private company: Company,
     private logger: { log: (msg: string) => void },
     private taskId: number,
     private jobTypes: ("SendRequest" | "DownloadFile")[],
-    private financialYear: string = "",
-    private quarter: string = "",
-    private formType: string = ""
+    financialYear: string | string[] = "",
+    quarter: string | string[] = "",
+    formType: string | string[] = ""
   ) {
+    this.financialYear = Array.isArray(financialYear) ? financialYear[0] ?? "" : financialYear
+    this.quarter = Array.isArray(quarter) ? quarter[0] ?? "" : quarter
+    this.formType = Array.isArray(formType) ? formType[0] ?? "" : formType
+
     this.axiosClient = getAxiostClient()
     axiosRetry(this.axiosClient, {
       retries: 2,
@@ -1931,7 +1938,9 @@ export default class NoticeDownloaderConso {
     const fs = require("fs")
 
     try {
-      console.log(record);
+      if (!record) {
+        throw new Error("No challan record provided for TRACES automation")
+      }
 
       this.logger.log(`Starting TRACES automation for ${record.companyName}`)
 
@@ -2806,7 +2815,11 @@ export default class NoticeDownloaderConso {
       }
 
       const companyData = await this.readReturnsTxtFiles()
-      console.log("companyData", companyData)
+      if (!companyData) {
+        throw new Error(
+          `No challan data found for ${this.company.name} (FY ${this.financialYear}, ${this.quarter}, ${this.formType})`
+        )
+      }
 
       await this.getTracesDatapuppeteer(companyData)
     }

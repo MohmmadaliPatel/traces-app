@@ -1,164 +1,15 @@
-import { wrapper } from "axios-cookiejar-support"
-import { CookieJar } from "tough-cookie"
-import axios from "axios"
 import { secCodes as oldSecCodes } from "../challan/utils/secCodes"
 import { secCodes as newSecCodes } from "../challan/utils/newSecCodes"
 import type { IncomeTaxActKind } from "../challan/utils/incomeTaxAct"
 import { downloadChallans } from "./downloadChallan"
-const axiosRetry = require("axios-retry").default
-
-function delay(time: number) {
-  return new Promise(function (resolve) {
-    setTimeout(resolve, time)
-  })
-}
-
-const jar = new CookieJar()
-const axiosClient = wrapper(
-  axios.create({
-    jar: jar,
-    headers: {
-      "content-type": "application/json",
-      accept: "application/json, text/plain, */*",
-      "accept-language": "en-US,en;q=0.9",
-      "cache-control": "no-cache",
-      pragma: "no-cache",
-      "sec-fetch-dest": "empty",
-      "sec-fetch-mode": "cors",
-      "sec-fetch-site": "same-origin",
-      "sec-gpc": "1",
-      Referer: "https://eportal.incometax.gov.in/iec/foservices/",
-      "Referrer-Policy": "strict-origin-when-cross-origin",
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.82 Safari/537.36",
-    },
-  } as any) as any
-)
-axiosRetry(axiosClient, { retries: 3 })
+import {
+  createIncomeTaxAxiosClient,
+  loginIncomeTaxPortal,
+  saveIncomeTaxUserProfile,
+} from "src/utils/incomeTaxPortalAuth"
+import type { AxiosInstance } from "axios"
 
 
-
-async function loadLoginPage() {
-  try {
-    await axiosClient.get("https://eportal.incometax.gov.in/iec/foservices/#/login", {
-      headers: {
-        "Content-Type": "text/html; charset=utf-8",
-      },
-    })
-  } catch (error) {
-    console.error(error)
-  }
-}
-
-async function login(pan: string, password: string) {
-  await loadLoginPage()
-  const panResponse = await verifyPan(pan)
-  await delay(5000)
-  const res = await verifyPassword(panResponse.reqId, panResponse.role, pan, password)
-  const shouldForceLogin = res.messages.some((m: any) => m.code === "EF00177")
-  const InvalidPassword = res.messages.some((m: any) => m.code === "EF00027")
-  if (InvalidPassword) {
-    throw new Error("Invalid password")
-  }
-  if (shouldForceLogin) {
-    console.log("It seems this user is already logged in someother device")
-    await delay(5000)
-    await forceLogin(panResponse.reqId, panResponse.role, pan, password)
-  }
-}
-
-async function forceLogin(reqId: string, role: string, pan: string, password: string) {
-  try {
-    console.log("Trying to force login")
-    const res = await axiosClient.post("https://eportal.incometax.gov.in/iec/loginapi/login", {
-      errors: [],
-      reqId: reqId,
-      entity: pan,
-      entityType: "PAN",
-      role,
-      uidValdtnFlg: "true",
-      aadhaarMobileValidated: "false",
-      secAccssMsg: "",
-      secLoginOptions: "",
-      dtoService: "LOGIN",
-      exemptedPan: "false",
-      userConsent: "",
-      imgByte: null,
-      pass: password,
-      passValdtnFlg: null,
-      otpGenerationFlag: null,
-      otp: null,
-      otpValdtnFlg: null,
-      otpSourceFlag: null,
-      contactPan: null,
-      contactMobile: null,
-      contactEmail: null,
-      email: null,
-      mobileNo: null,
-      forgnDirEmailId: null,
-      imagePath: null,
-      serviceName: "loginService",
-      aadhaarLinkedWithUserId: "Y",
-      userType: "IND",
-      remark: "Continue",
-      lastLoginSuccessFlag: "true",
-    })
-    return res.data
-  } catch (error) {
-    console.log(`Unable to login forcefully`)
-    throw error
-  }
-}
-
-async function verifyPan(pan: string) {
-  try {
-    const res = await axiosClient.post("https://eportal.incometax.gov.in/iec/loginapi/login", {
-      entity: pan,
-      serviceName: "wLoginService",
-    })
-    return res.data
-  } catch (error) {
-    throw error
-  }
-}
-
-async function verifyPassword(reqId: string, role: string, pan: string, password: string) {
-  try {
-    const res = await axiosClient.post("https://eportal.incometax.gov.in/iec/loginapi/login", {
-      errors: [],
-      reqId: reqId,
-      entity: pan,
-      entityType: "PAN",
-      role,
-      uidValdtnFlg: "true",
-      aadhaarMobileValidated: "false",
-      secAccssMsg: "",
-      secLoginOptions: "",
-      dtoService: "LOGIN",
-      exemptedPan: "false",
-      userConsent: "",
-      imgByte: null,
-      pass: password,
-      passValdtnFlg: null,
-      otpGenerationFlag: null,
-      otp: null,
-      otpValdtnFlg: null,
-      otpSourceFlag: null,
-      contactPan: null,
-      contactMobile: null,
-      contactEmail: null,
-      email: null,
-      mobileNo: null,
-      forgnDirEmailId: null,
-      imagePath: null,
-      serviceName: "loginService",
-    })
-    console.log(res.data)
-    return res.data
-  } catch (error) {
-    throw error
-  }
-}
 
 function price_in_words(price: any): string {
   const sglDigit = ["Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine"],
@@ -286,6 +137,7 @@ function countChallansToDownload(results: ChallanCreateResult[]): number {
 }
 
 async function createNewRegimeCombinedChallan(
+  client: AxiosInstance,
   username: string,
   assessmentYear: string,
   sections: Array<{ sectionCode: string; amount: string }>
@@ -376,24 +228,24 @@ async function createNewRegimeCombinedChallan(
       `Creating combined new-regime challan for ${sectionMeta.length} section(s):`,
       sectionMeta.map((s) => s.sectionCode).join(", ")
     )
-    const res = await axiosClient.post(
+    const res = await client.post(
       "https://eportal.incometax.gov.in/iec/paymentapi/auth/challan/savedraft",
       draftData
     )
     draftData.formData.pymntRefNum = res.data.pymntRefNum
     draftData.formData.paymentMode = "NER"
-    await axiosClient.post(
+    await client.post(
       "https://eportal.incometax.gov.in/iec/paymentapi/auth/challan/savedraft",
       draftData
     )
     draftData.formData.bankCode = "RBIS"
     draftData.formData.subMinorHd = ""
     draftData.formData.loginType = "post"
-    await axiosClient.post(
+    await client.post(
       "https://eportal.incometax.gov.in/iec/paymentapi/auth/challan/savedraft",
       draftData
     )
-    const response = await axiosClient.post(
+    const response = await client.post(
       "https://eportal.incometax.gov.in/iec/paymentapi/auth/challan/create",
       {
         header: { formName: "PO-03-PYMNT" },
@@ -476,25 +328,18 @@ export async function createChallan(params: CreateChallanParams) {
   console.log("ASSESSMENT YEAR", assessmentYear)
   console.log("SECTIONS", sections)
 
-  await login(username.toUpperCase(), Buffer.from(password).toString("base64"))
+  const client = createIncomeTaxAxiosClient()
+  await loginIncomeTaxPortal(client, username, password)
+  await saveIncomeTaxUserProfile(client, username.toUpperCase())
 
   const results: ChallanCreateResult[] = []
-
-  const res = await axiosClient.post(
-    "https://eportal.incometax.gov.in/iec/servicesapi/auth/saveEntity",
-    {
-      serviceName: "userProfileService",
-      userId: username,
-    }
-  )
-
-  console.log("RES", res.data)
 
   const newRegimeSections = sections.filter((s) => s.actType === "new")
   const otherSections = sections.filter((s) => s.actType !== "new")
 
   if (newRegimeSections.length > 0) {
     const combinedResults = await createNewRegimeCombinedChallan(
+      client,
       username,
       assessmentYear,
       newRegimeSections
@@ -558,14 +403,14 @@ export async function createChallan(params: CreateChallanParams) {
         createdByUser: username.toUpperCase(),
       }
       console.log("DRAFT DATA 1", draftData)
-      const res = await axiosClient.post(
+      const res = await client.post(
         "https://eportal.incometax.gov.in/iec/paymentapi/auth/challan/savedraft",
         draftData
       )
       draftData.formData.pymntRefNum = res.data.pymntRefNum
       draftData.formData.paymentMode = "NER"
       console.log("DRAFT DATA 2")
-      await axiosClient.post(
+      await client.post(
         "https://eportal.incometax.gov.in/iec/paymentapi/auth/challan/savedraft",
         draftData
       )
@@ -573,7 +418,7 @@ export async function createChallan(params: CreateChallanParams) {
       draftData.formData.subMinorHd = ""
       draftData.formData.loginType = "post"
       console.log("DRAFT DATA 3")
-      const response = await axiosClient.post(
+      const response = await client.post(
         "https://eportal.incometax.gov.in/iec/paymentapi/auth/challan/create",
         {
           header: { formName: "PO-03-PYMNT" },

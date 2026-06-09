@@ -137,6 +137,7 @@ const ChallanManagementPage: BlitzPage = () => {
   const [companyPickerCsvLoading, setCompanyPickerCsvLoading] = useState(false)
 
   const [epayConcurrency, setEpayConcurrency] = useState(1)
+  const [createConcurrency, setCreateConcurrency] = useState(1)
   const [epayDownloadProgress, setEpayDownloadProgress] = useState<{
     current: number
     total: number
@@ -356,7 +357,7 @@ const ChallanManagementPage: BlitzPage = () => {
   const runCreateBatch = async (items: CreateBatchItem[]) => {
     if (items.length === 0) return
 
-    const limit = 1
+    const limit = Math.min(7, Math.max(1, createConcurrency), items.length)
     let completed = 0
     const bumpProgress = () => {
       completed += 1
@@ -382,7 +383,7 @@ const ChallanManagementPage: BlitzPage = () => {
               companyId: item.companyId,
               assessmentYear: item.assessmentYear,
               sections: item.sections,
-              skipDownload: false,
+              skipDownload: true,
             }),
           })
 
@@ -1093,7 +1094,7 @@ const ChallanManagementPage: BlitzPage = () => {
           <Space direction="vertical" size="middle" style={{ width: "100%" }}>
             <Alert
               message="Upload CSV File"
-              description="Upload a CSV file with company data to create challans for multiple companies concurrently. Use Download Payment History afterward to fetch payment PDFs."
+              description="Upload a CSV file with company data to create challans for multiple companies concurrently (subject to the Concurrent creates setting above; creation is API-only and does not download PDFs). After the batch, use the 'Download Payment History' (or 'Download Generated Challans') section below — which supports its own concurrency — to fetch the receipt PDFs."
               type="info"
               showIcon
             />
@@ -1214,8 +1215,8 @@ const ChallanManagementPage: BlitzPage = () => {
         >
           <Space direction="vertical" size="middle" style={{ width: "100%" }}>
             <Alert
-              message="Create and download challan PDFs"
-              description="Each company is processed one at a time. After a challan is created on the portal, its Generated Challan PDF is downloaded automatically."
+              message="Create Challans (API, concurrent)"
+              description="Creates challans on the portal using the e-Pay APIs (no browser). Use the concurrency setting below to process multiple companies at once. No PDFs are downloaded as part of creation. After the batch finishes, go to the 'e-Pay downloads' section below and use 'Download Payment History' (or 'Download Generated Challans') to fetch the receipt PDFs concurrently."
               type="info"
               showIcon
             />
@@ -1235,6 +1236,22 @@ const ChallanManagementPage: BlitzPage = () => {
               >
                 <Option value="old">Old Act — pre-2025 regime (actType O)</Option>
                 <Option value="new">New Act — Income-tax Act, 2025 (actType N)</Option>
+              </Select>
+            </Space>
+
+            <Space direction="vertical" size="small" style={{ width: "100%" }}>
+              <div><strong>Concurrent creates:</strong></div>
+              <Text type="secondary" style={{ fontSize: 12, display: "block" }}>
+                How many companies to create challans for in parallel (portal API calls only — lightweight, no Chrome).
+                Max 7. Default 1 for safety. After creation, use the separate "Download Payment History" button (with its own concurrency) to fetch receipts.
+              </Text>
+              <Select
+                style={{ width: 120 }}
+                value={createConcurrency}
+                onChange={(v) => setCreateConcurrency(v)}
+                disabled={createBusy}
+              >
+                {[1,2,3,4,5,6,7].map(n => <Option key={n} value={n}>{n}</Option>)}
               </Select>
             </Space>
 
