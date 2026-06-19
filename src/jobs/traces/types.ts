@@ -9,4 +9,7 @@ export interface TracesLoginResponse {
     /** Required for `preauthV2` (`RefreshToken` header). */
     refreshToken?: string
   }
+  errorCode?: string
+  message?: string
+  isAuthenticated?: boolean
 }

@@ -210,6 +210,38 @@ export type LoginWithTracesApiAndPreauthOptions = {
 
   redirectGuard?: boolean
 
+  /** Max captcha+login attempts before failing (default 5). */
+
+  maxLoginAttempts?: number
+
+  /** Optional sink for retry / failure messages (e.g. job logger). */
+
+  log?: (message: string) => void
+
+}
+
+
+
+export const TRACES_DEFAULT_MAX_LOGIN_ATTEMPTS = 5
+
+
+
+const CAPTCHA_RETRY_ERROR_CODES = new Set(["CPT403", "CPT401", "CPT400"])
+
+
+
+function isRetryableLoginFailure(loginRes: {
+  errorCode?: string
+  message?: string
+}): boolean {
+  const code = (loginRes.errorCode ?? "").toUpperCase()
+  if (CAPTCHA_RETRY_ERROR_CODES.has(code)) return true
+  const msg = (loginRes.message ?? "").toLowerCase()
+  return (
+    msg.includes("captcha") ||
+    msg.includes("verification code") ||
+    msg.includes("image data")
+  )
 }
 
 
@@ -232,49 +264,97 @@ export async function loginWithTracesApiAndPreauth(
 
 ): Promise<void> {
 
-  log(
+  const jobLog = options?.log ?? ((message: string) => log("loginWithTracesApiAndPreauth", message))
 
-    "loginWithTracesApiAndPreauth",
+  const maxAttempts = options?.maxLoginAttempts ?? TRACES_DEFAULT_MAX_LOGIN_ATTEMPTS
 
-    "start API captcha + login → preauth cookies for Puppeteer",
+  jobLog(
 
-    `tan=${credentials.tan ? "(set)" : "(empty)"} userId=${credentials.userId ? "(set)" : "(empty)"}`
+    `TRACES API login starting (up to ${maxAttempts} captcha+login attempts); tan=${credentials.tan ? "(set)" : "(empty)"} userId=${credentials.userId ? "(set)" : "(empty)"}`
 
   )
 
   const http = createTracesHttp()
 
-  const authApiSetCookieLines: string[] = []
+  let accessToken: string | undefined
 
-  const captchaMeta = await generateCaptcha(http, authApiSetCookieLines)
+  let refreshToken: string | undefined
 
-  const captchaText = await resolveCaptchaFromImageBase64(captchaMeta.image)
+  let authApiSetCookieLines: string[] = []
 
-  const loginRes = await loginTraces(
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
 
-    http,
+    authApiSetCookieLines = []
 
-    {
+    const captchaMeta = await generateCaptcha(http, authApiSetCookieLines)
 
-      tan: credentials.tan,
+    const captchaText = await resolveCaptchaFromImageBase64(captchaMeta.image)
 
-      userId: credentials.userId,
+    const loginRes = await loginTraces(
 
-      password: credentials.password,
+      http,
 
-      captcha: captchaText,
+      {
 
-      captchaId: captchaMeta.id,
+        tan: credentials.tan,
 
-    },
+        userId: credentials.userId,
 
-    authApiSetCookieLines
+        password: credentials.password,
 
-  )
+        captcha: captchaText,
 
-  const accessToken = loginRes.authTokenDto?.accessToken
+        captchaId: captchaMeta.id,
 
-  const refreshToken = loginRes.authTokenDto?.refreshToken
+      },
+
+      authApiSetCookieLines
+
+    )
+
+    accessToken = loginRes.authTokenDto?.accessToken
+
+    refreshToken = loginRes.authTokenDto?.refreshToken
+
+    if (accessToken && refreshToken?.trim()) {
+
+      jobLog(`TRACES login succeeded on attempt ${attempt}/${maxAttempts}`)
+
+      break
+
+    }
+
+    const errorCode = loginRes.errorCode ?? "UNKNOWN"
+
+    const errorMessage = loginRes.message ?? "TRACES API login did not return authTokenDto.accessToken"
+
+    jobLog(
+
+      `TRACES login attempt ${attempt}/${maxAttempts} failed — errorCode=${errorCode} message=${errorMessage}`
+
+    )
+
+    if (attempt >= maxAttempts) {
+
+      throw new Error(
+
+        `TRACES login failed after ${maxAttempts} attempts: ${errorCode} — ${errorMessage}`
+
+      )
+
+    }
+
+    if (!isRetryableLoginFailure(loginRes)) {
+
+      throw new Error(`TRACES login failed (non-retryable): ${errorCode} — ${errorMessage}`)
+
+    }
+
+    jobLog(`Retrying TRACES login (new captcha)…`)
+
+    await new Promise((resolve) => setTimeout(resolve, 800))
+
+  }
 
   if (!accessToken) {
 

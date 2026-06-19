@@ -9,6 +9,13 @@ import db from "db"
 import { findAndProcessTxtFiles, getAxiostClient, setOn401Handler } from "./helper"
 import path from "path"
 import { waitForSecs } from "src/utils/promises"
+import {
+  waitForSelectorLong,
+  waitForEitherSelectorLong,
+  isCaptchaChallengeOnPage,
+  isResourceNotFoundErrorOnPage,
+  DEFAULT_LONG_WAIT,
+} from "src/utils/puppeteerWaits"
 import dayjs from "dayjs"
 import customParseFormat from "dayjs/plugin/customParseFormat"
 import { exec } from "child_process"
@@ -19,7 +26,11 @@ import puppeteer from "puppeteer-extra"
 import StealthPlugin from "puppeteer-extra-plugin-stealth"
 import * as XLSX from "xlsx"
 import { parseForm16AFile } from "src/utils/form16AParserExact"
-import { generateForm16APdf } from "src/utils/form16APdfGeneratorExact"
+import {
+  generateForm16APdfBatch,
+  closeForm16ABrowser,
+  defaultForm16AConcurrency,
+} from "src/utils/form16APdfGeneratorExact"
 import {
   loginWithTracesApiAndPreauth,
   TRACES61_ORIGIN,
@@ -33,17 +44,26 @@ dayjs.extend(customParseFormat)
 export default class NoticeDownloaderForm16 {
   axiosClient: AxiosInstance
   profileDetails: any
+  private financialYear: string = ""
+  private quarter: string = ""
+  private formType: string = ""
+  private form16Type: "form16" | "form16a" = "form16"
 
   constructor(
     private company: Company,
     private logger: { log: (msg: string) => void },
     private taskId: number,
     private jobTypes: ("SendRequest" | "DownloadFile")[],
-    private financialYear: string = "",
-    private quarter: string = "",
-    private formType: string = "",
-    private form16Type: "form16" | "form16a" = "form16"
+    financialYear: string | string[] = "",
+    quarter: string | string[] = "",
+    formType: string | string[] = "",
+    form16Type: "form16" | "form16a" = "form16"
   ) {
+    this.financialYear = Array.isArray(financialYear) ? financialYear[0] ?? "" : financialYear
+    this.quarter = Array.isArray(quarter) ? quarter[0] ?? "" : quarter
+    this.formType = Array.isArray(formType) ? formType[0] ?? "" : formType
+    this.form16Type = form16Type
+
     this.axiosClient = getAxiostClient()
     axiosRetry(this.axiosClient, {
       retries: 2,
@@ -1506,44 +1526,97 @@ export default class NoticeDownloaderForm16 {
     const fs = require("fs")
     console.log("record", record)
 
-    try {
-      this.logger.log(`Starting TRACES automation for ${record.companyName}`)
+    const MAX_CAPTCHA_RETRIES = 5
+    for (let attempt = 1; attempt <= MAX_CAPTCHA_RETRIES; attempt++) {
+      let browser: any = null
+      let page: any = null
+      try {
+        this.logger.log(
+          `Starting TRACES automation for ${record.companyName} (attempt ${attempt}/${MAX_CAPTCHA_RETRIES})`
+        )
 
-      const browser = await puppeteer.launch({
-        headless: false,
-        args: ["--start-maximized"],
-      })
+        browser = await puppeteer.launch({
+          headless: false,
+          args: ["--start-maximized"],
+        })
 
-      const page = await browser.newPage()
-      await page.setViewport({ width: 1920, height: 1080 })
+        page = await browser.newPage()
+        await page.setViewport({ width: 1920, height: 1080 })
 
-      this.logger.log("TRACES API login + preauth (traces61)…")
-      await loginWithTracesApiAndPreauth(page, {
-        userId: record.user_id,
-        password: record.password,
-        tan: record.tan,
-      })
-      this.logger.log("Login successful")
+        this.logger.log("TRACES API login + preauth (traces61)…")
+        await loginWithTracesApiAndPreauth(
+          page,
+          {
+            userId: record.user_id,
+            password: record.password,
+            tan: record.tan,
+          },
+          {
+            log: (msg) => this.logger.log(msg),
+            maxLoginAttempts: 5,
+          }
+        )
+        this.logger.log("Login successful")
 
-      this.logger.log("Navigating to consolidated file page...")
-      await page.goto(traces61DedUrl("filedownload.xhtml"), {
-        waitUntil: "networkidle2",
-      })
+        this.logger.log("Navigating to consolidated file page...")
+        await page.goto(traces61DedUrl("filedownload.xhtml"), {
+          waitUntil: "networkidle2",
+        })
 
-      // Select financial year, quarter, and form type
+        // Immediately check for the "Requested resource could not be found" dead-end page.
+        // If present, throw so the outer 5-attempt loop closes the browser and retries from login.
+        try {
+          if (await isResourceNotFoundErrorOnPage(page)) {
+            throw new Error('RESOURCE_NOT_FOUND_ERROR: "Requested resource could not be found" after navigating to filedownload page')
+          }
+        } catch (chkErr: any) {
+          const m = chkErr?.message || String(chkErr)
+          if (/RESOURCE_NOT_FOUND_ERROR/i.test(m)) throw chkErr
+          this.logger.log(`Resource-not-found check after filedownload nav transient: ${m}`)
+        }
 
-      await waitForSecs(2000)
+        // Select financial year, quarter, and form type
 
-      await page.waitForSelector("#search3")
-      await page.click("#search3")
+        await waitForSecs(2000)
 
-      await waitForSecs(2000)
+        // Long-poll wait after navigation to the download listing page (Form 16 / 16A downloads can be slow)
+        await waitForSelectorLong(page, "#search3", {
+          ...DEFAULT_LONG_WAIT,
+          label: "#search3 (after filedownload page nav)",
+        })
+        await page.click("#search3")
 
-      // await page.waitForNavigation({ waitUntil: "networkidle2" })
-      // INSERT_YOUR_CODE
+        await waitForSecs(2000)
 
-      // Wait for the reqList table to load
-      await page.waitForSelector("#reqList")
+        // await page.waitForNavigation({ waitUntil: "networkidle2" })
+        // INSERT_YOUR_CODE
+
+        // Wait for the reqList table to load - use robust long wait
+        await waitForSelectorLong(page, "#reqList", {
+          ...DEFAULT_LONG_WAIT,
+          label: "#reqList (after search click for downloads)",
+        })
+
+        try {
+          if (await isCaptchaChallengeOnPage(page)) {
+            throw new Error("CAPTCHA_FAILED_IN_FLOW: captcha presented on download listing page (after search)")
+          }
+        } catch (chkErr: any) {
+          const chkMsg = chkErr?.message || String(chkErr)
+          if (/captcha|CAPTCHA/i.test(chkMsg)) throw chkErr
+          this.logger.log(`Captcha check after search transient (continuing to retry logic if needed): ${chkMsg}`)
+        }
+
+        // Also check for the resource-not-found error page on the listing (can appear instead of the table on slow/bad state)
+        try {
+          if (await isResourceNotFoundErrorOnPage(page)) {
+            throw new Error('RESOURCE_NOT_FOUND_ERROR: "Requested resource could not be found" on download listing page (after search)')
+          }
+        } catch (chkErr: any) {
+          const m = chkErr?.message || String(chkErr)
+          if (/RESOURCE_NOT_FOUND_ERROR/i.test(m)) throw chkErr
+          this.logger.log(`Resource-not-found check after search transient: ${m}`)
+        }
 
       // Setup for downloading files
       const pathModule = require("path")
@@ -1698,11 +1771,38 @@ export default class NoticeDownloaderForm16 {
 
             this.logger.log(`Clicked on request row: ${reqNo}`)
 
+            // If a captcha challenge appeared instead of the download controls, trigger outer retry
+            try {
+              if (await isCaptchaChallengeOnPage(page)) {
+                throw new Error(`CAPTCHA_FAILED_IN_FLOW: captcha presented after clicking row ${reqNo} (download)`)
+              }
+            } catch (chkErr: any) {
+              const chkMsg = chkErr?.message || String(chkErr)
+              if (/captcha|CAPTCHA/i.test(chkMsg)) throw chkErr
+              this.logger.log(`Captcha check after row click transient for ${reqNo} (will retry flow): ${chkMsg}`)
+            }
+
+            // Check for the "Requested resource could not be found" error page after row click.
+            // This page can appear due to session/URL state issues on slow networks; close browser + retry whole flow.
+            try {
+              if (await isResourceNotFoundErrorOnPage(page)) {
+                throw new Error(`RESOURCE_NOT_FOUND_ERROR: "Requested resource could not be found" after clicking row ${reqNo} (download)`)
+              }
+            } catch (chkErr: any) {
+              const m = chkErr?.message || String(chkErr)
+              if (/RESOURCE_NOT_FOUND_ERROR/i.test(m)) throw chkErr
+              this.logger.log(`Resource-not-found check after row click transient for ${reqNo}: ${m}`)
+            }
+
             // Wait for the download link/button to appear
             await waitForSecs(1000)
             let downloadSelector = "#downloadhttp"
+            // Use long wait here: after clicking a request row, the download link can take >30s (esp. Form 16A)
             try {
-              await page.waitForSelector(downloadSelector, { timeout: 5000 })
+              await waitForSelectorLong(page, downloadSelector, {
+                ...DEFAULT_LONG_WAIT,
+                label: `${downloadSelector} (after row click for ${reqNo})`,
+              })
             } catch (e) {
               this.logger.log(`Download button not found for reqNo: ${reqNo}`)
               downloadResults.push({
@@ -1776,6 +1876,29 @@ export default class NoticeDownloaderForm16 {
                 reqNo: reqNo,
               })
               continue
+            }
+
+            // Some downloads (esp Form 16A) can trigger a captcha on the click itself due to slow session state
+            try {
+              if (await isCaptchaChallengeOnPage(page)) {
+                throw new Error(`CAPTCHA_FAILED_IN_FLOW: captcha presented on download click for ${reqNo}`)
+              }
+            } catch (chkErr: any) {
+              const chkMsg = chkErr?.message || String(chkErr)
+              if (/captcha|CAPTCHA/i.test(chkMsg)) throw chkErr
+              this.logger.log(`Captcha check after download click transient for ${reqNo}: ${chkMsg}`)
+            }
+
+            // Check for the resource-not-found error page right after the download click.
+            // On slow networks the click can navigate to a dead "requested resource could not be found" page.
+            try {
+              if (await isResourceNotFoundErrorOnPage(page)) {
+                throw new Error(`RESOURCE_NOT_FOUND_ERROR: "Requested resource could not be found" on download click for ${reqNo}`)
+              }
+            } catch (chkErr: any) {
+              const m = chkErr?.message || String(chkErr)
+              if (/RESOURCE_NOT_FOUND_ERROR/i.test(m)) throw chkErr
+              this.logger.log(`Resource-not-found check after download click transient for ${reqNo}: ${m}`)
             }
 
             // Wait for download to finish
@@ -1934,34 +2057,76 @@ export default class NoticeDownloaderForm16 {
           downloadResults: downloadResults,
         }
       }
-    } catch (error) {
-      this.logger.log(`Error in TRACES automation: ${error.message}`)
+    } catch (error: any) {
+      const msg = error?.message || String(error)
+
+      const isResourceNotFound =
+        /RESOURCE_NOT_FOUND_ERROR|requested resource could not be found/i.test(msg) ||
+        (browser && page ? await (async () => { try { return await isResourceNotFoundErrorOnPage(page) } catch { return false } })() : false)
+
+      // Retry on *any* error (network delay, page reload, context destroyed on navigation, protocol errors,
+      // slow element appearance after clicks/row selection, captcha, or the "Requested resource could not be found" dead-end page, etc.).
+      // Close browser and retry the entire flow from start (fresh login + steps) up to 5 times.
+      if (attempt < MAX_CAPTCHA_RETRIES) {
+        const reason = isResourceNotFound
+          ? 'Requested resource could not be found error page detected'
+          : 'Transient error (network delay, page reload, navigation, slow load, etc.)'
+        this.logger.log(
+          `${reason} during download (attempt ${attempt}/${MAX_CAPTCHA_RETRIES}): ${msg}. ` +
+            `Closing browser and retrying whole download flow from start (re-login + steps)...`
+        )
+        try {
+          if (browser) await browser.close()
+        } catch {}
+        await waitForSecs(2000)
+        continue
+      }
+
+      // Final attempt exhausted
+      this.logger.log(`Error in TRACES automation (final attempt): ${msg}`)
+      try {
+        if (browser) await browser.close()
+      } catch {}
       throw error
     }
+    } // end for retry loop for getTracesFilepuppeteer
   }
 
   async getTracesDatapuppeteer(record: any) {
     const puppeteer = require("puppeteer")
     const fs = require("fs")
 
-    try {
-      this.logger.log(`Starting TRACES automation for ${record.companyName}`)
+    const MAX_CAPTCHA_RETRIES = 5
+    for (let attempt = 1; attempt <= MAX_CAPTCHA_RETRIES; attempt++) {
+      let browser: any = null
+      let page: any = null
+      try {
+        this.logger.log(
+          `Starting TRACES automation for ${record.companyName} (attempt ${attempt}/${MAX_CAPTCHA_RETRIES})`
+        )
 
-      const browser = await puppeteer.launch({
-        headless: false,
-        args: ["--start-maximized"],
-      })
+        browser = await puppeteer.launch({
+          headless: false,
+          args: ["--start-maximized"],
+        })
 
-      const page = await browser.newPage()
-      await page.setViewport({ width: 1920, height: 1080 })
+        page = await browser.newPage()
+        await page.setViewport({ width: 1920, height: 1080 })
 
-      this.logger.log("TRACES API login + preauth (traces61)…")
-      await loginWithTracesApiAndPreauth(page, {
-        userId: record.userId,
-        password: record.password,
-        tan: record.tan,
-      })
-      this.logger.log("Login successful")
+        this.logger.log("TRACES API login + preauth (traces61)…")
+        await loginWithTracesApiAndPreauth(
+          page,
+          {
+            userId: record.userId,
+            password: record.password,
+            tan: record.tan,
+          },
+          {
+            log: (msg) => this.logger.log(msg),
+            maxLoginAttempts: 5,
+          }
+        )
+        this.logger.log("Login successful")
 
       const isForm16A = this.form16Type === "form16a"
       const formUrl = isForm16A
@@ -1973,11 +2138,26 @@ export default class NoticeDownloaderForm16 {
         waitUntil: "networkidle2",
       })
 
+      // Immediate check after landing on the Form 16/16A request page.
+      try {
+        if (await isResourceNotFoundErrorOnPage(page)) {
+          throw new Error(`RESOURCE_NOT_FOUND_ERROR: "Requested resource could not be found" after navigating to ${isForm16A ? "Form 16A" : "Form 16"} page`)
+        }
+      } catch (chkErr: any) {
+        const m = chkErr?.message || String(chkErr)
+        if (/RESOURCE_NOT_FOUND_ERROR/i.test(m)) throw chkErr
+        this.logger.log(`Resource-not-found check after form page nav transient: ${m}`)
+      }
+
       // Step 6: Select financial year
       this.logger.log(
         `Selecting financial year... ${this.financialYear},type: ${typeof this.financialYear}`
       )
-      await page.waitForSelector("#bulkfinYr")
+      // Long wait: page may be slow to load controls after navigation (esp. Form 16A)
+      await waitForSelectorLong(page, "#bulkfinYr", {
+        ...DEFAULT_LONG_WAIT,
+        label: "#bulkfinYr (after form page load)",
+      })
 
       // Extract year from financialYear (e.g., "2024-25" -> "2024")
       const year = this.financialYear ? String(this.financialYear).split("-")[0] : "2025"
@@ -1997,11 +2177,17 @@ export default class NoticeDownloaderForm16 {
         }
         const quarterValue = quarterMap[this.quarter] || "3"
 
-        await page.waitForSelector("#bulkquarter")
+        await waitForSelectorLong(page, "#bulkquarter", {
+          ...DEFAULT_LONG_WAIT,
+          label: "#bulkquarter (Form 16A)",
+        })
         await page.select("#bulkquarter", quarterValue)
         this.logger.log(`Selected quarter: ${this.quarter} (${quarterValue})`)
 
-        await page.waitForSelector("#bulkformType")
+        await waitForSelectorLong(page, "#bulkformType", {
+          ...DEFAULT_LONG_WAIT,
+          label: "#bulkformType (Form 16A)",
+        })
         await page.select("#bulkformType", record.formType || this.formType)
         this.logger.log(`Selected form type: ${record.formType || this.formType}`)
       }
@@ -2013,29 +2199,99 @@ export default class NoticeDownloaderForm16 {
       this.logger.log("Go button clicked")
 
       this.logger.log("Checking and clicking Go button if present...")
-      const goButton = await page.$("#clickGo")
+      // Use resilient waiter (short timeout, polls) instead of bare page.$ so a navigation/reload
+      // right after the bulkGo click (common on slow networks) doesn't throw "context destroyed".
+      let goButton: any = null
+      try {
+        goButton = await waitForSelectorLong(page, "#clickGo", {
+          timeoutMs: 15000,
+          pollIntervalMs: 1500,
+          label: "optional secondary #clickGo (after bulkGo)",
+        }).catch(() => null)
+      } catch {
+        goButton = null
+      }
       if (goButton) {
-        await goButton.click()
-        await waitForSecs(5000)
-        this.logger.log("Go button clicked")
+        try {
+          await goButton.click()
+          await waitForSecs(5000)
+          this.logger.log("Go button clicked")
+        } catch (clickErr: any) {
+          this.logger.log(`Secondary #clickGo click encountered transient issue (proceeding): ${clickErr?.message || clickErr}`)
+        }
       } else {
         this.logger.log("Go button ('#clickGo') not found, proceeding ahead")
       }
 
+      // After Go (and optional secondary Go), the next UI is either the main submit button
+      // or (on slow networks / Form 16A) a captcha challenge. Use either-wait so we react fast to captcha.
+      // The either-wait itself now also aborts early if the resource-not-found error page appears.
+      this.logger.log("Waiting for submit button or possible captcha after Go...")
+      const postGo = await waitForEitherSelectorLong(
+        page,
+        ["#j_id1972728517_7cc7de5f", 'input[name*="captcha" i]', 'img[src*="captcha" i]', "#captcha"],
+        { ...DEFAULT_LONG_WAIT, label: "submit or captcha (after Go for send request)" }
+      )
+      if (postGo.matchedSelector.toLowerCase().includes("captcha") || postGo.matchedSelector === "#captcha") {
+        throw new Error("CAPTCHA_FAILED_IN_FLOW: captcha presented after Go click (send request)")
+      }
+
+      // Explicit resource-not-found check after the Go phase (belt-and-suspenders; the waiter should have caught most cases).
+      try {
+        if (await isResourceNotFoundErrorOnPage(page)) {
+          throw new Error("RESOURCE_NOT_FOUND_ERROR: \"Requested resource could not be found\" after Go phase (send request)")
+        }
+      } catch (chkErr: any) {
+        const m = chkErr?.message || String(chkErr)
+        if (/RESOURCE_NOT_FOUND_ERROR/i.test(m)) throw chkErr
+        this.logger.log(`Resource-not-found check after Go transient: ${m}`)
+      }
+
       // Step 9: Click Submit button
       this.logger.log("Clicking Submit button...")
-      await page.waitForSelector("#j_id1972728517_7cc7de5f")
       await page.click("#j_id1972728517_7cc7de5f")
       await waitForSecs(5000)
       this.logger.log("Submit button clicked")
 
+      // Check immediately if this submit surfaced a captcha challenge (common for Form 16A send request).
+      // Wrap so a concurrent navigation (context destroy during the evaluate) just triggers outer retry.
+      try {
+        if (await isCaptchaChallengeOnPage(page)) {
+          throw new Error("CAPTCHA_FAILED_IN_FLOW: captcha presented after main submit (send request)")
+        }
+      } catch (chkErr: any) {
+        const chkMsg = chkErr?.message || String(chkErr)
+        if (/captcha|CAPTCHA/i.test(chkMsg)) {
+          throw chkErr
+        }
+        // Otherwise transient during check — let a later waiter or the outer catch decide to retry the flow.
+        this.logger.log(`Captcha presence check after submit hit transient issue (will continue/retry as needed): ${chkMsg}`)
+      }
+
+      // Check for the resource-not-found error page after the main submit click.
+      try {
+        if (await isResourceNotFoundErrorOnPage(page)) {
+          throw new Error("RESOURCE_NOT_FOUND_ERROR: \"Requested resource could not be found\" after main submit (send request)")
+        }
+      } catch (chkErr: any) {
+        const m = chkErr?.message || String(chkErr)
+        if (/RESOURCE_NOT_FOUND_ERROR/i.test(m)) throw chkErr
+        this.logger.log(`Resource-not-found check after submit transient: ${m}`)
+      }
+
       // Step 8: Click radio button for search2
       this.logger.log("Selecting search option 2...")
-      await page.waitForSelector("#search2")
+      await waitForSelectorLong(page, "#search2", {
+        ...DEFAULT_LONG_WAIT,
+        label: "#search2 (after submit)",
+      })
       await page.click("#search2")
 
       // Step 9: Click Proceed button
-      await page.waitForSelector("#normalkyc")
+      await waitForSelectorLong(page, "#normalkyc", {
+        ...DEFAULT_LONG_WAIT,
+        label: "#normalkyc (proceed)",
+      })
       await page.click("#normalkyc")
       await waitForSecs(2000)
       // await page.waitForNavigation({ waitUntil: "networkidle2" })
@@ -2043,7 +2299,18 @@ export default class NoticeDownloaderForm16 {
 
       // Step 10: Fill in challan details
       this.logger.log("Filling challan details...")
-      // await page.waitForSelector("#token")
+      // The previous click on #normalkyc (Proceed) can cause a navigation or slow render (>30s possible).
+      // Long-poll for the first input so network delay / page reload does not fail the run.
+      try {
+        await waitForSelectorLong(page, "#token", {
+          timeoutMs: 300000,
+          pollIntervalMs: 10000,
+          label: "#token (challan form after proceed/kyc)",
+        })
+      } catch (e: any) {
+        // If we can't find it after full wait, let the type fail — the outer per-attempt catch will retry the whole flow.
+        this.logger.log(`Warning: #token not ready after long wait (will retry flow on error): ${e?.message || e}`)
+      }
       await page.type("#token", record.rrr || "")
       await page.type("#bsr", record.bsr || "")
 
@@ -2088,6 +2355,18 @@ export default class NoticeDownloaderForm16 {
       await waitForSecs(2000)
       this.logger.log("KYC Proceed clicked")
 
+      // After KYC click, the page may land on the resource-not-found error instead of the next form.
+      // Detect early so we close + retry the whole send-request flow instead of waiting for #token or redirect.
+      try {
+        if (await isResourceNotFoundErrorOnPage(page)) {
+          throw new Error("RESOURCE_NOT_FOUND_ERROR: \"Requested resource could not be found\" after KYC click (send request)")
+        }
+      } catch (chkErr: any) {
+        const m = chkErr?.message || String(chkErr)
+        if (/RESOURCE_NOT_FOUND_ERROR/i.test(m)) throw chkErr
+        this.logger.log(`Resource-not-found check after KYC transient: ${m}`)
+      }
+
       // If there are less than 3 PAN details, handle the popup by hitting Enter
       const panFieldsCount = [record.pan1, record.pan2, record.pan3].filter(
         (pan) => pan && `${pan}`.trim()
@@ -2105,10 +2384,46 @@ export default class NoticeDownloaderForm16 {
       }
 
       // Step 12: Click "Proceed with Transaction"
-      await page.waitForSelector("#redirect")
+      // Use long wait (5min polling every 10s) because page loads can be slow (>30s), especially for Form 16A.
+      // Wait for either the redirect button or a captcha (so we can retry fast on captcha without 5min timeout).
+      this.logger.log("Waiting for redirect or possible captcha after KYC...")
+      const postKyc = await waitForEitherSelectorLong(
+        page,
+        ["#redirect", 'input[name*="captcha" i]', 'img[src*="captcha" i]', "#captcha"],
+        { ...DEFAULT_LONG_WAIT, label: "redirect or captcha (after KYC for send request)" }
+      )
+      if (postKyc.matchedSelector.toLowerCase().includes("captcha") || postKyc.matchedSelector === "#captcha") {
+        throw new Error("CAPTCHA_FAILED_IN_FLOW: captcha presented after KYC click (send request)")
+      }
       await page.click("#redirect")
       await waitForSecs(2000)
       this.logger.log("Transaction initiated")
+
+      // Optional: after final redirect, quickly check if a captcha challenge appeared for this submission.
+      // Guarded so transient eval errors just fall through to outer retry logic.
+      try {
+        if (await isCaptchaChallengeOnPage(page)) {
+          throw new Error("CAPTCHA_FAILED_IN_FLOW: captcha presented after final redirect (send request)")
+        }
+      } catch (chkErr: any) {
+        const chkMsg = chkErr?.message || String(chkErr)
+        if (/captcha|CAPTCHA/i.test(chkMsg)) {
+          throw chkErr
+        }
+        this.logger.log(`Captcha presence check after redirect hit transient issue (continuing): ${chkMsg}`)
+      }
+
+      // Final check for the resource-not-found error page after the last redirect.
+      // If the TRACES flow ends up on this dead page, close browser and retry from the very start.
+      try {
+        if (await isResourceNotFoundErrorOnPage(page)) {
+          throw new Error("RESOURCE_NOT_FOUND_ERROR: \"Requested resource could not be found\" after final redirect (send request)")
+        }
+      } catch (chkErr: any) {
+        const m = chkErr?.message || String(chkErr)
+        if (/RESOURCE_NOT_FOUND_ERROR/i.test(m)) throw chkErr
+        this.logger.log(`Resource-not-found check after final redirect transient: ${m}`)
+      }
 
       // Wait a bit to see the result
       await waitForSecs(1000)
@@ -2118,11 +2433,42 @@ export default class NoticeDownloaderForm16 {
 
       this.logger.log(`TRACES automation completed successfully for ${record.companyName}`)
       return { success: true }
-    } catch (error) {
-      this.logger.log(`Error in TRACES automation: ${error.message}`)
+    } catch (error: any) {
+      const msg = error?.message || String(error)
+
+      const isResourceNotFound =
+        /RESOURCE_NOT_FOUND_ERROR|requested resource could not be found/i.test(msg) ||
+        (browser && page ? await (async () => { try { return await isResourceNotFoundErrorOnPage(page) } catch { return false } })() : false)
+
+      // Retry on *any* error, including the specific "Requested resource could not be found" error page.
+      // The elements are known to exist because a previous run worked; the only reason for failure is
+      // transient browser/page state, network delay, or the site serving a dead-end resource-not-found page.
+      // Always: close the browser and retry the entire login + flow from the very start, up to 5 times.
+      if (attempt < MAX_CAPTCHA_RETRIES) {
+        const reason = isResourceNotFound
+          ? 'Requested resource could not be found error page detected'
+          : 'Transient error (network delay, page reload, navigation, slow load, context destroyed, etc.)'
+        this.logger.log(
+          `${reason} during send request (attempt ${attempt}/${MAX_CAPTCHA_RETRIES}): ${msg}. ` +
+            `Closing browser and retrying whole flow from start (re-login + steps)...`
+        )
+        try {
+          if (browser) await browser.close()
+        } catch {}
+        // Give the site/network a moment before the next full attempt
+        await waitForSecs(2000)
+        continue
+      }
+
+      // Final attempt exhausted — surface the error
+      this.logger.log(`Error in TRACES automation (final attempt): ${msg}`)
+      try {
+        if (browser) await browser.close()
+      } catch {}
       throw error
     }
-  }
+    } // end for retry loop for getTracesDatapuppeteer
+  } // end getTracesDatapuppeteer
 
   async extractTdsDataFromTraces(successfulDownloads?: any[]) {
     const fs = require("fs")
@@ -2523,35 +2869,38 @@ export default class NoticeDownloaderForm16 {
               )
               fs.mkdirSync(pdfOutputDir, { recursive: true })
 
-              // Generate PDF for each deductee
-              for (let i = 0; i < form16AData.length; i++) {
-                const record = form16AData[i]
-                if (!record) continue
+              // Generate PDFs concurrently (one shared browser, pool of pages).
+              const concurrency = defaultForm16AConcurrency()
+              this.logger.log(
+                `  Generating ${form16AData.length} PDF(s) — ${concurrency} in parallel...`
+              )
 
-                try {
-                  // Generate PDF filename based on PAN and certificate number
+              const pdfItems = form16AData
+                .filter((record) => !!record)
+                .map((record) => {
                   const pan = record.deducteeData.pan || "UNKNOWN"
                   const pdfFileName = `${pan}_${formType}_${finYr}_${qrtr}.pdf`
-                  const pdfOutputPath = path.join(pdfOutputDir, pdfFileName)
+                  return { outputPath: path.join(pdfOutputDir, pdfFileName), data: record }
+                })
 
-                  this.logger.log(`  Generating PDF ${i + 1}/${form16AData.length}: ${pdfFileName}`)
+              const batch = await generateForm16APdfBatch(pdfItems, {
+                concurrency,
+                keepBrowserOpen: true, // reuse the browser across all downloads in this run
+                onProgress: (doneCount, total, last) => {
+                  if (doneCount === total || doneCount % 25 === 0) {
+                    this.logger.log(
+                      `  ✓ PDFs ${doneCount}/${total}${last.ok ? "" : " (last failed)"}`
+                    )
+                  }
+                },
+              })
 
-                  // Generate PDF
-                  await generateForm16APdf({
-                    outputPath: pdfOutputPath,
-                    data: record,
-                  })
-
-                  this.logger.log(`  ✓ PDF generated: ${pdfFileName}`)
-                } catch (pdfError: any) {
-                  this.logger.log(
-                    `  ❌ Failed to generate PDF for record ${i + 1}: ${pdfError.message}`
-                  )
-                  // Continue with next record
-                }
+              this.logger.log(
+                `✓ Finished generating PDFs: ${batch.success} ok, ${batch.failed} failed (of ${batch.total})`
+              )
+              for (const e of batch.errors.slice(0, 5)) {
+                this.logger.log(`  ❌ ${path.basename(e.outputPath)}: ${e.error}`)
               }
-
-              this.logger.log(`✓ Finished generating PDFs for ${form16AData.length} record(s)`)
             } catch (pdfGenError: any) {
               this.logger.log(`❌ Error generating PDFs: ${pdfGenError.message}`)
               // Continue with next download
@@ -2566,6 +2915,9 @@ export default class NoticeDownloaderForm16 {
     } catch (error) {
       this.logger.log(`Error in extractTdsDataFromTraces: ${error.message}`)
       throw error
+    } finally {
+      // The PDF browser was kept open across downloads; close it now.
+      await closeForm16ABrowser()
     }
   }
 

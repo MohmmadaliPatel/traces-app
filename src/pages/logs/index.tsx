@@ -1,13 +1,15 @@
 import React, { useState } from "react"
-import { Table, Card, Tag, Button, Space, Typography, Descriptions, Modal, Tooltip } from "antd"
+import { Table, Card, Tag, Button, Space, Typography, Descriptions, Modal, Tooltip, message, Alert } from "antd"
 import type { ColumnsType, TablePaginationConfig } from "antd/es/table"
-import { useQuery } from "@blitzjs/rpc"
+import { useMutation, useQuery } from "@blitzjs/rpc"
 import { FilterValue } from "antd/es/table/interface"
 import dayjs from "dayjs"
 import relativeTime from "dayjs/plugin/relativeTime"
 import { Task } from "@prisma/client"
 import Layout from "src/core/layouts/Layout"
 import getTaskBatch from "src/tasks/queries/getTaskBatch"
+import getTaskBatchTaskIds from "src/tasks/mutations/getTaskBatchTaskIds"
+import retryFailedForm16BatchTasks from "src/tasks/mutations/retryFailedForm16BatchTasks"
 import {
   ClockCircleOutlined,
   SyncOutlined,
@@ -15,6 +17,7 @@ import {
   CloseCircleOutlined,
   InfoCircleOutlined,
   FileTextOutlined,
+  ReloadOutlined,
 } from "@ant-design/icons"
 
 dayjs.extend(relativeTime)
@@ -68,6 +71,12 @@ function TasksListPage() {
   const [selectedStatus, setSelectedStatus] = useState<string[]>([])
   const [filtersModal, setFiltersModal] = useState(false)
   const [selectedFilters, setSelectedFilters] = useState<any>(null)
+  const [selectedTaskRowKeys, setSelectedTaskRowKeys] = useState<number[]>([])
+  const [retryLoading, setRetryLoading] = useState(false)
+  const [selectFailedLoading, setSelectFailedLoading] = useState(false)
+
+  const [getTaskBatchTaskIdsMutation] = useMutation(getTaskBatchTaskIds)
+  const [retryFailedForm16BatchTasksMutation] = useMutation(retryFailedForm16BatchTasks)
 
   const [tableParams, setTableParams] = useState<TableParams>({
     pagination: {
@@ -157,11 +166,37 @@ function TasksListPage() {
 
     // Action Type
     if (filters.actionType) {
-      const actionLabel = filters.actionType === "send_request" ? "Send Request" : "Download File"
+      const actionLabel =
+        filters.actionType === "send_request"
+          ? "Send Request"
+          : filters.actionType === "sign_pdf"
+          ? "Attach DSC"
+          : "Download File"
       descriptionItems.push({
         key: "actionType",
         label: "Action Type",
         children: <Tag color="orange">{actionLabel}</Tag>,
+      })
+    }
+
+    // Form 16 Type
+    if (filters.form16Type) {
+      descriptionItems.push({
+        key: "form16Type",
+        label: "Form 16 Type",
+        children: (
+          <Tag color={filters.form16Type === "form16a" ? "magenta" : "geekblue"}>
+            {filters.form16Type === "form16a" ? "Form 16A" : "Form 16"}
+          </Tag>
+        ),
+      })
+    }
+
+    if (filters.sendToAllPeriods) {
+      descriptionItems.push({
+        key: "sendToAllPeriods",
+        label: "All Periods",
+        children: <Tag color="gold">Yes</Tag>,
       })
     }
 
@@ -273,6 +308,7 @@ function TasksListPage() {
             icon={<FileTextOutlined />}
             onClick={() => {
               setSelectedRow(record.id)
+              setSelectedTaskRowKeys([])
               setTaskTableParams({
                 ...taskTableParams,
                 pagination: { current: 1, pageSize: 10 },
@@ -345,6 +381,52 @@ function TasksListPage() {
     const batch: any = tasksResponse.tasksBatch.find((t) => t.id === selectedRow)
     const totalTasks = batch?._count?.Task || 0
 
+    let batchFilters: Record<string, unknown> = {}
+    try {
+      batchFilters = JSON.parse(batch?.filters || "{}")
+    } catch {
+      batchFilters = {}
+    }
+    const isForm16Batch = Boolean(batchFilters.form16Type)
+
+    const handleSelectFailedTasks = async () => {
+      if (!selectedRow) return
+      setSelectFailedLoading(true)
+      try {
+        const result = await getTaskBatchTaskIdsMutation({
+          batchId: selectedRow,
+          statusFilter: ["Failed"],
+        })
+        setSelectedTaskRowKeys(result.taskIds)
+        message.info(`Selected ${result.taskIds.length} failed task(s)`)
+      } catch (error: any) {
+        message.error(error.message || "Failed to load failed tasks")
+      } finally {
+        setSelectFailedLoading(false)
+      }
+    }
+
+    const handleRetrySelectedTasks = async () => {
+      if (!selectedRow || selectedTaskRowKeys.length === 0) {
+        message.warning("Select at least one failed task to retry")
+        return
+      }
+      setRetryLoading(true)
+      try {
+        const result = await retryFailedForm16BatchTasksMutation({
+          batchId: selectedRow,
+          taskIds: selectedTaskRowKeys,
+        })
+        message.success(result.message || `Queued ${result.retriedCount} task(s) for retry`)
+        setSelectedTaskRowKeys([])
+        refetch()
+      } catch (error: any) {
+        message.error(error.message || "Failed to retry tasks")
+      } finally {
+        setRetryLoading(false)
+      }
+    }
+
     if (!batch) {
       return (
         <Card title="Tasks" style={{ margin: "20px 0" }}>
@@ -357,12 +439,66 @@ function TasksListPage() {
       <Card
         title={`Tasks for Batch #${selectedRow}`}
         style={{ margin: "20px 0" }}
-        extra={<Button onClick={() => setSelectedRow(undefined)}>Close</Button>}
+        extra={
+          <Space wrap>
+            {isForm16Batch && (
+              <>
+                <Button
+                  size="small"
+                  loading={selectFailedLoading}
+                  onClick={handleSelectFailedTasks}
+                >
+                  Select failed
+                </Button>
+                <Button size="small" onClick={() => setSelectedTaskRowKeys([])}>
+                  Clear selection
+                </Button>
+                <Button
+                  size="small"
+                  type="primary"
+                  icon={<ReloadOutlined />}
+                  loading={retryLoading}
+                  disabled={selectedTaskRowKeys.length === 0}
+                  onClick={handleRetrySelectedTasks}
+                >
+                  Retry selected ({selectedTaskRowKeys.length})
+                </Button>
+              </>
+            )}
+            <Button
+              onClick={() => {
+                setSelectedRow(undefined)
+                setSelectedTaskRowKeys([])
+              }}
+            >
+              Close
+            </Button>
+          </Space>
+        }
       >
+        {isForm16Batch && (
+          <Alert
+            message={`Form 16${batchFilters.form16Type === "form16a" ? "A" : ""} batch — retry re-queues failed tasks with the same configuration (action, periods, job types).`}
+            type="info"
+            showIcon
+            style={{ marginBottom: 16 }}
+          />
+        )}
         <Table
           rowKey="id"
           columns={taskColumns}
           dataSource={batch?.Task}
+          rowSelection={
+            isForm16Batch
+              ? {
+                  selectedRowKeys: selectedTaskRowKeys,
+                  onChange: (keys) => setSelectedTaskRowKeys(keys as number[]),
+                  getCheckboxProps: (record) => ({
+                    disabled: record.status !== "Failed",
+                  }),
+                }
+              : undefined
+          }
           pagination={{
             current: taskTableParams.pagination?.current,
             pageSize: taskTableParams.pagination?.pageSize,

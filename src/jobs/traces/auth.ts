@@ -49,15 +49,28 @@ function normalizeLoginResponse(data: unknown): TracesLoginResponse {
     (nested?.refresh_token as string | undefined) ||
     (d.refreshToken as string | undefined) ||
     (d.refresh_token as string | undefined)
+  const errorCode = typeof d.errorCode === "string" ? d.errorCode : undefined
+  const message = typeof d.message === "string" ? d.message : undefined
+  const isAuthenticated =
+    typeof d.isAuthenticated === "boolean" ? d.isAuthenticated : undefined
+
   if (accessToken) {
     return {
       authTokenDto: {
         accessToken,
         ...(refreshToken ? { refreshToken } : {}),
       },
+      errorCode,
+      message,
+      isAuthenticated,
     }
   }
-  return d as TracesLoginResponse
+  return {
+    errorCode,
+    message,
+    isAuthenticated,
+    ...(d as TracesLoginResponse),
+  }
 }
 
 export type LoginTracesBody = {
@@ -159,12 +172,18 @@ export async function loginTraces(
   const out = normalizeLoginResponse(res.data)
   const hasAccess = Boolean(out.authTokenDto?.accessToken)
   const hasRefresh = Boolean(out.authTokenDto?.refreshToken)
-  log(
-    "loginTraces",
-    "OK",
-    hasAccess
-      ? `authTokenDto.accessToken present refreshToken=${hasRefresh ? "present" : "missing"}`
-      : "no accessToken in response"
-  )
+  if (hasAccess) {
+    log(
+      "loginTraces",
+      "OK",
+      `authTokenDto.accessToken present refreshToken=${hasRefresh ? "present" : "missing"}`
+    )
+  } else {
+    log(
+      "loginTraces",
+      "login rejected",
+      `errorCode=${out.errorCode ?? "unknown"} message=${out.message ?? "no message"}`
+    )
+  }
   return out
 }

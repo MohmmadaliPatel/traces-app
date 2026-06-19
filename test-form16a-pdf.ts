@@ -2,7 +2,12 @@
  * Test script for Form 16A PDF generation
  */
 
-import { generateForm16APdf } from "./src/utils/form16APdfGeneratorExact"
+import {
+  generateForm16APdf,
+  generateForm16APdfBatch,
+  closeForm16ABrowser,
+  defaultForm16AConcurrency,
+} from "./src/utils/form16APdfGeneratorExact"
 import { parseForm16AFile } from "./src/utils/form16AParserExact"
 import fs from "fs"
 import path from "path"
@@ -60,44 +65,43 @@ async function main() {
 
       console.log(`✅ PDF Generated successfully: ${outputPath}`)
     } else {
-      // Generate PDFs for all deductees
-      console.log(`📝 Generating PDFs for all ${data.length} deductees...`)
+      // Generate PDFs for all deductees — concurrently via the batch API.
+      const concurrency = defaultForm16AConcurrency()
+      console.log(
+        `📝 Generating PDFs for all ${data.length} deductees (${concurrency} in parallel)...`
+      )
 
-      let successCount = 0
-      let errorCount = 0
+      const items = data
+        .filter((d) => !!d)
+        .map((d) => ({
+          outputPath: path.join(outputDir, `${d.deducteeData.pan}_Q2_2026-27.pdf`),
+          data: d,
+        }))
 
-      console.log("data",data);
-
-      for (let i = 0; i < data.length; i++) {
-        const deducteeData = data[i]
-        if (!deducteeData) continue
-
-        const pan = deducteeData.deducteeData.pan
-        const outputPath = path.join(outputDir, `${pan}_Q2_2026-27.pdf`)
-
-        try {
-          await generateForm16APdf({
-            outputPath,
-            data: deducteeData,
-          })
-          successCount++
-          if ((i + 1) % 50 === 0) {
-            console.log(`  Progress: ${i + 1}/${data.length} PDFs generated...`)
+      const started = Date.now()
+      const batch = await generateForm16APdfBatch(items, {
+        concurrency,
+        keepBrowserOpen: true,
+        onProgress: (done, total) => {
+          if (done === total || done % 50 === 0) {
+            const rate = done / ((Date.now() - started) / 1000)
+            console.log(`  Progress: ${done}/${total} (${rate.toFixed(1)} PDFs/sec)`)
           }
-        } catch (error) {
-          errorCount++
-          console.error(`  ❌ Error generating PDF for PAN ${pan}:`, error)
-        }
-      }
+        },
+      })
 
+      const secs = (Date.now() - started) / 1000
       console.log(`\n✅ PDF Generation Complete!`)
-      console.log(`  Success: ${successCount}`)
-      console.log(`  Errors: ${errorCount}`)
+      console.log(`  Success: ${batch.success}`)
+      console.log(`  Errors: ${batch.failed}`)
+      console.log(`  Time: ${secs.toFixed(1)}s  (${(batch.success / secs).toFixed(1)} PDFs/sec)`)
       console.log(`  Output directory: ${outputDir}`)
     }
   } catch (error) {
     console.error("❌ Error:", error)
     process.exit(1)
+  } finally {
+    await closeForm16ABrowser()
   }
 }
 

@@ -22,7 +22,8 @@
     "seed": "blitz db seed",
     "generate": "blitz prisma generate",
     "pup": "node src/pup.js",
-    "try": "node src/test.js"
+    "try": "node src/test.js",
+    "form16a:bulk": "node -r esbuild-register src/scripts/generateForm16PdfsCluster.ts"
   },
   "prisma": {
     "schema": "db/schema.prisma"
@@ -79,6 +80,7 @@
     "node-cron": "3.0.3",
     "node-machine-id": "1.1.12",
     "nodemailer": "6.10.0",
+    "pdf-lib": "1.17.1",
     "pdf-parse": "1.1.1",
     "pdf-text-reader": "4.0.1",
     "pdfmake": "0.2.20",

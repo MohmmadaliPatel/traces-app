@@ -3,14 +3,46 @@
  * Based on JRXML templates: Form-16A.jrxml, Payment_Summary.jrxml, Tax_Deducted.jrxml, CIN_Tax_Deducted.jrxml
  */
 
-import puppeteer from "puppeteer"
+import puppeteer, { type Browser, type Page } from "puppeteer"
+import { PDFDocument } from "pdf-lib"
 import { Form16AData } from "./form16AParserExact"
 import path from "path"
 import fs from "fs"
+import os from "os"
 
 interface PdfGenerationOptions {
   outputPath: string
   data: Form16AData
+}
+
+/** Blank header — non-empty to suppress Chromium default date/title/url headers. */
+function buildEmptyHeaderTemplate(): string {
+  return `<div style="height:0;width:100%;overflow:hidden;font-size:0;line-height:0;"></div>`
+}
+
+function buildForm16AHeaderContent(data: Form16AData): string {
+  const { deducteeData, header } = data
+  const item = (label: string, value: string) =>
+    `<span class="header-item" style="white-space: nowrap;"><b>${label} ${value}</b></span>`
+  return [
+    item("Certificate Number:", deducteeData.certificateNumber),
+    item("TAN of Deductor:", header.deductorTAN),
+    item("PAN of Deductee:", deducteeData.pan),
+    item("Assessment Year:", header.assessmentYear),
+  ].join("")
+}
+
+/** Puppeteer headerTemplate — items distributed evenly across full width, Times-Bold. */
+function buildForm16AHeaderTemplate(data: Form16AData): string {
+  return `<div style="font-size: 6pt; font-family: 'Times New Roman', Times, serif; font-weight: 700; width: 100%; display: flex; justify-content: space-around; align-items: center; padding: 10pt 25px; height: 30pt; line-height: 15pt; box-sizing: border-box; white-space: nowrap; background: #fff; -webkit-print-color-adjust: exact; print-color-adjust: exact;">
+    ${buildForm16AHeaderContent(data)}
+  </div>`
+}
+
+function buildForm16AFooterTemplate(): string {
+  return `<div style="font-size: 7pt; font-family: 'Times New Roman', Times, serif; font-weight: 400; text-align: right; padding: 0 70px 0 0; height: 16pt; line-height: 14pt; box-sizing: border-box; width: 100%; -webkit-print-color-adjust: exact; print-color-adjust: exact;">
+    <span>Page </span><span class="pageNumber"></span><span> of </span><span class="totalPages"></span>
+  </div>`
 }
 
 function imageToBase64(imagePath: string): string {
@@ -61,130 +93,290 @@ export async function generateForm16AHtmlFile(options: PdfGenerationOptions): Pr
   return htmlPath
 }
 
-export async function generateForm16APdf(options: PdfGenerationOptions): Promise<void> {
+/**
+ * Lazily-loaded, cached base64 images. The originals were re-read from disk and
+ * re-encoded on every single PDF; now they are loaded once and reused.
+ */
+let cachedImages: { watermark: string; tdsLogo: string; emblem: string } | null = null
+function getForm16AImages(): { watermark: string; tdsLogo: string; emblem: string } {
+  if (cachedImages) return cachedImages
+  const watermark = imageToBase64(
+    path.join(process.cwd(), "public", "images", "form16", "watermark.png")
+  )
+  const tdsLogo = imageToBase64(path.join(process.cwd(), "public", "images", "form16", "tdslogo.png"))
+  const emblem = imageToBase64(
+    path.join(process.cwd(), "public", "images", "form16", "emblem-english.jpg")
+  )
+  if (!watermark) console.warn("⚠ Watermark image not loaded!")
+  if (!tdsLogo) console.warn("⚠ TDS logo not loaded!")
+  if (!emblem) console.warn("⚠ Emblem not loaded!")
+  cachedImages = { watermark, tdsLogo, emblem }
+  return cachedImages
+}
+
+/**
+ * Shared, lazily-launched Chromium instance. Launching a browser per PDF was the
+ * single biggest bottleneck (~1s+ each); now one browser is reused for everything.
+ */
+let sharedBrowser: Browser | null = null
+let browserLaunch: Promise<Browser> | null = null
+
+export async function getForm16ABrowser(): Promise<Browser> {
+  if (sharedBrowser && sharedBrowser.connected) return sharedBrowser
+  if (!browserLaunch) {
+    browserLaunch = puppeteer
+      .launch({
+        headless: true,
+        // Bigger than the default 180s isn't needed, but under heavy parallelism a
+        // busy renderer can take a while to answer — keep a comfortable margin.
+        protocolTimeout: 120000,
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--allow-file-access-from-files",
+          "--disable-dev-shm-usage", // avoid /dev/shm exhaustion under concurrency
+          "--disable-gpu",
+          "--disable-extensions",
+          "--disable-background-networking",
+          "--disable-background-timer-throttling",
+          "--disable-renderer-backgrounding",
+          "--disable-backgrounding-occluded-windows",
+          "--no-first-run",
+          "--no-default-browser-check",
+          "--font-render-hinting=none",
+        ],
+      })
+      .then((browser) => {
+        sharedBrowser = browser
+        browser.on("disconnected", () => {
+          sharedBrowser = null
+          browserLaunch = null
+        })
+        return browser
+      })
+      .catch((err) => {
+        browserLaunch = null
+        throw err
+      })
+  }
+  return browserLaunch
+}
+
+/** Close the shared browser. Call once after a batch of PDFs is finished. */
+export async function closeForm16ABrowser(): Promise<void> {
+  const browser = sharedBrowser
+  sharedBrowser = null
+  browserLaunch = null
+  if (browser) {
+    try {
+      await browser.close()
+    } catch {
+      // ignore close errors
+    }
+  }
+}
+
+async function createRenderPage(browser: Browser): Promise<Page> {
+  const page = await browser.newPage()
+  await page.setViewport({ width: 794, height: 1123 }) // A4 at 96 DPI
+  return page
+}
+
+/** Core renderer: turn one record into a PDF using an already-open page. */
+async function renderForm16APdfOnPage(page: Page, options: PdfGenerationOptions): Promise<void> {
   const { outputPath, data } = options
+  const { watermark, tdsLogo, emblem } = getForm16AImages()
 
-  // Load images
-  const watermarkPath = path.join(process.cwd(), "public", "images", "form16", "watermark.png")
-  const tdsLogoPath = path.join(process.cwd(), "public", "images", "form16", "tdslogo.png")
-  const emblemPath = path.join(process.cwd(), "public", "images", "form16", "emblem-english.jpg")
+  const htmlContent = generateForm16AHtml(data, watermark, tdsLogo, emblem)
 
-  const watermarkBase64 = imageToBase64(watermarkPath)
-  const tdsLogoBase64 = imageToBase64(tdsLogoPath)
-  const emblemBase64 = imageToBase64(emblemPath)
-
-  if (!watermarkBase64) console.warn("⚠ Watermark image not loaded!")
-  if (!tdsLogoBase64) console.warn("⚠ TDS logo not loaded!")
-  if (!emblemBase64) console.warn("⚠ Emblem not loaded!")
-
-  const htmlContent = generateForm16AHtml(data, watermarkBase64, tdsLogoBase64, emblemBase64)
-
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--allow-file-access-from-files"],
+  // Every asset is an inline data URI, so "load" resolves almost instantly. The old
+  // networkidle0 + image polling + fixed 500ms sleep added ~1s of pure waiting per PDF.
+  await page.setContent(htmlContent, {
+    waitUntil: "load",
+    timeout: 30000,
   })
 
-  try {
-    const page = await browser.newPage()
+  // Multi-page PDFs: page 1 has no custom header; pages 2+ use Puppeteer headerTemplate.
+  const hasMultiplePages = await page.evaluate(() => {
+    const pageHeight = 1123 // A4 height at 96 DPI
+    return document.body.scrollHeight > pageHeight
+  })
 
-    // Set viewport
-    await page.setViewport({ width: 794, height: 1123 }) // A4 at 96 DPI
+  const headerTemplate = buildForm16AHeaderTemplate(data)
+  const footerTemplate = buildForm16AFooterTemplate()
 
-    await page.setContent(htmlContent, {
-      waitUntil: "networkidle0",
-      timeout: 60000,
-    })
+  const singlePageMargins = {
+    top: "0.278in",
+    right: "0.278in",
+    bottom: "0.52in",
+    left: "0.278in",
+  }
+  const multiPageFirstMargins = {
+    top: "0.278in",
+    right: "0.278in",
+    bottom: "0.75in",
+    left: "0.278in",
+  }
+  const multiPageRestMargins = {
+    top: "0.65in",
+    right: "0.278in",
+    bottom: "0.75in",
+    left: "0.278in",
+  }
 
-    // Wait for images to load
-    await page
-      .waitForFunction(
-        () => {
-          const images = document.querySelectorAll("img")
-          return Array.from(images).every((img) => img.complete)
-        },
-        { timeout: 10000 }
-      )
-      .catch(() => {
-        console.warn("⚠ Some images may not have loaded")
-      })
+  const sharedPdfOptions = {
+    format: "A4" as const,
+    printBackground: true,
+    preferCSSPageSize: false,
+  }
 
-    // Additional wait
-    await new Promise((resolve) => setTimeout(resolve, 500))
-
-    // Note: We're using Puppeteer's header/footer system for proper page numbering
-    // The HTML header/footer elements are kept for styling reference but won't be used
-    // Puppeteer's header/footer will appear on all pages (we can't easily hide on first page)
-
-    // Determine if we have multiple pages and set appropriate margins
-    const hasMultiplePages = await page.evaluate(() => {
-      const firstPageContent = document.querySelector(".first-page")
-      if (firstPageContent) {
-        const contentHeight = firstPageContent.scrollHeight
-        const pageHeight = 1123 // A4 height at 96 DPI (794px width, 1123px height)
-        return contentHeight > pageHeight
-      }
-      return false
-    })
-
-    // Build header and footer templates for Puppeteer
-    // Header: Matching example PDF analysis - 6pt font, Times-Bold, single line with multiple spaces
-    // From PDF: "Certificate Number: DIAQISA   TAN of Deductor: MUMC18011A   PAN of Deductee: AAACA4710A   Assessment Year: 2026-27"
-    // All items on same line at y: 802.04, spaced with 3 spaces between items
-    // Header should appear on all pages starting from page 2
-    // Puppeteer's headerTemplate shows on all pages including page 1
-    // We'll hide it on page 1 by making it have zero height/visibility when pageNumber is 1
-    // Note: Puppeteer doesn't support JavaScript in headerTemplate, so we use a CSS workaround
-    // const headerText = `<div style="font-size: 6pt; font-family: 'Times New Roman', Times, serif; font-weight: 700; display: flex; justify-content: space-around; align-items: center; width: 100%; padding: 10pt 0; height: 30pt; line-height: 15pt; box-sizing: border-box; white-space: nowrap; text-align: center;">
-    //   <b>Certificate Number: ${data.deducteeData.certificateNumber}</b>
-    //   <b>TAN of Deductor: ${data.header.deductorTAN}</b>
-    //   <b>PAN of Deductee: ${data.deducteeData.pan}</b>
-    //   <b>Assessment Year: ${data.header.assessmentYear}</b>
-    // </div>`
-    const headerText = ``
-
-    // Footer: Matching example PDF analysis - 7pt font, Times-Roman (not bold), right-aligned, "Page X of Y"
-    // From PDF: "Page 2 of 3" at x: 507.56, y: 26.14, right-aligned, 7pt font
-    // Note: Puppeteer uses special classes for page numbers - pageNumber and totalPages (camelCase)
-    // Increased z-index to ensure footer text is visible on top
-    const footerText = `<div style="font-size: 7pt; font-family: 'Times New Roman', Times, serif; font-weight: 400; text-align: right; padding: 0 70px 0 0; height: 16pt; line-height: 14pt; box-sizing: border-box; width: 100%; z-index: 9999; position: relative;">
-      <span style="display: inline;">Page </span><span class="pageNumber" style="display: inline;"></span><span style="display: inline;"> of </span><span class="totalPages" style="display: inline;"></span>
-    </div>`
-
-    // Use Puppeteer's header/footer for proper page numbering
-    // They will appear on all pages, but we hide the HTML ones on first page
+  if (!hasMultiplePages) {
     await page.pdf({
       path: outputPath,
-      format: "A4",
-      printBackground: true,
-      preferCSSPageSize: false,
-      // Increase top and bottom margins when we have header/footer (multiple pages)
-      // JRXML: header height=30pt, footer height=16pt, page margins=20pt
-      // Puppeteer renders header/footer in the margin area, so we need:
-      // Top: 20pt (base) + 30pt (header) + 10pt (buffer) = 60pt total = 60/72 inch ≈ 0.833in
-      // Bottom: At least 50px (0.52in) to ensure content doesn't get cut off
-      // Converting: 50px at 96 DPI = 50/96 inch ≈ 0.52in
-      // Side margins: 20pt = 20/72 inch ≈ 0.278in
-      // Converting points to inches: 1pt = 1/72 inch
-      // Increased top margin to prevent content overlap with header
-      // Margins:
-      // - First page: normal top margin (0.278in = 20px)
-      // - Pages 2+: CSS @page:not(:first) rule handles 80px margin-top
-      // Footer still uses footerTemplate, so we need bottom margin for it
-      margin: hasMultiplePages
-        ? { top: "0.65in", right: "0.278in", bottom: "0.75in", left: "0.278in" } // 0.65in top margin for pages 2+, increased bottom margin (0.75in) to ensure footer is visible
-        : { top: "0.278in", right: "0.278in", bottom: "0.52in", left: "0.278in" }, // Normal margins for single page (no header needed)
-      displayHeaderFooter: hasMultiplePages, // Show header/footer on multi-page documents
-      // Use headerTemplate to show header on all pages starting from page 2
-      // Note: Puppeteer will show header on all pages, but we can't easily hide on page 1
-      // Solution: Show header on all pages, but first page content starts lower to account for header space
-      headerTemplate: hasMultiplePages ? headerText : "<div></div>",
-      footerTemplate: hasMultiplePages ? footerText : "<div></div>",
+      ...sharedPdfOptions,
+      margin: singlePageMargins,
+      displayHeaderFooter: false,
+    })
+  } else {
+    // Page 1: footer only (no custom header). Pages 2+: custom header + footer.
+    // Puppeteer cannot hide headerTemplate on page 1, so generate separately and merge.
+    const page1Bytes = await page.pdf({
+      ...sharedPdfOptions,
+      margin: multiPageFirstMargins,
+      displayHeaderFooter: true,
+      headerTemplate: buildEmptyHeaderTemplate(),
+      footerTemplate,
+      pageRanges: "1",
     })
 
-    console.log(`✓ Generated PDF: ${outputPath}`)
-  } finally {
-    await browser.close()
+    const restBytes = await page.pdf({
+      ...sharedPdfOptions,
+      margin: multiPageRestMargins,
+      displayHeaderFooter: true,
+      headerTemplate,
+      footerTemplate,
+      pageRanges: "2-",
+    })
+
+    const merged = await PDFDocument.create()
+    const firstDoc = await PDFDocument.load(page1Bytes)
+    const restDoc = await PDFDocument.load(restBytes)
+    const [firstPage] = await merged.copyPages(firstDoc, [0])
+    merged.addPage(firstPage)
+    const restPages = await merged.copyPages(restDoc, restDoc.getPageIndices())
+    for (const restPage of restPages) {
+      merged.addPage(restPage)
+    }
+    fs.writeFileSync(outputPath, await merged.save())
   }
+}
+
+/**
+ * Generate a single Form 16A PDF. Reuses the shared browser (launched once) and the
+ * cached images. For large volumes prefer {@link generateForm16APdfBatch}.
+ */
+export async function generateForm16APdf(options: PdfGenerationOptions): Promise<void> {
+  const browser = await getForm16ABrowser()
+  const page = await createRenderPage(browser)
+  try {
+    await renderForm16APdfOnPage(page, options)
+    console.log(`✓ Generated PDF: ${options.outputPath}`)
+  } finally {
+    await page.close().catch(() => {})
+  }
+}
+
+export interface Form16ABatchResult {
+  total: number
+  success: number
+  failed: number
+  errors: Array<{ outputPath: string; error: string }>
+}
+
+export interface Form16ABatchOptions {
+  /** Number of PDFs rendered in parallel. Defaults to env FORM16A_PDF_CONCURRENCY or a CPU-based value. */
+  concurrency?: number
+  /** Recycle each worker page after this many PDFs to keep memory flat on long runs. Default 250. */
+  recycleEvery?: number
+  /** Called after each PDF (success or failure) for progress reporting. */
+  onProgress?: (done: number, total: number, last: { outputPath: string; ok: boolean }) => void
+  /** Keep the shared browser open after the batch (default false → the browser is closed). */
+  keepBrowserOpen?: boolean
+}
+
+export function defaultForm16AConcurrency(): number {
+  const fromEnv = parseInt(process.env.FORM16A_PDF_CONCURRENCY || "", 10)
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv
+  const cores = os.cpus()?.length || 4
+  return Math.max(2, Math.min(cores, 8))
+}
+
+/**
+ * Render many Form 16A PDFs concurrently using a pool of pages on a single browser.
+ * Dramatically faster than calling {@link generateForm16APdf} in a loop.
+ */
+export async function generateForm16APdfBatch(
+  items: PdfGenerationOptions[],
+  options: Form16ABatchOptions = {}
+): Promise<Form16ABatchResult> {
+  const result: Form16ABatchResult = { total: items.length, success: 0, failed: 0, errors: [] }
+  if (items.length === 0) return result
+
+  const concurrency = Math.max(1, options.concurrency ?? defaultForm16AConcurrency())
+  const recycleEvery = Math.max(1, options.recycleEvery ?? 250)
+  const browser = await getForm16ABrowser()
+
+  let nextIndex = 0
+  let done = 0
+
+  const worker = async (): Promise<void> => {
+    let page = await createRenderPage(browser)
+    let renderedOnPage = 0
+    try {
+      while (true) {
+        const index = nextIndex++
+        if (index >= items.length) break
+        const item = items[index]
+        if (!item) continue
+
+        let ok = true
+        try {
+          await renderForm16APdfOnPage(page, item)
+          result.success++
+        } catch (err: any) {
+          ok = false
+          result.failed++
+          result.errors.push({
+            outputPath: item.outputPath,
+            error: err?.message || String(err),
+          })
+        }
+        done++
+        options.onProgress?.(done, items.length, { outputPath: item.outputPath, ok })
+
+        // Recycle the page periodically so Chromium memory doesn't grow unbounded.
+        renderedOnPage++
+        if (renderedOnPage >= recycleEvery) {
+          await page.close().catch(() => {})
+          page = await createRenderPage(browser)
+          renderedOnPage = 0
+        }
+      }
+    } finally {
+      await page.close().catch(() => {})
+    }
+  }
+
+  const workerCount = Math.min(concurrency, items.length)
+  try {
+    await Promise.all(Array.from({ length: workerCount }, () => worker()))
+  } finally {
+    if (!options.keepBrowserOpen) {
+      await closeForm16ABrowser()
+    }
+  }
+
+  return result
 }
 
 /**
@@ -837,19 +1029,6 @@ ${
     : ""
 }
 
-<!-- PDF Header/Footer - Using Puppeteer's header/footer system instead -->
-<!-- HTML elements kept for reference but hidden -->
-<div class="pdf-header" style="display: none;">
-  <span class="header-item"><b>Certificate Number:</b> ${deducteeData.certificateNumber}</span>
-  <span class="header-item"><b>TAN of Deductor:</b> ${header.deductorTAN}</span>
-  <span class="header-item"><b>PAN of Deductee:</b> ${deducteeData.pan}</span>
-  <span class="header-item"><b>Assessment Year:</b> ${header.assessmentYear}</span>
-</div>
-
-<div class="pdf-footer" style="margin:50px;">
-  <span style="margin:50px;">Page <span class="page-number"></span> of <span class="total-pages"></span></span>
-</div>
-
 <div class="content-wrapper first-page">
 <!-- Header Logos -->
 <div class="logo-header">
@@ -1139,8 +1318,6 @@ I, <b>${footer.authPersonName}</b>, son/daughter of <b>${
 
 
 </div>
-
-<!-- Header is now handled by Puppeteer's headerTemplate, so it appears on all pages starting from page 2 -->
 
 <!-- Section Code and Description Table - Last Page -->
 <div style="page-break-before: always;"></div>

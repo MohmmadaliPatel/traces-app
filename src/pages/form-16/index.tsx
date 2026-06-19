@@ -23,6 +23,7 @@ import {
   DownloadOutlined,
   MailOutlined,
   LockOutlined,
+  DeleteOutlined,
 } from "@ant-design/icons"
 import { useMutation, useQuery } from "@blitzjs/rpc"
 import Layout from "src/core/layouts/Layout"
@@ -30,6 +31,8 @@ import processExcelUpload from "src/companies/mutations/processExcelUploadForm16
 import getUploadHistory from "src/companies/queries/getUploadHistory"
 import getCompanies from "src/companies/queries/getCompanies"
 import sendForm16Emails from "src/companies/mutations/sendForm16Emails"
+import deleteUploadHistory from "src/companies/mutations/deleteUploadHistory"
+import generateForm16PdfsFromZips from "src/companies/mutations/generateForm16PdfsFromZips"
 import * as XLSX from "xlsx"
 import dayjs from "dayjs"
 import "dayjs/locale/en-gb"
@@ -65,6 +68,7 @@ function Form16Page() {
   const [messageApi, contextHolder] = message.useMessage()
   const [processExcelUploadMutation] = useMutation(processExcelUpload)
   const [sendForm16EmailsMutation] = useMutation(sendForm16Emails)
+  const [deleteUploadHistoryMutation] = useMutation(deleteUploadHistory)
   const [form16Type, setForm16Type] = useState<"form16" | "form16a">("form16")
   const [uploadHistoryResponse, { refetch }] = useQuery(
     getUploadHistory,
@@ -100,6 +104,19 @@ function Form16Page() {
   const [emailResults, setEmailResults] = useState<any[]>([])
 
   const [certificateName, setCertificateName] = useState("")
+  const [selectedHistoryRowKeys, setSelectedHistoryRowKeys] = useState<number[]>([])
+  const [deleteHistoryLoading, setDeleteHistoryLoading] = useState(false)
+
+  // === NEW: Generate PDFs from existing local ZIP folder (separate feature) ===
+  const [generateZipMutation] = useMutation(generateForm16PdfsFromZips)
+  const [zipSourceFolder, setZipSourceFolder] = useState("")
+  const [zipCompanyName, setZipCompanyName] = useState("")
+  const [zipTan, setZipTan] = useState("")
+  const [zipFinancialYear, setZipFinancialYear] = useState("")
+  const [zipQuarter, setZipQuarter] = useState("")
+  const [zipFormType, setZipFormType] = useState("")
+  const [zipGenerateLoading, setZipGenerateLoading] = useState(false)
+  const [zipGenerateResult, setZipGenerateResult] = useState<any>(null)
 
   const [companiesResponse] = useQuery(getCompanies, {
     orderBy: { name: "asc" },
@@ -108,6 +125,78 @@ function Form16Page() {
   })
 
   const savedCompanies = companiesResponse?.companies || []
+  const uploadHistoryRecords = uploadHistoryResponse?.uploadHistory || []
+
+  const handleSelectFailedHistory = () => {
+    const failedIds = uploadHistoryRecords.filter((r) => r.status === "Failed").map((r) => r.id)
+    setSelectedHistoryRowKeys(failedIds)
+    messageApi.info(`Selected ${failedIds.length} failed record(s)`)
+  }
+
+  const handleDeleteSelectedHistory = async () => {
+    if (selectedHistoryRowKeys.length === 0) {
+      messageApi.warning("Select at least one record to delete")
+      return
+    }
+    setDeleteHistoryLoading(true)
+    try {
+      const result = await deleteUploadHistoryMutation({ ids: selectedHistoryRowKeys })
+      messageApi.success(result.message || "Deleted successfully")
+      setSelectedHistoryRowKeys([])
+      await refetch()
+    } catch (error: any) {
+      messageApi.error(error.message || "Failed to delete records")
+    } finally {
+      setDeleteHistoryLoading(false)
+    }
+  }
+
+  // === NEW FEATURE HANDLER: Generate PDFs directly from a folder of ZIP files ===
+  const handleGenerateFromZips = async () => {
+    if (!zipSourceFolder || !zipCompanyName || !zipTan || !zipFinancialYear || !zipQuarter || !zipFormType) {
+      messageApi.error("Please fill Source Folder, Company Name, TAN, Financial Year, Quarter and Form Type")
+      return
+    }
+
+    setZipGenerateLoading(true)
+    setZipGenerateResult(null)
+
+    try {
+      const res = await generateZipMutation({
+        sourceFolder: zipSourceFolder.trim(),
+        companyName: zipCompanyName.trim(),
+        tan: zipTan.trim().toUpperCase(),
+        financialYear: zipFinancialYear,
+        quarter: zipQuarter,
+        formType: zipFormType,
+        form16Type,
+      })
+
+      setZipGenerateResult(res)
+
+      if (res.success) {
+        messageApi.success(
+          `Generated ${res.generatedPdfs || 0} PDF(s) from ${res.processedZips || 0} ZIP(s)`
+        )
+      } else {
+        messageApi.error(res.message || "Generation completed with errors")
+      }
+    } catch (error: any) {
+      messageApi.error(error.message || "Failed to generate PDFs from ZIPs")
+      setZipGenerateResult({ success: false, message: error.message, errors: [error.message] })
+    } finally {
+      setZipGenerateLoading(false)
+    }
+  }
+
+  const fillZipFromCompany = (companyId: number) => {
+    const c = savedCompanies.find((x) => x.id === companyId)
+    if (c) {
+      setZipCompanyName(c.name || "")
+      // Many teams store TAN in user_id or tan field in Company model
+      setZipTan((c as any).tan || (c as any).user_id || "")
+    }
+  }
 
   // Generate financial year options
   const generateFinancialYears = (): Array<{ label: string; value: string }> => {
@@ -763,6 +852,200 @@ function Form16Page() {
             </Button>
           </Card>
 
+          {/* ============================================================ */}
+          {/* NEW SEPARATE FEATURE: Generate PDFs from already downloaded ZIPs */}
+          {/* ============================================================ */}
+          <Card
+            title={
+              <Space>
+                <FileExcelOutlined />
+                <span>Generate Form 16 / 16A PDFs from Existing ZIP Files</span>
+              </Space>
+            }
+            style={{ border: "2px solid #52c41a" }}
+          >
+            <Alert
+              type="info"
+              showIcon
+              style={{ marginBottom: 16 }}
+              message="This is a separate offline flow. No portal login or download required."
+              description={
+                <>
+                  Point to a folder that already contains the downloaded .zip file(s) from TRACES.
+                  Example: <code>/Users/apatel/.../public/pdf/form16zip/form16a/Swiggy 26Q-Q3</code>
+                  <br />
+                  The tool will extract the ZIPs (using the TAN you provide as password), parse, and generate the final PDFs.
+                </>
+              }
+            />
+
+            <div style={{ marginBottom: 16 }}>
+              <label style={{ display: "block", fontWeight: 600, marginBottom: 6 }}>
+                Source ZIP Folder * <span style={{ fontWeight: 400, color: "#666" }}>(full server path)</span>
+              </label>
+              <Space.Compact style={{ width: "100%" }}>
+                <Input
+                  placeholder="/Users/.../public/pdf/form16zip/form16a/CompanyName 26Q-Q3"
+                  value={zipSourceFolder}
+                  onChange={(e) => setZipSourceFolder(e.target.value)}
+                  size="large"
+                  style={{ fontFamily: "monospace", flex: 1 }}
+                />
+                <Button
+                  onClick={() =>
+                    setZipSourceFolder(
+                      "/Users/apatel/projects/projects/Taxteck/traces-app/public/pdf/form16zip/form16a/"
+                    )
+                  }
+                >
+                  Example base
+                </Button>
+              </Space.Compact>
+              <div style={{ fontSize: 12, color: "#888", marginTop: 4 }}>
+                The folder should contain one or more .zip files for the same company + period.
+              </div>
+            </div>
+
+            <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+              <div>
+                <label style={{ display: "block", fontWeight: 500, marginBottom: 6 }}>Company Name *</label>
+                <Space.Compact style={{ width: "100%" }}>
+                  <Input
+                    placeholder="Company Name (used for output folder)"
+                    value={zipCompanyName}
+                    onChange={(e) => setZipCompanyName(e.target.value)}
+                    style={{ flex: 1 }}
+                  />
+                  <Select
+                    placeholder="Fill from saved"
+                    style={{ width: 220 }}
+                    allowClear
+                    onChange={(val) => {
+                      if (val) fillZipFromCompany(val)
+                    }}
+                    options={savedCompanies.map((c) => ({ label: c.name, value: c.id }))}
+                  />
+                </Space.Compact>
+              </div>
+
+              <div>
+                <label style={{ display: "block", fontWeight: 500, marginBottom: 6 }}>
+                  TAN (ZIP Password) * <span style={{ color: "#d4380d" }}>Required</span>
+                </label>
+                <Input.Password
+                  placeholder="Company TAN (usually the password for the downloaded ZIP)"
+                  value={zipTan}
+                  onChange={(e) => setZipTan(e.target.value.toUpperCase())}
+                />
+              </div>
+
+              <Space wrap size="large">
+                <div>
+                  <label style={{ display: "block", fontWeight: 500, marginBottom: 6 }}>Financial Year *</label>
+                  <Select
+                    value={zipFinancialYear}
+                    onChange={setZipFinancialYear}
+                    placeholder="Select year"
+                    style={{ width: 160 }}
+                    options={generateFinancialYears()}
+                  />
+                </div>
+
+                <div>
+                  <label style={{ display: "block", fontWeight: 500, marginBottom: 6 }}>Quarter *</label>
+                  <Select
+                    value={zipQuarter}
+                    onChange={setZipQuarter}
+                    placeholder="Select quarter"
+                    style={{ width: 140 }}
+                    options={quarterOptions}
+                  />
+                </div>
+
+                <div>
+                  <label style={{ display: "block", fontWeight: 500, marginBottom: 6 }}>Form Type *</label>
+                  <Select
+                    value={zipFormType}
+                    onChange={setZipFormType}
+                    placeholder="Select form type"
+                    style={{ width: 120 }}
+                    options={formTypeOptions}
+                  />
+                </div>
+              </Space>
+            </Space>
+
+            <div style={{ marginTop: 20 }}>
+              <Button
+                type="primary"
+                size="large"
+                icon={<DownloadOutlined />}
+                loading={zipGenerateLoading}
+                onClick={handleGenerateFromZips}
+                disabled={
+                  !zipSourceFolder ||
+                  !zipCompanyName ||
+                  !zipTan ||
+                  !zipFinancialYear ||
+                  !zipQuarter ||
+                  !zipFormType
+                }
+              >
+                Generate PDFs from ZIP Folder
+              </Button>
+              <Button
+                style={{ marginLeft: 12 }}
+                onClick={() => {
+                  setZipSourceFolder("")
+                  setZipCompanyName("")
+                  setZipTan("")
+                  setZipFinancialYear("")
+                  setZipQuarter("")
+                  setZipFormType("")
+                  setZipGenerateResult(null)
+                }}
+              >
+                Clear
+              </Button>
+            </div>
+
+            {zipGenerateResult && (
+              <div style={{ marginTop: 20, padding: 16, background: "#fafafa", borderRadius: 6 }}>
+                <div style={{ fontWeight: 600, marginBottom: 8 }}>
+                  {zipGenerateResult.success ? "✅ Generation completed" : "⚠️ Completed with issues"}
+                </div>
+                <div>ZIPs processed: <strong>{zipGenerateResult.processedZips ?? 0}</strong></div>
+                <div>PDFs generated: <strong>{zipGenerateResult.generatedPdfs ?? 0}</strong></div>
+                {zipGenerateResult.outputDir && (
+                  <div>Output folder: <code>{zipGenerateResult.outputDir}</code></div>
+                )}
+                {zipGenerateResult.generatedExcel && (
+                  <div>Excel report: <code>{zipGenerateResult.generatedExcel}</code></div>
+                )}
+
+                {zipGenerateResult.errors && zipGenerateResult.errors.length > 0 && (
+                  <div style={{ marginTop: 10, color: "#c00" }}>
+                    <div style={{ fontWeight: 500 }}>Errors:</div>
+                    <ul style={{ margin: 0, paddingLeft: 18 }}>
+                      {zipGenerateResult.errors.map((e: string, i: number) => (
+                        <li key={i}>{e}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {zipGenerateResult.logs && zipGenerateResult.logs.length > 0 && (
+                  <details style={{ marginTop: 10 }}>
+                    <summary style={{ cursor: "pointer", color: "#1890ff" }}>Show detailed logs</summary>
+                    <pre style={{ fontSize: 12, maxHeight: 220, overflow: "auto", background: "#fff", padding: 8, border: "1px solid #eee" }}>
+                      {zipGenerateResult.logs.join("\n")}
+                    </pre>
+                  </details>
+                )}
+              </div>
+            )}
+          </Card>
+
           {/* Manual Email Trigger Card */}
           <Card
             title={
@@ -984,15 +1267,37 @@ function Form16Page() {
           <Card
             title="Upload History"
             extra={
-              <Button onClick={() => refetch()} icon={<SyncOutlined />}>
-                Refresh
-              </Button>
+              <Space wrap>
+                <Button size="small" onClick={handleSelectFailedHistory}>
+                  Select failed
+                </Button>
+                <Button size="small" onClick={() => setSelectedHistoryRowKeys([])}>
+                  Clear selection
+                </Button>
+                <Button
+                  size="small"
+                  danger
+                  icon={<DeleteOutlined />}
+                  loading={deleteHistoryLoading}
+                  disabled={selectedHistoryRowKeys.length === 0}
+                  onClick={handleDeleteSelectedHistory}
+                >
+                  Delete selected ({selectedHistoryRowKeys.length})
+                </Button>
+                <Button onClick={() => refetch()} icon={<SyncOutlined />}>
+                  Refresh
+                </Button>
+              </Space>
             }
           >
             <Table
               rowKey="id"
               columns={columns}
-              dataSource={uploadHistoryResponse?.uploadHistory || []}
+              dataSource={uploadHistoryRecords}
+              rowSelection={{
+                selectedRowKeys: selectedHistoryRowKeys,
+                onChange: (keys) => setSelectedHistoryRowKeys(keys as number[]),
+              }}
               pagination={{
                 total: uploadHistoryResponse?.count || 0,
                 pageSize: 100,
