@@ -1530,7 +1530,7 @@ export default class NoticeDownloaderJustification {
       // INSERT_YOUR_CODE
 
       // Wait for the reqList table to load
-      await page.waitForSelector("#reqList")
+      await page.waitForSelector("#gview_reqList")
 
       // Setup for downloading files
       const pathModule = require("path")
@@ -1625,7 +1625,7 @@ export default class NoticeDownloaderJustification {
 
         // Get rows from current page
         const pageRows = await page.evaluate(() => {
-          const table = document.querySelector("#reqList")
+          const table = document.querySelector("#gview_reqList")
           if (!table) return []
           const rows: any[] = []
           const trs = table.querySelectorAll("tr")
@@ -1678,7 +1678,7 @@ export default class NoticeDownloaderJustification {
 
             // Click on the row
             await page.evaluate((rowId) => {
-              const tr: any = document.querySelector(`#reqList tr[id="${rowId}"]`)
+              const tr: any = document.querySelector(`#gview_reqList tr[id="${rowId}"]`)
               if (tr) tr.click()
             }, fileToDownload.rowIdx)
 

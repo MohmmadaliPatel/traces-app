@@ -1592,20 +1592,10 @@ export default class NoticeDownloaderForm16 {
         // INSERT_YOUR_CODE
 
         // Wait for the reqList table to load - use robust long wait
-        await waitForSelectorLong(page, "#reqList", {
+        await waitForSelectorLong(page, "#gview_reqList", {
           ...DEFAULT_LONG_WAIT,
-          label: "#reqList (after search click for downloads)",
+          label: "#gview_reqList (after search click for downloads)",
         })
-
-        try {
-          if (await isCaptchaChallengeOnPage(page)) {
-            throw new Error("CAPTCHA_FAILED_IN_FLOW: captcha presented on download listing page (after search)")
-          }
-        } catch (chkErr: any) {
-          const chkMsg = chkErr?.message || String(chkErr)
-          if (/captcha|CAPTCHA/i.test(chkMsg)) throw chkErr
-          this.logger.log(`Captcha check after search transient (continuing to retry logic if needed): ${chkMsg}`)
-        }
 
         // Also check for the resource-not-found error page on the listing (can appear instead of the table on slow/bad state)
         try {
@@ -1711,7 +1701,7 @@ export default class NoticeDownloaderForm16 {
 
         // Get rows from current page
         const pageRows = await page.evaluate(() => {
-          const table = document.querySelector("#reqList")
+          const table = document.querySelector("#gview_reqList")
           if (!table) return []
           const rows: any[] = []
           const trs = table.querySelectorAll("tr")
@@ -1765,22 +1755,11 @@ export default class NoticeDownloaderForm16 {
 
             // Click on the row
             await page.evaluate((rowId) => {
-              const tr: any = document.querySelector(`#reqList tr[id="${rowId}"]`)
+              const tr: any = document.querySelector(`#gview_reqList tr[id="${rowId}"]`)
               if (tr) tr.click()
             }, fileToDownload.rowIdx)
 
             this.logger.log(`Clicked on request row: ${reqNo}`)
-
-            // If a captcha challenge appeared instead of the download controls, trigger outer retry
-            try {
-              if (await isCaptchaChallengeOnPage(page)) {
-                throw new Error(`CAPTCHA_FAILED_IN_FLOW: captcha presented after clicking row ${reqNo} (download)`)
-              }
-            } catch (chkErr: any) {
-              const chkMsg = chkErr?.message || String(chkErr)
-              if (/captcha|CAPTCHA/i.test(chkMsg)) throw chkErr
-              this.logger.log(`Captcha check after row click transient for ${reqNo} (will retry flow): ${chkMsg}`)
-            }
 
             // Check for the "Requested resource could not be found" error page after row click.
             // This page can appear due to session/URL state issues on slow networks; close browser + retry whole flow.
@@ -1876,17 +1855,6 @@ export default class NoticeDownloaderForm16 {
                 reqNo: reqNo,
               })
               continue
-            }
-
-            // Some downloads (esp Form 16A) can trigger a captcha on the click itself due to slow session state
-            try {
-              if (await isCaptchaChallengeOnPage(page)) {
-                throw new Error(`CAPTCHA_FAILED_IN_FLOW: captcha presented on download click for ${reqNo}`)
-              }
-            } catch (chkErr: any) {
-              const chkMsg = chkErr?.message || String(chkErr)
-              if (/captcha|CAPTCHA/i.test(chkMsg)) throw chkErr
-              this.logger.log(`Captcha check after download click transient for ${reqNo}: ${chkMsg}`)
             }
 
             // Check for the resource-not-found error page right after the download click.
@@ -2885,18 +2853,18 @@ export default class NoticeDownloaderForm16 {
 
               const batch = await generateForm16APdfBatch(pdfItems, {
                 concurrency,
+                skipExisting: true,
                 keepBrowserOpen: true, // reuse the browser across all downloads in this run
                 onProgress: (doneCount, total, last) => {
                   if (doneCount === total || doneCount % 25 === 0) {
-                    this.logger.log(
-                      `  ✓ PDFs ${doneCount}/${total}${last.ok ? "" : " (last failed)"}`
-                    )
+                    const note = last.skipped ? " (skipped existing)" : last.ok ? "" : " (last failed)"
+                    this.logger.log(`  ✓ PDFs ${doneCount}/${total}${note}`)
                   }
                 },
               })
 
               this.logger.log(
-                `✓ Finished generating PDFs: ${batch.success} ok, ${batch.failed} failed (of ${batch.total})`
+                `✓ Finished generating PDFs: ${batch.success} new, ${batch.skipped} skipped, ${batch.failed} failed (of ${batch.total})`
               )
               for (const e of batch.errors.slice(0, 5)) {
                 this.logger.log(`  ❌ ${path.basename(e.outputPath)}: ${e.error}`)

@@ -16,6 +16,9 @@
  *     --fy 2025-26 --quarter Q2 --formType 26Q \
  *     --max --pages 2
  *
+ * Re-runs skip PDFs that already exist. To overwrite everything:
+ *     ... --force-regenerate
+ *
  * (or via npm script:  yarn form16a:bulk --source ... --tan ... --max --pages 2)
  *
  * -------------------------------------------------------------------------------
@@ -49,6 +52,7 @@ interface WorkerParams {
   shardIndex: number
   shardCount: number
   pageConcurrency: number
+  skipExisting: boolean
 }
 
 function parseArgs(argv: string[]): Record<string, string | boolean> {
@@ -78,6 +82,7 @@ function fmt(n: number): string {
 async function runWorker(): Promise<void> {
   const params: WorkerParams = JSON.parse(process.argv[2] || "{}")
   let success = 0
+  let skipped = 0
   let failed = 0
   let lastSent = 0
 
@@ -85,7 +90,7 @@ async function runWorker(): Promise<void> {
     const now = Date.now()
     if (!force && now - lastSent < 400) return
     lastSent = now
-    process.send?.({ type: "progress", shard: params.shardIndex, success, failed })
+    process.send?.({ type: "progress", shard: params.shardIndex, success, skipped, failed })
   }
 
   const result = await generatePdfsFromZipFolder({
@@ -99,8 +104,10 @@ async function runWorker(): Promise<void> {
     pageConcurrency: params.pageConcurrency,
     shardIndex: params.shardIndex,
     shardCount: params.shardCount,
-    onPdf: (ok: boolean) => {
-      if (ok) success++
+    skipExisting: params.skipExisting,
+    onPdf: (info) => {
+      if (info.skipped) skipped++
+      else if (info.ok) success++
       else failed++
       sendProgress()
     },
@@ -148,7 +155,7 @@ async function runMaster(): Promise<void> {
     console.error(`Missing required args: ${missing.join(", ")}`)
     console.error(
       "Usage: --source <folder> --tan <TAN> --fy <2025-26> --quarter <Q2> --formType <26Q> " +
-        "[--company <name>] [--max | --processes <n>] [--pages <n>] [--machines <n>] [--machine-index <i>]"
+        "[--company <name>] [--max | --processes <n>] [--pages <n>] [--machines <n>] [--machine-index <i>] [--force-regenerate]"
     )
     process.exit(1)
   }
@@ -170,6 +177,7 @@ async function runMaster(): Promise<void> {
   const pageConcurrency = Math.max(1, parseInt(String(args.pages ?? "2"), 10) || 2)
   const machines = Math.max(1, parseInt(String(args.machines ?? "1"), 10) || 1)
   const machineIndex = Math.max(0, parseInt(String(args["machine-index"] ?? "0"), 10) || 0)
+  const skipExisting = !(args["force-regenerate"] || args.force)
 
   const zipTotal = fs.readdirSync(sourceFolder).filter((f) => f.toLowerCase().endsWith(".zip")).length
   const globalShardCount = processCount * machines
@@ -184,6 +192,7 @@ async function runMaster(): Promise<void> {
   console.log(`Machines        : ${machines} (this is machine #${machineIndex})`)
   console.log(`Processes (here): ${processCount}`)
   console.log(`Pages / process : ${pageConcurrency}`)
+  console.log(`Skip existing   : ${skipExisting ? "yes (use --force-regenerate to overwrite)" : "no"}`)
   console.log(
     `Parallel PDFs   : ${processCount * pageConcurrency} on this machine` +
       (machines > 1 ? `, ${globalShardCount * pageConcurrency} across all machines` : "")
@@ -210,7 +219,7 @@ async function runMaster(): Promise<void> {
   const execArgv = isTs && !hasLoader ? [...process.execArgv, "-r", "esbuild-register"] : process.execArgv
 
   const started = Date.now()
-  const stats = new Map<number, { success: number; failed: number; done: boolean }>()
+  const stats = new Map<number, { success: number; skipped: number; failed: number; done: boolean }>()
 
   const spawnWorker = (localIndex: number) => {
     const globalShard = machineIndex * processCount + localIndex
@@ -225,8 +234,9 @@ async function runMaster(): Promise<void> {
       shardIndex: globalShard,
       shardCount: globalShardCount,
       pageConcurrency,
+      skipExisting,
     }
-    stats.set(globalShard, { success: 0, failed: 0, done: false })
+    stats.set(globalShard, { success: 0, skipped: 0, failed: 0, done: false })
 
     const child = fork(__filename, [JSON.stringify(wp)], {
       env: { ...process.env, FORM16A_WORKER: "1" },
@@ -238,6 +248,7 @@ async function runMaster(): Promise<void> {
       const s = stats.get(m.shard)
       if (m.type === "progress" && s) {
         s.success = m.success
+        s.skipped = m.skipped ?? 0
         s.failed = m.failed
       } else if (m.type === "done" && s) {
         s.done = true
@@ -261,17 +272,19 @@ async function runMaster(): Promise<void> {
 
   const printer = setInterval(() => {
     let success = 0
+    let skipped = 0
     let failed = 0
     let doneWorkers = 0
     stats.forEach((s) => {
       success += s.success
+      skipped += s.skipped
       failed += s.failed
       if (s.done) doneWorkers++
     })
     const secs = (Date.now() - started) / 1000
     const rate = success / Math.max(secs, 0.001)
     process.stdout.write(
-      `\r⏱  ${fmt(success)} PDFs | ${fmt(failed)} failed | ${rate.toFixed(1)}/s ` +
+      `\r⏱  ${fmt(success)} new | ${fmt(skipped)} skipped | ${fmt(failed)} failed | ${rate.toFixed(1)}/s ` +
         `(${fmt(rate * 60)}/min) | ${secs.toFixed(0)}s | workers ${doneWorkers}/${processCount} done   `
     )
   }, 1000)
@@ -289,9 +302,11 @@ async function runMaster(): Promise<void> {
   clearInterval(printer)
 
   let success = 0
+  let skipped = 0
   let failed = 0
   stats.forEach((s) => {
     success += s.success
+    skipped += s.skipped
     failed += s.failed
   })
   const secs = (Date.now() - started) / 1000
@@ -299,10 +314,11 @@ async function runMaster(): Promise<void> {
   console.log("\n" + line)
   console.log(`Done in ${secs.toFixed(1)}s`)
   console.log(`  PDFs generated : ${fmt(success)}`)
+  console.log(`  Skipped (exist): ${fmt(skipped)}`)
   console.log(`  Failed         : ${fmt(failed)}`)
-  console.log(`  Throughput     : ${rate.toFixed(1)}/s  (${fmt(rate * 60)}/min)`)
+  console.log(`  Throughput     : ${rate.toFixed(1)}/s  (${fmt(rate * 60)}/min new PDFs)`)
   console.log(line)
-  process.exit(failed > 0 && success === 0 ? 1 : 0)
+  process.exit(failed > 0 && success === 0 && skipped === 0 ? 1 : 0)
 }
 
 // ----------------------------------------------------------------------------

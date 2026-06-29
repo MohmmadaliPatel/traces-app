@@ -49,6 +49,7 @@ const ProcessExcelUploadSchema = z.object({
 
 export default resolver.pipe(
   resolver.zod(ProcessExcelUploadSchema),
+  resolver.authorize(),
   async ({
     companies,
     financialYear,

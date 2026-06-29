@@ -274,13 +274,23 @@ async function renderForm16APdfOnPage(page: Page, options: PdfGenerationOptions)
 /**
  * Generate a single Form 16A PDF. Reuses the shared browser (launched once) and the
  * cached images. For large volumes prefer {@link generateForm16APdfBatch}.
+ * Returns 'skipped' when skipExisting is true (default) and the file already exists.
  */
-export async function generateForm16APdf(options: PdfGenerationOptions): Promise<void> {
+export async function generateForm16APdf(
+  options: PdfGenerationOptions,
+  opts?: { skipExisting?: boolean }
+): Promise<"generated" | "skipped"> {
+  const skipExisting = opts?.skipExisting !== false
+  if (skipExisting && isExistingForm16APdf(options.outputPath)) {
+    return "skipped"
+  }
+
   const browser = await getForm16ABrowser()
   const page = await createRenderPage(browser)
   try {
     await renderForm16APdfOnPage(page, options)
     console.log(`✓ Generated PDF: ${options.outputPath}`)
+    return "generated"
   } finally {
     await page.close().catch(() => {})
   }
@@ -289,6 +299,7 @@ export async function generateForm16APdf(options: PdfGenerationOptions): Promise
 export interface Form16ABatchResult {
   total: number
   success: number
+  skipped: number
   failed: number
   errors: Array<{ outputPath: string; error: string }>
 }
@@ -298,10 +309,37 @@ export interface Form16ABatchOptions {
   concurrency?: number
   /** Recycle each worker page after this many PDFs to keep memory flat on long runs. Default 250. */
   recycleEvery?: number
-  /** Called after each PDF (success or failure) for progress reporting. */
-  onProgress?: (done: number, total: number, last: { outputPath: string; ok: boolean }) => void
+  /** Skip PDFs that already exist on disk (default true). Set false to force regeneration. */
+  skipExisting?: boolean
+  /** Called after each PDF (success, failure, or skip). */
+  onProgress?: (
+    done: number,
+    total: number,
+    last: { outputPath: string; ok: boolean; skipped?: boolean }
+  ) => void
   /** Keep the shared browser open after the batch (default false → the browser is closed). */
   keepBrowserOpen?: boolean
+}
+
+/** Minimum bytes for an existing PDF to count as valid (avoids skipping over empty/corrupt stubs). */
+const MIN_EXISTING_PDF_BYTES = 1024
+
+/** True when a non-empty PDF already exists at outputPath. */
+export function isExistingForm16APdf(outputPath: string): boolean {
+  try {
+    const stat = fs.statSync(outputPath)
+    if (!stat.isFile() || stat.size < MIN_EXISTING_PDF_BYTES) return false
+    const fd = fs.openSync(outputPath, "r")
+    try {
+      const buf = Buffer.alloc(5)
+      fs.readSync(fd, buf, 0, 5, 0)
+      return buf.toString("ascii") === "%PDF-"
+    } finally {
+      fs.closeSync(fd)
+    }
+  } catch {
+    return false
+  }
 }
 
 export function defaultForm16AConcurrency(): number {
@@ -319,15 +357,34 @@ export async function generateForm16APdfBatch(
   items: PdfGenerationOptions[],
   options: Form16ABatchOptions = {}
 ): Promise<Form16ABatchResult> {
-  const result: Form16ABatchResult = { total: items.length, success: 0, failed: 0, errors: [] }
+  const result: Form16ABatchResult = { total: items.length, success: 0, skipped: 0, failed: 0, errors: [] }
   if (items.length === 0) return result
 
+  const skipExisting = options.skipExisting !== false
   const concurrency = Math.max(1, options.concurrency ?? defaultForm16AConcurrency())
   const recycleEvery = Math.max(1, options.recycleEvery ?? 250)
-  const browser = await getForm16ABrowser()
 
-  let nextIndex = 0
+  const pending: PdfGenerationOptions[] = []
   let done = 0
+
+  for (const item of items) {
+    if (skipExisting && isExistingForm16APdf(item.outputPath)) {
+      result.skipped++
+      done++
+      options.onProgress?.(done, items.length, {
+        outputPath: item.outputPath,
+        ok: true,
+        skipped: true,
+      })
+    } else {
+      pending.push(item)
+    }
+  }
+
+  if (pending.length === 0) return result
+
+  const browser = await getForm16ABrowser()
+  let nextIndex = 0
 
   const worker = async (): Promise<void> => {
     let page = await createRenderPage(browser)
@@ -335,8 +392,8 @@ export async function generateForm16APdfBatch(
     try {
       while (true) {
         const index = nextIndex++
-        if (index >= items.length) break
-        const item = items[index]
+        if (index >= pending.length) break
+        const item = pending[index]
         if (!item) continue
 
         let ok = true
@@ -352,7 +409,7 @@ export async function generateForm16APdfBatch(
           })
         }
         done++
-        options.onProgress?.(done, items.length, { outputPath: item.outputPath, ok })
+        options.onProgress?.(done, items.length, { outputPath: item.outputPath, ok, skipped: false })
 
         // Recycle the page periodically so Chromium memory doesn't grow unbounded.
         renderedOnPage++
@@ -367,7 +424,7 @@ export async function generateForm16APdfBatch(
     }
   }
 
-  const workerCount = Math.min(concurrency, items.length)
+  const workerCount = Math.min(concurrency, pending.length)
   try {
     await Promise.all(Array.from({ length: workerCount }, () => worker()))
   } finally {

@@ -4,6 +4,19 @@ This is a [Blitz.js](https://github.com/blitz-js/blitz) app.
 
 # Traces Conso
 
+## API Documentation
+
+- **Full reference (RPC + REST):** [docs/API.md](docs/API.md)
+- **Interactive REST explorer:** [/api-docs](/api-docs) (requires login)
+- **OpenAPI spec:** [docs/openapi.yaml](docs/openapi.yaml)
+
+### Creating an API token for external clients
+
+1. Log in to the app (or call `POST /api/rpc/login`).
+2. Call `POST /api/rpc/createApiToken` with `{ "name": "My integration" }`.
+3. Save the returned `token` (format `tt_...`) — it is shown only once.
+4. Send `Authorization: Bearer tt_...` on all REST and RPC requests.
+
 ## Getting Started
 
 Run your app in the development mode.

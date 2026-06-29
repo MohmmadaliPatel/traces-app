@@ -11,6 +11,7 @@ const GetUploadHistorySchema = z.object({
 
 export default resolver.pipe(
   resolver.zod(GetUploadHistorySchema),
+  resolver.authorize(),
   async ({ skip = 0, take = 100, type, batchId }) => {
     const where:any = type ? { type } : {}
     if (batchId) {

@@ -94,6 +94,7 @@
     "react-js-cron": "5.0.1",
     "secure-password": "4.0.0",
     "socks-proxy-agent": "7.0.0",
+    "swagger-ui-react": "5.32.8",
     "tough-cookie": "4.1.2",
     "winreg": "1.2.5",
     "xlsx": "0.18.5",

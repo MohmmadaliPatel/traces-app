@@ -1,3 +1,4 @@
+import { withApiAuth } from "src/utils/apiAuth"
 import { NextApiRequest, NextApiResponse } from "next"
 import db from "db"
 import { readCachedPaymentHistoryGaps } from "src/scripts/fetchPaymentHistory"
@@ -8,7 +9,7 @@ import {
   saveChallanStatusCoverageReport,
 } from "src/challan/utils/challanStatusExcel"
 
-export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ctx) => {
   if (req.method !== "GET") {
     return res.status(405).json({ error: "Method not allowed" })
   }
@@ -90,4 +91,4 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       error: error.message || "Failed to read payment history gaps",
     })
   }
-}
+})

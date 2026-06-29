@@ -286,6 +286,7 @@ export async function findAndProcessTxtFiles(
         }
 
         const companyData = {
+          ...roundedChallan,
           companyName,
           formType,
           quarter,
@@ -293,7 +294,6 @@ export async function findAndProcessTxtFiles(
           tan: tan,
           userId: "", // Will be filled by caller
           password: "", // Will be filled by caller
-          ...roundedChallan,
         }
 
         results.push(companyData)

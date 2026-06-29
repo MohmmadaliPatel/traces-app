@@ -1,0 +1,668 @@
+openapi: 3.0.3
+info:
+  title: Traces App REST API
+  description: |
+    REST endpoints for the Traces (Taxteck) application. Blitz RPC endpoints are documented in docs/API.md.
+
+    ## Authentication
+    All endpoints except `/api/env/license` require either:
+    - `Authorization: Bearer tt_{hex}` API token, or
+    - Blitz session cookie (`not-track_*`) from login
+
+    Create API tokens via `POST /api/rpc/createApiToken` after logging in.
+  version: 1.0.2
+servers:
+  - url: http://localhost:3000
+    description: Local development
+  - url: https://{host}
+    description: Production
+    variables:
+      host:
+        default: example.com
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: "tt_{hex}"
+      description: API token created via createApiToken RPC
+  schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+    UnauthorizedResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          example: Unauthorized
+    CompanyIdBody:
+      type: object
+      required:
+        - companyId
+      properties:
+        companyId:
+          oneOf:
+            - type: integer
+            - type: string
+    ChallanSection:
+      type: object
+      required:
+        - sectionCode
+        - amount
+      properties:
+        sectionCode:
+          type: string
+        amount:
+          type: string
+        actType:
+          type: string
+          description: Set to "new" for new tax regime sections
+        sectionDesc:
+          type: string
+    CreateChallanRequest:
+      allOf:
+        - $ref: '#/components/schemas/CompanyIdBody'
+        - type: object
+          required:
+            - assessmentYear
+            - sections
+          properties:
+            assessmentYear:
+              type: string
+              example: "2025-26"
+            sections:
+              type: array
+              items:
+                $ref: '#/components/schemas/ChallanSection'
+            skipDownload:
+              type: boolean
+              default: true
+    PortalCredentials:
+      type: object
+      required:
+        - userId
+        - password
+        - tan
+      properties:
+        userId:
+          type: string
+        password:
+          type: string
+        tan:
+          type: string
+    SuccessResult:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+        result:
+          type: object
+    LicenseResponse:
+      type: object
+      properties:
+        moduleAccess:
+          type: object
+        expiresAt:
+          type: integer
+        machineId:
+          type: string
+security:
+  - bearerAuth: []
+paths:
+  /api/env/license:
+    get:
+      tags: [License]
+      summary: Verify license JWT
+      security: []
+      responses:
+        '200':
+          description: License payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LicenseResponse'
+        '405':
+          description: Method not allowed
+  /api/challan/create:
+    post:
+      tags: [Challan]
+      summary: Create challans on Income Tax portal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateChallanRequest'
+      responses:
+        '200':
+          description: Challans created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  results:
+                    type: array
+                    items:
+                      type: object
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnauthorizedResponse'
+        '404':
+          description: Company not found
+  /api/challan/download:
+    post:
+      tags: [Challan]
+      summary: Download generated challans for a company
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompanyIdBody'
+      responses:
+        '200':
+          description: Download result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResult'
+        '401':
+          description: Unauthorized
+  /api/challan/fetch-payment-history:
+    post:
+      tags: [Challan]
+      summary: Fetch payment history from IT portal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompanyIdBody'
+      responses:
+        '200':
+          description: Payment history and gap analysis
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  companyName:
+                    type: string
+                  tan:
+                    type: string
+                  payments:
+                    type: array
+                    items:
+                      type: object
+                  gaps:
+                    type: array
+                    items:
+                      type: object
+                  contentJsonPath:
+                    type: string
+                  gapsJsonPath:
+                    type: string
+        '401':
+          description: Unauthorized
+  /api/challan/download-payment:
+    post:
+      tags: [Challan]
+      summary: Download payment history PDFs
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/CompanyIdBody'
+                - type: object
+                  properties:
+                    fromDate:
+                      type: string
+                    toDate:
+                      type: string
+                    assessmentYear:
+                      type: string
+                    paymentType:
+                      type: string
+                    incomeTaxAct:
+                      type: string
+                      description: Set to "new" for new regime
+      responses:
+        '200':
+          description: Download result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResult'
+        '401':
+          description: Unauthorized
+  /api/challan/download-generated-challans:
+    post:
+      tags: [Challan]
+      summary: Download generated challan PDFs with filters
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/CompanyIdBody'
+                - type: object
+                  properties:
+                    fromDate:
+                      type: string
+                    toDate:
+                      type: string
+                    assessmentYear:
+                      type: string
+                    paymentType:
+                      type: string
+                    incomeTaxAct:
+                      type: string
+      responses:
+        '200':
+          description: Download result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResult'
+        '401':
+          description: Unauthorized
+  /api/challan/payment-history-gaps:
+    get:
+      tags: [Challan]
+      summary: Read cached payment history gaps
+      parameters:
+        - name: companyId
+          in: query
+          required: true
+          schema:
+            type: integer
+        - name: refreshCoverage
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: ["true", "false"]
+      responses:
+        '200':
+          description: Cached gaps and coverage report
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  gaps:
+                    type: array
+                    items:
+                      type: object
+                  challanStatusCoverage:
+                    type: object
+        '401':
+          description: Unauthorized
+  /api/challan/download-missing-payment-pdfs:
+    post:
+      tags: [Challan]
+      summary: Download missing payment PDFs and refresh coverage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/CompanyIdBody'
+                - type: object
+                  properties:
+                    incomeTaxAct:
+                      type: string
+      responses:
+        '200':
+          description: Download and coverage refresh result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  companyName:
+                    type: string
+                  result:
+                    type: object
+                  gapsRefreshed:
+                    type: boolean
+                  challanStatusCoverage:
+                    type: object
+        '401':
+          description: Unauthorized
+  /api/tldc/fetch-data:
+    post:
+      tags: [TLDC]
+      summary: Fetch TLDC data from TRACES portal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - tan
+                - year
+                - credentials
+              properties:
+                tan:
+                  type: string
+                year:
+                  type: string
+                companyId:
+                  type: integer
+                credentials:
+                  $ref: '#/components/schemas/PortalCredentials'
+      responses:
+        '200':
+          description: TLDC fetch result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: array
+                    items:
+                      type: object
+                  cached:
+                    type: boolean
+                  message:
+                    type: string
+        '401':
+          description: Unauthorized
+  /api/tldc/update-data:
+    post:
+      tags: [TLDC]
+      summary: Refresh existing TLDC records from portal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - tan
+                - year
+                - companyId
+                - credentials
+              properties:
+                tan:
+                  type: string
+                year:
+                  type: string
+                companyId:
+                  type: integer
+                recordId:
+                  type: integer
+                credentials:
+                  $ref: '#/components/schemas/PortalCredentials'
+      responses:
+        '200':
+          description: TLDC update result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: array
+                    items:
+                      type: object
+                  cached:
+                    type: boolean
+                  message:
+                    type: string
+        '401':
+          description: Unauthorized
+  /api/outstanding-demand/fetch:
+    post:
+      tags: [OutstandingDemand]
+      summary: Fetch outstanding demand from IT portal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - companyId
+                - credentials
+              properties:
+                companyId:
+                  type: integer
+                credentials:
+                  $ref: '#/components/schemas/PortalCredentials'
+      responses:
+        '200':
+          description: Fetch and persist result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: array
+                    items:
+                      type: object
+                  saved:
+                    type: array
+                    items:
+                      type: object
+                  updated:
+                    type: array
+                    items:
+                      type: object
+                  errors:
+                    type: array
+                    items:
+                      type: object
+                  message:
+                    type: string
+        '401':
+          description: Unauthorized
+  /api/return-status/fetch:
+    post:
+      tags: [ReturnStatus]
+      summary: Fetch TDS return status from portal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - companyId
+                - credentials
+                - financialYears
+                - quarters
+                - formTypes
+              properties:
+                companyId:
+                  type: integer
+                credentials:
+                  $ref: '#/components/schemas/PortalCredentials'
+                financialYears:
+                  type: array
+                  items:
+                    type: string
+                quarters:
+                  type: array
+                  items:
+                    type: string
+                formTypes:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '200':
+          description: Fetch and persist result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: array
+                    items:
+                      type: object
+                  saved:
+                    type: integer
+                  updated:
+                    type: integer
+                  errors:
+                    type: array
+                    items:
+                      type: object
+                  message:
+                    type: string
+        '401':
+          description: Unauthorized
+  /api/smtp-test:
+    post:
+      tags: [SMTP]
+      summary: Test SMTP connection
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - host
+                - port
+                - user
+                - password
+              properties:
+                host:
+                  type: string
+                port:
+                  oneOf:
+                    - type: integer
+                    - type: string
+                secure:
+                  type: boolean
+                user:
+                  type: string
+                password:
+                  type: string
+      responses:
+        '200':
+          description: Connection verified
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+        '401':
+          description: Unauthorized
+  /api/file/upload:
+    post:
+      tags: [Files]
+      summary: Upload files to server directory
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Destination directory path on server
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: array
+                  items:
+                    type: string
+                    format: binary
+      responses:
+        '200':
+          description: Upload successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  files:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        originalName:
+                          type: string
+                        uploadedName:
+                          type: string
+                        path:
+                          type: string
+        '401':
+          description: Unauthorized
+  /api/file/{slug}:
+    get:
+      tags: [Files]
+      summary: Download a file from public storage
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema:
+            type: array
+            items:
+              type: string
+          style: simple
+          explode: false
+      responses:
+        '200':
+          description: File bytes
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '401':
+          description: Unauthorized

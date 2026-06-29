@@ -23,14 +23,17 @@ export interface GenerateFromZipsParams {
   shardIndex?: number
   /** For multi-process / multi-machine runs: total number of shards. Zips are split round-robin. */
   shardCount?: number
-  /** Called once per generated PDF (ok=false on failure). Used for live progress aggregation. */
-  onPdf?: (ok: boolean) => void
+  /** Skip PDFs that already exist on disk (default true). Set false to force regeneration. */
+  skipExisting?: boolean
+  /** Called once per PDF outcome. Used for live progress aggregation. */
+  onPdf?: (info: { ok: boolean; skipped?: boolean }) => void
 }
 
 export interface GenerateFromZipsResult {
   success: boolean
   processedZips: number
   generatedPdfs: number
+  skippedPdfs: number
   generatedExcel?: string
   outputDir?: string
   errors: string[]
@@ -157,11 +160,13 @@ export async function generatePdfsFromZipFolder(params: GenerateFromZipsParams):
     shardIndex,
     shardCount,
     onPdf,
+    skipExisting,
   } = params
 
   const errors: string[] = []
   let processedZips = 0
   let generatedPdfs = 0
+  let skippedPdfs = 0
   let generatedExcel: string | undefined
   let outputDir: string | undefined
 
@@ -307,16 +312,22 @@ export async function generatePdfsFromZipFolder(params: GenerateFromZipsParams):
 
               const batch = await generateForm16APdfBatch(items, {
                 concurrency,
+                skipExisting: skipExisting !== false,
                 keepBrowserOpen: true, // reuse the browser across all zips in this folder
                 onProgress: (doneCount, total, last) => {
-                  if (onPdf) onPdf(last.ok)
+                  if (onPdf) onPdf({ ok: last.ok, skipped: last.skipped })
                   if (doneCount === total || doneCount % 25 === 0) {
-                    logg(`  ✓ PDFs ${doneCount}/${total}${last.ok ? "" : " (last failed)"}`)
+                    const note = last.skipped ? " (skipped existing)" : last.ok ? "" : " (last failed)"
+                    logg(`  ✓ PDFs ${doneCount}/${total}${note}`)
                   }
                 },
               })
 
               generatedPdfs += batch.success
+              skippedPdfs += batch.skipped
+              if (batch.skipped > 0) {
+                logg(`  ↷ Skipped ${batch.skipped} existing PDF(s) in ${zipBase}`)
+              }
               if (batch.failed > 0) {
                 logg(`  ⚠ ${batch.failed}/${batch.total} PDF(s) failed in ${zipBase}`)
                 for (const e of batch.errors.slice(0, 5)) {
@@ -348,11 +359,13 @@ export async function generatePdfsFromZipFolder(params: GenerateFromZipsParams):
       success,
       processedZips,
       generatedPdfs,
+      skippedPdfs,
       generatedExcel,
       outputDir,
       errors,
       message: success
-        ? `Processed ${processedZips} zip(s). Generated ${generatedPdfs} PDF(s).`
+        ? `Processed ${processedZips} zip(s). Generated ${generatedPdfs} PDF(s)` +
+          (skippedPdfs > 0 ? `, skipped ${skippedPdfs} existing.` : `.`)
         : `Completed with errors. See details.`,
     }
   } catch (fatal: any) {
@@ -360,6 +373,7 @@ export async function generatePdfsFromZipFolder(params: GenerateFromZipsParams):
       success: false,
       processedZips,
       generatedPdfs,
+      skippedPdfs,
       errors: [...errors, fatal.message],
       message: fatal.message,
     }

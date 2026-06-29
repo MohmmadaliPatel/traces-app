@@ -6,6 +6,8 @@ import db from "db"
 import { authConfig } from "./blitz-client"
 import { xssRegex, crlfRegex, XMLRegex } from "./utils/waf/specialchars.regex"
 import { NextApiRequest, NextApiResponse } from "next"
+import { getSession } from "@blitzjs/auth"
+import { authenticateBearerToken, isPublicRpcPath } from "./utils/apiAuth"
 
 // Enhanced validation helpers
 const isStringUnsafe = (value: string): boolean => {
@@ -130,6 +132,34 @@ const securityMiddleware: any = async (req: NextApiRequest, res: NextApiResponse
   }
 }
 
+const bearerAuthMiddleware: any = async (req: NextApiRequest, res: NextApiResponse, next) => {
+  const url = req.url || ""
+  if (!url.startsWith("/api/rpc/")) {
+    await next()
+    return
+  }
+
+  const authHeader = req.headers.authorization
+  if (!authHeader?.startsWith("Bearer ")) {
+    await next()
+    return
+  }
+
+  const user = await authenticateBearerToken(req)
+  if (!user) {
+    if (!isPublicRpcPath(url)) {
+      res.status(401).json({ error: "Unauthorized" })
+      return
+    }
+    await next()
+    return
+  }
+
+  const session = await getSession(req, res)
+  await session.$create({ userId: user.userId, role: user.role })
+  await next()
+}
+
 export const { gSSP, gSP, api } = setupBlitzServer({
   plugins: [
     AuthServerPlugin({
@@ -140,6 +170,7 @@ export const { gSSP, gSP, api } = setupBlitzServer({
         process.env.NODE_ENV === "production" && process.env.DISABLE_SECURE_COOKIE !== "true",
     }),
     BlitzServerMiddleware(securityMiddleware),
+    BlitzServerMiddleware(bearerAuthMiddleware),
     BlitzServerMiddleware(async (req, res: any, next) => {
       res.blitzCtx.makeCookiesHttpOnly = () => {
         // Modify Set-Cookie header to enforce HttpOnly

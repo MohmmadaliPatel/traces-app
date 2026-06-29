@@ -1,8 +1,9 @@
+import { withApiAuth } from "src/utils/apiAuth"
 import { NextApiRequest, NextApiResponse } from "next"
 import db from "db"
 import { downloadGeneratedChallansWithFilters } from "src/scripts/downloadChallanPayment"
 
-export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ctx) => {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" })
   }
@@ -42,4 +43,4 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       error: error.message || "Failed to download generated challans",
     })
   }
-}
+})

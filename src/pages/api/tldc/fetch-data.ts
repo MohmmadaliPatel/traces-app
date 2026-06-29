@@ -1,3 +1,4 @@
+import { withApiAuth } from "src/utils/apiAuth"
 import db from "db"
 import { NextApiRequest, NextApiResponse } from "next"
 import { fetchTldcData, processPdfFiles } from "src/scripts/fetchTldcData"
@@ -7,7 +8,7 @@ import { updateTldcData } from "src/scripts/updateTldcData"
  * API endpoint to fetch TLDC data using Puppeteer
  * This keeps the Puppeteer code on the server side only
  */
-export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ctx) => {
   // Only allow POST requests
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" })
@@ -164,4 +165,4 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       message: error instanceof Error ? error.message : "Unknown error occurred",
     })
   }
-}
+})

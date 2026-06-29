@@ -10,6 +10,7 @@ const GetTaskBatchTaskIdsSchema = z.object({
 
 export default resolver.pipe(
   resolver.zod(GetTaskBatchTaskIdsSchema),
+  resolver.authorize(),
   async ({ batchId, statusFilter, companyNameFilter }) => {
     const tasks = await db.task.findMany({
       where: {

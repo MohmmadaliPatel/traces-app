@@ -8,6 +8,7 @@ const CleanupTemporaryCompaniesSchema = z.object({
 
 export default resolver.pipe(
   resolver.zod(CleanupTemporaryCompaniesSchema),
+  resolver.authorize(),
   async ({ olderThanDays }) => {
     const cutoffDate = new Date()
     cutoffDate.setDate(cutoffDate.getDate() - olderThanDays)

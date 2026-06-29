@@ -11,6 +11,7 @@ import {
   Alert,
   Radio,
   Divider,
+  Checkbox,
 } from "antd"
 import type { ColumnsType } from "antd/es/table"
 import {
@@ -115,6 +116,7 @@ function Form16Page() {
   const [zipFinancialYear, setZipFinancialYear] = useState("")
   const [zipQuarter, setZipQuarter] = useState("")
   const [zipFormType, setZipFormType] = useState("")
+  const [zipSkipExisting, setZipSkipExisting] = useState(true)
   const [zipGenerateLoading, setZipGenerateLoading] = useState(false)
   const [zipGenerateResult, setZipGenerateResult] = useState<any>(null)
 
@@ -170,13 +172,18 @@ function Form16Page() {
         quarter: zipQuarter,
         formType: zipFormType,
         form16Type,
+        skipExisting: zipSkipExisting,
       })
 
       setZipGenerateResult(res)
 
       if (res.success) {
+        const skipped = res.skippedPdfs ?? 0
+        const generated = res.generatedPdfs ?? 0
         messageApi.success(
-          `Generated ${res.generatedPdfs || 0} PDF(s) from ${res.processedZips || 0} ZIP(s)`
+          skipped > 0
+            ? `Generated ${generated} new PDF(s), skipped ${skipped} existing — from ${res.processedZips || 0} ZIP(s)`
+            : `Generated ${generated} PDF(s) from ${res.processedZips || 0} ZIP(s)`
         )
       } else {
         messageApi.error(res.message || "Generation completed with errors")
@@ -875,6 +882,8 @@ function Form16Page() {
                   Example: <code>/Users/apatel/.../public/pdf/form16zip/form16a/Swiggy 26Q-Q3</code>
                   <br />
                   The tool will extract the ZIPs (using the TAN you provide as password), parse, and generate the final PDFs.
+                  <br />
+                  <strong>Re-runs are safe:</strong> PDFs already present in the output folder are skipped automatically so you can resume interrupted runs.
                 </>
               }
             />
@@ -975,6 +984,14 @@ function Form16Page() {
               </Space>
             </Space>
 
+            <Checkbox
+              checked={zipSkipExisting}
+              onChange={(e) => setZipSkipExisting(e.target.checked)}
+              style={{ marginTop: 12 }}
+            >
+              Skip PDFs that already exist in the output folder (resume interrupted runs)
+            </Checkbox>
+
             <div style={{ marginTop: 20 }}>
               <Button
                 type="primary"
@@ -1002,6 +1019,7 @@ function Form16Page() {
                   setZipFinancialYear("")
                   setZipQuarter("")
                   setZipFormType("")
+                  setZipSkipExisting(true)
                   setZipGenerateResult(null)
                 }}
               >
@@ -1016,6 +1034,9 @@ function Form16Page() {
                 </div>
                 <div>ZIPs processed: <strong>{zipGenerateResult.processedZips ?? 0}</strong></div>
                 <div>PDFs generated: <strong>{zipGenerateResult.generatedPdfs ?? 0}</strong></div>
+                {(zipGenerateResult.skippedPdfs ?? 0) > 0 && (
+                  <div>PDFs skipped (already exist): <strong>{zipGenerateResult.skippedPdfs}</strong></div>
+                )}
                 {zipGenerateResult.outputDir && (
                   <div>Output folder: <code>{zipGenerateResult.outputDir}</code></div>
                 )}

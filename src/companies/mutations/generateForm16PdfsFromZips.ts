@@ -10,10 +10,13 @@ const GenerateForm16PdfsFromZipsSchema = z.object({
   quarter: z.string().min(2),
   formType: z.string().min(2),
   form16Type: z.enum(["form16", "form16a"]),
+  /** Skip PDFs that already exist in the output folder (default true). */
+  skipExisting: z.boolean().optional(),
 })
 
 export default resolver.pipe(
   resolver.zod(GenerateForm16PdfsFromZipsSchema),
+  resolver.authorize(),
   async (input, ctx) => {
     const logLines: string[] = []
     const logger = (msg: string) => {
@@ -23,6 +26,7 @@ export default resolver.pipe(
 
     const result = await generatePdfsFromZipFolder({
       ...input,
+      skipExisting: input.skipExisting !== false,
       logger,
     })
 

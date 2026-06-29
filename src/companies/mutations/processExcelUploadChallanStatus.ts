@@ -98,6 +98,7 @@ function getChallanDetailsCount(companyName: string): number {
 
 export default resolver.pipe(
   resolver.zod(ProcessExcelUploadSchema),
+  resolver.authorize(),
   async ({
     companies,
     actionType,

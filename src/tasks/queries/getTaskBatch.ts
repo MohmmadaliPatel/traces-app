@@ -19,6 +19,7 @@ const GetTaskBatchSchema = z.object({
 
 export default resolver.pipe(
   resolver.zod(GetTaskBatchSchema),
+  resolver.authorize(),
   async ({
     skip = 0,
     take = 10,

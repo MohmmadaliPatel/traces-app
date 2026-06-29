@@ -648,6 +648,40 @@ export default class NoticeDownloaderConso {
     return null
   }
 
+  private normalizeFormTypeForMatch(value: string): string {
+    return String(value || "")
+      .trim()
+      .toUpperCase()
+      .replace(/^F(?=\d)/, "")
+  }
+
+  private normalizeQuarterForMatch(value: string): string {
+    const quarter = String(value || "").trim().toUpperCase()
+    if (/^\d$/.test(quarter)) return `Q${quarter}`
+    return quarter
+  }
+
+  private matchesFormTypeAndQuarter(result: { formType?: string; quarter?: string }): boolean {
+    const targetForm = this.normalizeFormTypeForMatch(this.formType)
+    const targetQuarter = this.normalizeQuarterForMatch(this.quarter)
+    if (!targetForm || !targetQuarter) return false
+    return (
+      this.normalizeFormTypeForMatch(result.formType || "") === targetForm &&
+      this.normalizeQuarterForMatch(result.quarter || "") === targetQuarter
+    )
+  }
+
+  private enrichChallanRecord(record: any) {
+    if (!record) return record
+    return {
+      ...record,
+      companyName: record.companyName || this.company.name,
+      tan: record.tan || this.company.tan || "",
+      userId: record.userId || this.company.user_id || "",
+      password: record.password || this.company.password || "",
+    }
+  }
+
   async readReturnsTxtFiles() {
     try {
       // Use the common function
@@ -659,19 +693,34 @@ export default class NoticeDownloaderConso {
         this.logger
       )
 
-      // Filter results for the specific form type and quarter we're looking for
-      const matchingResult = results.find(
-        (result) => result.formType === this.formType && result.quarter === this.quarter
-      )
-
-      if (matchingResult) {
-        // Add company credentials
-        matchingResult.userId = this.company.user_id || ""
-        matchingResult.password = this.company.password || ""
-        return matchingResult
+      if (results.length === 0) {
+        this.logger.log(
+          `No challan records parsed from txt files for ${this.company.name} (FY ${this.financialYear})`
+        )
+        return null
       }
 
-      return null
+      // Filter results for the specific form type and quarter we're looking for
+      let matchingResult = results.find((result) => this.matchesFormTypeAndQuarter(result))
+
+      if (!matchingResult && results.length === 1 && results[0]) {
+        matchingResult = results[0]
+        this.logger.log(
+          `⚠ Using sole parsed record (${matchingResult.formType}/${matchingResult.quarter}) for requested ${this.formType}/${this.quarter}`
+        )
+      }
+
+      if (!matchingResult) {
+        const available = results
+          .map((r) => `${r.formType || "?"}/${r.quarter || "?"}`)
+          .join(", ")
+        this.logger.log(
+          `No match for formType=${this.formType}, quarter=${this.quarter}. Parsed: [${available}]`
+        )
+        return null
+      }
+
+      return this.enrichChallanRecord(matchingResult)
     } catch (error) {
       this.logger.log(`Error in readReturnsTxtFiles: ${error.message}`)
       throw error
@@ -1501,7 +1550,12 @@ export default class NoticeDownloaderConso {
     const fs = require("fs")
 
     try {
-      this.logger.log(`Starting TRACES automation for ${record.companyName}`)
+      if (!record) {
+        throw new Error("No company record provided for TRACES file download")
+      }
+
+      const companyLabel = record.companyName || record.name || "Unknown"
+      this.logger.log(`Starting TRACES automation for ${companyLabel}`)
 
       const browser = await puppeteer.launch({
         headless: false,
@@ -1537,7 +1591,7 @@ export default class NoticeDownloaderConso {
       // INSERT_YOUR_CODE
 
       // Wait for the reqList table to load
-      await page.waitForSelector("#reqList")
+      await page.waitForSelector("#gview_reqList")
 
       // Setup for downloading files
       const pathModule = require("path")
@@ -1632,7 +1686,7 @@ export default class NoticeDownloaderConso {
 
         // Get rows from current page
         const pageRows = await page.evaluate(() => {
-          const table = document.querySelector("#reqList")
+          const table = document.querySelector("#gview_reqList")
           if (!table) return []
           const rows: any[] = []
           const trs = table.querySelectorAll("tr")
@@ -1685,7 +1739,7 @@ export default class NoticeDownloaderConso {
 
             // Click on the row
             await page.evaluate((rowId) => {
-              const tr: any = document.querySelector(`#reqList tr[id="${rowId}"]`)
+              const tr: any = document.querySelector(`#gview_reqList tr[id="${rowId}"]`)
               if (tr) tr.click()
             }, fileToDownload.rowIdx)
 
@@ -1942,6 +1996,7 @@ export default class NoticeDownloaderConso {
         throw new Error("No challan record provided for TRACES automation")
       }
 
+      record = this.enrichChallanRecord(record)
       this.logger.log(`Starting TRACES automation for ${record.companyName}`)
 
       const browser = await puppeteer.launch({
@@ -2065,7 +2120,9 @@ export default class NoticeDownloaderConso {
       // Close browser
       await browser.close()
 
-      this.logger.log(`TRACES automation completed successfully for ${record.companyName}`)
+      this.logger.log(
+        `TRACES automation completed successfully for ${record.companyName || this.company.name}`
+      )
       return { success: true }
     } catch (error) {
       this.logger.log(`Error in TRACES automation: ${error.message}`)

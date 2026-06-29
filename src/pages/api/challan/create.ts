@@ -1,8 +1,9 @@
 import { NextApiRequest, NextApiResponse } from "next"
 import db from "db"
 import { createChallan } from "src/scripts/createChallan"
+import { withApiAuth } from "src/utils/apiAuth"
 
-export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+export default withApiAuth(async (req, res, _ctx) => {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" })
   }
@@ -92,5 +93,5 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     console.error("Error creating challan:", error)
     return res.status(500).json({ error: error.message || "Failed to create challan" })
   }
-}
+})
 

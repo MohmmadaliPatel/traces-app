@@ -1,3 +1,4 @@
+import { withApiAuth } from "src/utils/apiAuth"
 import multer from "multer"
 import path from "path"
 import fs from "fs"
@@ -29,7 +30,7 @@ export const config = {
   },
 }
 
-export default async function handler(req, res) {
+export default withApiAuth(async (req, res, _ctx) => {
   if (req.method === "POST") {
 
     // Use multer middleware to handle file uploads
@@ -59,4 +60,4 @@ export default async function handler(req, res) {
   } else {
     res.status(405).json({ message: "Method Not Allowed" })
   }
-}
+})
