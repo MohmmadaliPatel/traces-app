@@ -908,52 +908,98 @@ const PAYMENT_HISTORY_FILTER_DOM: EpayFilterModalDomIds = {
   toDateInputId: "topayment",
 }
 
-/** Apply Payment History tab filters (payment date range required for missing-PDF batch downloads). */
-async function applyPaymentHistoryFilters(
+async function waitForVisibleMatOptions(page: Page, timeoutMs = 8000): Promise<boolean> {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    const visible = await page.evaluate(() => {
+      const options = Array.from(
+        document.querySelectorAll(".cdk-overlay-container mat-option")
+      ) as HTMLElement[]
+      return options.some((opt) => opt.offsetParent !== null)
+    })
+    if (visible) return true
+    await waitForSecs(200)
+  }
+  return false
+}
+
+async function waitForEpayFilterModal(page: Page, timeoutMs = 10000): Promise<boolean> {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    const open = await page.evaluate(() => {
+      if (document.querySelector(".modal.show")) return true
+      if (document.querySelector("#atPaymentFilter")) return true
+      return Array.from(document.querySelectorAll(".modal-content.filterAlign")).some((el) => {
+        const modal = el.closest(".modal")
+        return modal?.classList.contains("show")
+      })
+    })
+    if (open) return true
+    await waitForSecs(200)
+  }
+  return false
+}
+
+/** Apply e-Pay filter modal (Payment History + Generated Challans tabs). */
+async function applyEpayFilterModal(
   page: Page,
   params: {
     fromDate?: string
     toDate?: string
     assessmentYear?: string
     paymentType?: string
-  }
+  },
+  dom: EpayFilterModalDomIds
 ) {
   const { fromDate, toDate, assessmentYear, paymentType } = params
-  const dom = PAYMENT_HISTORY_FILTER_DOM
 
   if (!assessmentYear && !paymentType && !(fromDate && toDate)) {
     return
   }
 
-  console.log("Applying Payment History filters...", { fromDate, toDate, assessmentYear, paymentType })
+  console.log("Applying e-Pay filters...", { fromDate, toDate, assessmentYear, paymentType })
 
   await page.waitForSelector("button.defaultButton.filterButton")
   await page.click("button.defaultButton.filterButton")
-  await waitForSecs(2000)
+  await waitForSecs(500)
+  const modalReady = await waitForEpayFilterModal(page)
+  if (!modalReady) {
+    console.log("Warning: filter modal did not appear after clicking filter button")
+  }
+  await waitForSecs(500)
 
-  const openMatSelectInFilterModal = async (formControlName: "assessmentYear" | "typeOfPayment") => {
-    const opened = await page.evaluate((name) => {
+  const openMatSelectInFilterModal = async (formControlNames: string[]) => {
+    const opened = await page.evaluate((names) => {
       const modalBody =
         document.querySelector(".modal.show .modal-body") ??
+        Array.from(document.querySelectorAll(".modal-content.filterAlign .modal-body")).find((b) => {
+          const modal = b.closest(".modal")
+          return modal?.classList.contains("show")
+        }) ??
         Array.from(document.querySelectorAll(".modal-body")).find(
           (b) => (b as HTMLElement).offsetParent !== null
         ) ??
         null
-      const sel = modalBody?.querySelector(
-        `mat-select[formcontrolname="${name}"]`
-      ) as HTMLElement | null
-      if (!sel) return false
-      sel.click()
-      return true
-    }, formControlName)
+      for (const name of names) {
+        const sel = modalBody?.querySelector(
+          `mat-select[formcontrolname="${name}"]`
+        ) as HTMLElement | null
+        if (sel) {
+          sel.click()
+          return name
+        }
+      }
+      return null
+    }, formControlNames)
     if (!opened) {
-      console.log(`Warning: mat-select[formcontrolname=${formControlName}] not found in filter modal`)
+      console.log(
+        `Warning: mat-select not found in filter modal for ${formControlNames.join(" | ")}`
+      )
     }
     await waitForSecs(400)
-    try {
-      await page.waitForSelector(".cdk-overlay-container mat-option", { visible: true, timeout: 8000 })
-    } catch {
-      console.log(`Warning: mat-option panel did not appear for ${formControlName}`)
+    const optionsVisible = await waitForVisibleMatOptions(page)
+    if (!optionsVisible) {
+      console.log(`Warning: mat-option panel did not appear for ${formControlNames.join(" | ")}`)
     }
   }
 
@@ -983,12 +1029,12 @@ async function applyPaymentHistoryFilters(
   }
 
   if (assessmentYear) {
-    await openMatSelectInFilterModal("assessmentYear")
+    await openMatSelectInFilterModal(["taxYear", "assessmentYear"])
     await clickMatOptionByExactLabel(assessmentYear)
   }
 
   if (paymentType) {
-    await openMatSelectInFilterModal("typeOfPayment")
+    await openMatSelectInFilterModal(["typeOfPayment"])
     await clickMatOptionByExactLabel(paymentType)
   }
 
@@ -1031,29 +1077,37 @@ async function applyPaymentHistoryFilters(
 
   await waitForSecs(1000)
   const filterClicked = await page.evaluate(() => {
-    const filterSection = Array.from(document.querySelectorAll(".filter-section.mt-3.mr-3")).find(
-      (el) => !el.hasAttribute("hidden") && ((el as HTMLElement).offsetParent !== null)
-    )
-    if (!filterSection) return false
-
-    const modalFooter = filterSection.querySelector(".modal-footer")
-    if (modalFooter) {
-      const buttons = Array.from(modalFooter.querySelectorAll("button"))
-      const filterButton = buttons.find((btn) => btn.textContent?.trim() === "Filter")
+    const clickFilterInRoot = (root: ParentNode) => {
+      const modalFooter = root.querySelector(".modal-footer")
+      if (modalFooter) {
+        const buttons = Array.from(modalFooter.querySelectorAll("button"))
+        const filterButton = buttons.find((btn) => btn.textContent?.trim() === "Filter")
+        if (filterButton) {
+          ;(filterButton as HTMLElement).click()
+          return true
+        }
+      }
+      const filterButtons = Array.from(
+        root.querySelectorAll("button.defaultButton.primaryButton")
+      )
+      const filterButton = filterButtons.find((btn) => btn.textContent?.trim() === "Filter")
       if (filterButton) {
         ;(filterButton as HTMLElement).click()
         return true
       }
+      return false
     }
 
-    const filterButtons = Array.from(
-      filterSection.querySelectorAll("button.defaultButton.primaryButton")
+    const modalContent =
+      document.querySelector(".modal.show .modal-content.filterAlign") ??
+      document.querySelector(".modal.show .modal-content")
+    if (modalContent && clickFilterInRoot(modalContent)) return true
+
+    const filterSection = Array.from(document.querySelectorAll(".filter-section.mt-3.mr-3")).find(
+      (el) => !el.hasAttribute("hidden") && (el as HTMLElement).offsetParent !== null
     )
-    const filterButton = filterButtons.find((btn) => btn.textContent?.trim() === "Filter")
-    if (filterButton) {
-      ;(filterButton as HTMLElement).click()
-      return true
-    }
+    if (filterSection && clickFilterInRoot(filterSection)) return true
+
     return false
   })
 
@@ -1212,137 +1266,8 @@ async function runChallanEpayFilterDownload(
 
   await waitForSecs(5000)
 
-  if (isPaymentHistory) {
-    await applyPaymentHistoryFilters(page, { fromDate, toDate, assessmentYear, paymentType })
-  } else if (assessmentYear || paymentType || (fromDate && toDate)) {
-    console.log("Applying filters using the portal's filter modal...")
-    await page.waitForSelector("button.defaultButton.filterButton")
-    await page.click("button.defaultButton.filterButton")
-    await waitForSecs(2000)
-    // Generated Challans tab keeps inline filter logic (different date input ids via dom)
-    const openMatSelectInFilterModal = async (formControlName: "assessmentYear" | "typeOfPayment") => {
-      const opened = await page.evaluate((name) => {
-        const modalBody =
-          document.querySelector(".modal.show .modal-body") ??
-          Array.from(document.querySelectorAll(".modal-body")).find(
-            (b) => (b as HTMLElement).offsetParent !== null
-          ) ??
-          null
-        const sel = modalBody?.querySelector(
-          `mat-select[formcontrolname="${name}"]`
-        ) as HTMLElement | null
-        if (!sel) return false
-        sel.click()
-        return true
-      }, formControlName)
-      if (!opened) {
-        console.log(`Warning: mat-select[formcontrolname=${formControlName}] not found in filter modal`)
-      }
-      await waitForSecs(400)
-      try {
-        await page.waitForSelector(".cdk-overlay-container mat-option", { visible: true, timeout: 8000 })
-      } catch {
-        console.log(`Warning: mat-option panel did not appear for ${formControlName}`)
-      }
-    }
-
-    const clickMatOptionByExactLabel = async (label: string) => {
-      const clicked = await page.evaluate((want) => {
-        const norm = (s: string) => s.replace(/\s+/g, " ").trim()
-        const wantNorm = norm(want)
-        const options = Array.from(
-          document.querySelectorAll(".cdk-overlay-container mat-option")
-        ) as HTMLElement[]
-        const target = options.find((opt) => norm(opt.textContent || "") === wantNorm)
-        if (target) {
-          target.click()
-          return true
-        }
-        const loose = options.find((opt) => norm(opt.textContent || "").includes(wantNorm))
-        if (loose) {
-          loose.click()
-          return true
-        }
-        return false
-      }, label)
-      if (!clicked) {
-        console.log(`Warning: no mat-option matched label: "${label}"`)
-      }
-      await waitForSecs(600)
-    }
-
-    if (assessmentYear) {
-      await openMatSelectInFilterModal("assessmentYear")
-      await clickMatOptionByExactLabel(assessmentYear)
-    }
-    if (paymentType) {
-      await openMatSelectInFilterModal("typeOfPayment")
-      await clickMatOptionByExactLabel(paymentType)
-    }
-    if (fromDate && toDate) {
-      const fromInputId = dom.fromDateInputId
-      const toInputId = dom.toDateInputId
-      await page.evaluate((inputId) => {
-        const fromInput = document.getElementById(inputId)
-        if (fromInput) {
-          const parent = fromInput.closest("mat-form-field")
-          const calendarButton = parent?.querySelector(
-            'mat-datepicker-toggle button[aria-label="Open calendar"]'
-          )
-          if (calendarButton) {
-            ;(calendarButton as HTMLElement).click()
-          }
-        }
-      }, fromInputId)
-      await waitForSecs(1000)
-      await selectDateInOpenMatCalendar(page, fromDate)
-      await waitForSecs(500)
-      await page.evaluate((inputId) => {
-        const toInput = document.getElementById(inputId)
-        if (toInput) {
-          const parent = toInput.closest("mat-form-field")
-          const calendarButton = parent?.querySelector(
-            'mat-datepicker-toggle button[aria-label="Open calendar"]'
-          )
-          if (calendarButton) {
-            ;(calendarButton as HTMLElement).click()
-          }
-        }
-      }, toInputId)
-      await waitForSecs(1000)
-      await selectDateInOpenMatCalendar(page, toDate)
-      await waitForSecs(500)
-    }
-
-    await waitForSecs(1000)
-    const filterClicked = await page.evaluate(() => {
-      const filterSection = Array.from(document.querySelectorAll(".filter-section.mt-3.mr-3")).find(
-        (el) => !el.hasAttribute("hidden") && ((el as HTMLElement).offsetParent !== null)
-      )
-      if (!filterSection) return false
-      const modalFooter = filterSection.querySelector(".modal-footer")
-      if (modalFooter) {
-        const buttons = Array.from(modalFooter.querySelectorAll("button"))
-        const filterButton = buttons.find((btn) => btn.textContent?.trim() === "Filter")
-        if (filterButton) {
-          ;(filterButton as HTMLElement).click()
-          return true
-        }
-      }
-      const filterButtons = Array.from(
-        filterSection.querySelectorAll("button.defaultButton.primaryButton")
-      )
-      const filterButton = filterButtons.find((btn) => btn.textContent?.trim() === "Filter")
-      if (filterButton) {
-        ;(filterButton as HTMLElement).click()
-        return true
-      }
-      return false
-    })
-    if (!filterClicked) {
-      console.log("Warning: Could not find filter button")
-    }
-    await waitForSecs(3000)
+  if (isPaymentHistory || assessmentYear || paymentType || (fromDate && toDate)) {
+    await applyEpayFilterModal(page, { fromDate, toDate, assessmentYear, paymentType }, dom)
   }
 
   await page.evaluate(() => {
@@ -1486,12 +1411,16 @@ export async function downloadMissingPaymentHistoryPdfs(
       )
 
       capture.reset()
-      await applyPaymentHistoryFilters(page, {
-        fromDate: group.fromDate,
-        toDate: group.toDate,
-        assessmentYear: group.assessmentYear,
-        paymentType: group.paymentType,
-      })
+      await applyEpayFilterModal(
+        page,
+        {
+          fromDate: group.fromDate,
+          toDate: group.toDate,
+          assessmentYear: group.assessmentYear,
+          paymentType: group.paymentType,
+        },
+        PAYMENT_HISTORY_FILTER_DOM
+      )
 
       await page.evaluate(() => {
         ;[...Array.from(document.querySelectorAll("ag-grid-angular .ag-row.ag-row-first"))].forEach(
