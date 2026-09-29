@@ -1,4 +1,4 @@
-import { withApiAuth } from "src/utils/apiAuth"
+import { withApiAuth } from "src/shared/http"
 import { NextApiRequest, NextApiResponse } from "next"
 import { fetchReturnStatus } from "src/scripts/fetchReturnStatus"
 import db from "db"

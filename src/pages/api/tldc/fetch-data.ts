@@ -1,4 +1,4 @@
-import { withApiAuth } from "src/utils/apiAuth"
+import { withApiAuth } from "src/shared/http"
 import db from "db"
 import { NextApiRequest, NextApiResponse } from "next"
 import { fetchTldcData, processPdfFiles } from "src/scripts/fetchTldcData"

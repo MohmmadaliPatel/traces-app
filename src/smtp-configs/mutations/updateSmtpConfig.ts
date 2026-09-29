@@ -30,7 +30,10 @@ export default resolver.pipe(
 
     const smtpConfig = await db.smtpConfig.update({
       where: { id },
-      data: data as any,
+      data: {
+        ...data,
+        ...(isActive !== undefined ? { isActive } : {}),
+      } as any,
     })
 
     return smtpConfig

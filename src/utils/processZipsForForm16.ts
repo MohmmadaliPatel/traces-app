@@ -7,6 +7,13 @@ import {
   closeForm16ABrowser,
   defaultForm16AConcurrency,
 } from "./form16APdfGeneratorExact"
+import {
+  parseForm131File,
+  isForm131CaretContent,
+  isNewActCertificateFormType,
+} from "./form131ParserExact"
+import { generateForm131PdfBatch } from "./form131PdfGeneratorExact"
+import { attachDscToForm16aPdfs } from "src/form16/utils/signForm16Pdfs"
 
 export interface GenerateFromZipsParams {
   sourceFolder: string
@@ -292,46 +299,144 @@ export async function generatePdfsFromZipFolder(params: GenerateFromZipsParams):
         generatedExcel = excelPath
         logg(`✓ Excel written: ${excelPath}`)
 
-        // PDF generation (primarily for form16a using the exact parser)
+        // PDF generation (Form 16A classic or New Act Form 130/131/133)
         if (form16Type === "form16a") {
           try {
-            const form16AData = parseForm16AFile(txtContent)
-            if (form16AData.length === 0) {
-              logg("⚠ No Form 16A records parsed from the file")
-            } else {
-              const concurrency = pageConcurrency ?? defaultForm16AConcurrency()
-              logg(
-                `✓ Parsed ${form16AData.length} Form 16A record(s) — generating PDFs (${concurrency} in parallel)`
-              )
+            const useForm131 =
+              isNewActCertificateFormType(formType) || isForm131CaretContent(txtContent)
 
-              const items = form16AData.map((rec) => {
-                const pan = rec?.deducteeData?.pan || "UNKNOWN"
-                const pdfName = `${pan}_${formType}_${financialYear}_${quarter}.pdf`
-                return { outputPath: path.join(finalPdfDir, pdfName), data: rec }
-              })
-
-              const batch = await generateForm16APdfBatch(items, {
-                concurrency,
-                skipExisting: skipExisting !== false,
-                keepBrowserOpen: true, // reuse the browser across all zips in this folder
-                onProgress: (doneCount, total, last) => {
-                  if (onPdf) onPdf({ ok: last.ok, skipped: last.skipped })
-                  if (doneCount === total || doneCount % 25 === 0) {
-                    const note = last.skipped ? " (skipped existing)" : last.ok ? "" : " (last failed)"
-                    logg(`  ✓ PDFs ${doneCount}/${total}${note}`)
+            if (useForm131) {
+              const form131Data = parseForm131File(txtContent)
+              if (form131Data.length === 0) {
+                logg("⚠ No Form 131 records parsed from the file")
+              } else {
+                const concurrency = pageConcurrency ?? defaultForm16AConcurrency()
+                logg(
+                  `✓ Parsed ${form131Data.length} Form 131 record(s) — generating PDFs (${concurrency} in parallel)`
+                )
+                const items = form131Data.map((rec) => {
+                  const pan = rec?.deducteeData?.pan || "UNKNOWN"
+                  const pdfName = `${pan}_${formType}_${financialYear}_${quarter}.pdf`
+                  return { outputPath: path.join(finalPdfDir, pdfName), data: rec }
+                })
+                const batch = await generateForm131PdfBatch(items, {
+                  concurrency,
+                  skipExisting: skipExisting !== false,
+                  keepBrowserOpen: true,
+                  onProgress: (doneCount, total, last) => {
+                    if (onPdf) onPdf({ ok: last.ok, skipped: last.skipped })
+                    if (doneCount === total || doneCount % 25 === 0) {
+                      const note = last.skipped
+                        ? " (skipped existing)"
+                        : last.ok
+                          ? ""
+                          : " (last failed)"
+                      logg(`  ✓ PDFs ${doneCount}/${total}${note}`)
+                    }
+                  },
+                })
+                generatedPdfs += batch.success
+                skippedPdfs += batch.skipped
+                if (batch.skipped > 0) {
+                  logg(`  ↷ Skipped ${batch.skipped} existing PDF(s) in ${zipBase}`)
+                }
+                if (batch.failed > 0) {
+                  logg(`  ⚠ ${batch.failed}/${batch.total} PDF(s) failed in ${zipBase}`)
+                  for (const e of batch.errors.slice(0, 5)) {
+                    errors.push(`PDF error (${path.basename(e.outputPath)}): ${e.error}`)
                   }
-                },
-              })
-
-              generatedPdfs += batch.success
-              skippedPdfs += batch.skipped
-              if (batch.skipped > 0) {
-                logg(`  ↷ Skipped ${batch.skipped} existing PDF(s) in ${zipBase}`)
+                }
+                const pdfsToSign = items
+                  .map((item) => item.outputPath)
+                  .filter((p) => fs.existsSync(p))
+                if (pdfsToSign.length > 0) {
+                  const dscResult = await attachDscToForm16aPdfs({
+                    companyName,
+                    tan,
+                    pdfPaths: pdfsToSign,
+                    log: logg,
+                  })
+                  if (dscResult.signed) {
+                    logg(
+                      `✓ Auto-DSC: signed ${dscResult.pdfCount} PDF(s) with "${dscResult.certificateName}"`
+                    )
+                  } else if (dscResult.skippedReason) {
+                    logg(`ℹ Auto-DSC skipped: ${dscResult.skippedReason}`)
+                  } else {
+                    // Unsigned certificates must not pass as a clean run.
+                    const reason = dscResult.error || "DSC was not attached"
+                    errors.push(`Auto-DSC failed for ${zipBase}: ${reason}`)
+                    logg(`⚠ Auto-DSC failed: ${reason}`)
+                  }
+                }
               }
-              if (batch.failed > 0) {
-                logg(`  ⚠ ${batch.failed}/${batch.total} PDF(s) failed in ${zipBase}`)
-                for (const e of batch.errors.slice(0, 5)) {
-                  errors.push(`PDF error (${path.basename(e.outputPath)}): ${e.error}`)
+            } else {
+              const form16AData = parseForm16AFile(txtContent)
+              if (form16AData.length === 0) {
+                logg("⚠ No Form 16A records parsed from the file")
+              } else {
+                const concurrency = pageConcurrency ?? defaultForm16AConcurrency()
+                logg(
+                  `✓ Parsed ${form16AData.length} Form 16A record(s) — generating PDFs (${concurrency} in parallel)`
+                )
+
+                const items = form16AData.map((rec) => {
+                  const pan = rec?.deducteeData?.pan || "UNKNOWN"
+                  const pdfName = `${pan}_${formType}_${financialYear}_${quarter}.pdf`
+                  return { outputPath: path.join(finalPdfDir, pdfName), data: rec }
+                })
+
+                const batch = await generateForm16APdfBatch(items, {
+                  concurrency,
+                  skipExisting: skipExisting !== false,
+                  keepBrowserOpen: true,
+                  onProgress: (doneCount, total, last) => {
+                    if (onPdf) onPdf({ ok: last.ok, skipped: last.skipped })
+                    if (doneCount === total || doneCount % 25 === 0) {
+                      const note = last.skipped
+                        ? " (skipped existing)"
+                        : last.ok
+                          ? ""
+                          : " (last failed)"
+                      logg(`  ✓ PDFs ${doneCount}/${total}${note}`)
+                    }
+                  },
+                })
+
+                generatedPdfs += batch.success
+                skippedPdfs += batch.skipped
+                if (batch.skipped > 0) {
+                  logg(`  ↷ Skipped ${batch.skipped} existing PDF(s) in ${zipBase}`)
+                }
+                if (batch.failed > 0) {
+                  logg(`  ⚠ ${batch.failed}/${batch.total} PDF(s) failed in ${zipBase}`)
+                  for (const e of batch.errors.slice(0, 5)) {
+                    errors.push(`PDF error (${path.basename(e.outputPath)}): ${e.error}`)
+                  }
+                }
+
+                const pdfsToSign = items
+                  .map((item) => item.outputPath)
+                  .filter((p) => fs.existsSync(p))
+                if (pdfsToSign.length > 0) {
+                  const dscResult = await attachDscToForm16aPdfs({
+                    companyName,
+                    tan,
+                    pdfPaths: pdfsToSign,
+                    log: logg,
+                  })
+                  if (dscResult.signed) {
+                    logg(
+                      `✓ Auto-DSC: signed ${dscResult.pdfCount} PDF(s) with "${dscResult.certificateName}"`
+                    )
+                  } else if (dscResult.skippedReason) {
+                    logg(`ℹ Auto-DSC skipped: ${dscResult.skippedReason}`)
+                  } else {
+                    // Unsigned certificates must not pass as a clean run.
+                    const reason = dscResult.error || "DSC was not attached"
+                    errors.push(`Auto-DSC failed for ${zipBase}: ${reason}`)
+                    logg(`⚠ Auto-DSC failed: ${reason}`)
+                  }
                 }
               }
             }

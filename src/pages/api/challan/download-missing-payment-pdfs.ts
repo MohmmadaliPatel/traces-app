@@ -1,4 +1,4 @@
-import { withApiAuth } from "src/utils/apiAuth"
+import { withApiAuth } from "src/shared/http"
 import { NextApiRequest, NextApiResponse } from "next"
 import db from "db"
 import { downloadMissingPaymentHistoryPdfs } from "src/scripts/downloadChallanPayment"
@@ -6,6 +6,7 @@ import {
   analyzePaymentHistoryGaps,
   paymentHistoryContentJsonPath,
   paymentHistoryGapsJsonPath,
+  type PaymentHistoryRowInput,
 } from "src/challan/utils/paymentHistoryFiles"
 import {
   auditPaymentPdfChallanStatusCoverage,
@@ -19,11 +20,14 @@ export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ct
   }
 
   try {
-    const { companyId, incomeTaxAct } = req.body
+    const { companyId, incomeTaxAct, missing } = req.body
 
     if (!companyId) {
       return res.status(400).json({ error: "Missing company ID" })
     }
+
+    // Default old act (matches prior API behavior when incomeTaxAct omitted)
+    const resolvedAct: "old" | "new" = incomeTaxAct === "new" ? "new" : "old"
 
     const company = await db.company.findUnique({
       where: { id: parseInt(String(companyId), 10) },
@@ -33,13 +37,30 @@ export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ct
       return res.status(404).json({ error: "Company not found" })
     }
 
-    const skipNewActRadio = incomeTaxAct !== "new"
+    const skipNewActRadio = resolvedAct !== "new"
+
+    const missingRows: PaymentHistoryRowInput[] | undefined = Array.isArray(missing)
+      ? missing
+          .filter((r: any) => r && typeof r.cin === "string" && r.cin.length > 0)
+          .map((r: any) => ({
+            cin: String(r.cin),
+            paymentTime: r.paymentTime ? String(r.paymentTime) : undefined,
+            assessmentYear: r.assessmentYear ? String(r.assessmentYear) : undefined,
+            paymentType: r.paymentType ? String(r.paymentType) : undefined,
+            actType: r.actType ? String(r.actType) : undefined,
+          }))
+      : undefined
 
     const result = await downloadMissingPaymentHistoryPdfs(
       company.tan,
       company.it_password,
       company.name,
-      { skipNewActRadio }
+      {
+        skipNewActRadio,
+        // New Act: download all available PDFs without date filter
+        skipDateFilter: resolvedAct === "new",
+        ...(missingRows && resolvedAct === "old" ? { missing: missingRows } : {}),
+      }
     )
 
     // Refresh gaps JSON after downloads
@@ -75,6 +96,7 @@ export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ct
     return res.status(200).json({
       success: true,
       companyName: company.name,
+      incomeTaxAct: resolvedAct,
       result,
       gapsRefreshed: true,
       challanStatusCoverage: coverageReport,

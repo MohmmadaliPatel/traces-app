@@ -33,6 +33,7 @@ import createDeducteeMaster from "src/deductee-masters/mutations/createDeducteeM
 import updateDeducteeMaster from "src/deductee-masters/mutations/updateDeducteeMaster"
 import deleteDeducteeMaster from "src/deductee-masters/mutations/deleteDeducteeMaster"
 import bulkUploadDeducteeMasters from "src/deductee-masters/mutations/bulkUploadDeducteeMasters"
+import { ExportButtons } from "src/shared/ui"
 import * as XLSX from "xlsx"
 import { ConfigProvider } from "antd"
 import enGB from "antd/lib/locale/en_GB"
@@ -114,7 +115,6 @@ function DeducteeMastersPage() {
               }
             }
           )
-          console.log(masters)
           // Bulk upload
           handleBulkUpload(masters)
         } catch (error: any) {
@@ -291,11 +291,16 @@ function DeducteeMastersPage() {
                   />
                 </Col>
                 <Col>
+                  <ExportButtons
+                    feature="deductee-masters"
+                    filters={{ search: searchText || undefined }}
+                    disabled={filteredDeducteeMasters.length === 0}
+                  />
                   <Button
                     type="primary"
                     icon={<PlusOutlined />}
                     onClick={handleAdd}
-                    style={{ marginRight: 8 }}
+                    style={{ marginRight: 8, marginLeft: 8 }}
                   >
                     Add New
                   </Button>
@@ -378,4 +383,5 @@ function DeducteeMastersPage() {
   )
 }
 
+DeducteeMastersPage.authenticate = { redirectTo: "/auth/login" }
 export default DeducteeMastersPage

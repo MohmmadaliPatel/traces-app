@@ -1,9 +1,15 @@
 import type { Page } from "puppeteer"
 import type { AxiosInstance } from "axios"
+import type { TracesLoginResponse } from "./types"
 
 import { createTracesHttp } from "./http"
 
-import { generateCaptcha, loginTraces } from "./auth"
+import {
+  generateCaptcha,
+  isTransientTracesFailure,
+  loginTraces,
+  tracesRetryDelayMs,
+} from "./auth"
 
 import { resolveCaptchaFromImageBase64 } from "./captchaDecode"
 
@@ -11,6 +17,7 @@ import {
   TRACES61_DASHBOARD_URL,
   TRACES61_ORIGIN,
   TRACES61_PREAUTH_V2_URL,
+  rewriteTracesRedirectLocation,
   rewriteTracesNewPortalUrlToTraces61,
   tracesAppAuthCookieContextUrl,
 } from "./constants"
@@ -39,41 +46,151 @@ function log(fn: string, message: string, detail?: string) {
 
 
 const redirectGuardKey = Symbol.for("traces61.redirectGuard")
+const redirectGuardHandlerKey = Symbol.for("traces61.redirectGuardHandler")
 
-
+type PageWithGuard = Page & Record<symbol, unknown>
 
 export async function attachTraces61RedirectGuard(page: Page): Promise<void> {
-
-  if ((page as unknown as Record<symbol, boolean>)[redirectGuardKey]) {
-
+  const tagged = page as PageWithGuard
+  if (tagged[redirectGuardKey]) {
     log("attachTraces61RedirectGuard", "already attached, skipping")
-
     return
-
   }
 
   log("attachTraces61RedirectGuard", "enabling request interception; rewriting traces.tdscpc.gov.in → traces61")
+  tagged[redirectGuardKey] = true
 
-  ;(page as unknown as Record<symbol, boolean>)[redirectGuardKey] = true
-
-  await page.setRequestInterception(true)
-
-  page.on("request", (req) => {
-
-    const url = rewriteTracesNewPortalUrlToTraces61(req.url())
-
-    if (url !== req.url()) {
-
-      void req.continue({ url })
-
-    } else {
-
+  const handler = (req: { url: () => string; method: () => string; continue: (overrides?: { url?: string }) => Promise<void> }) => {
+    // Never rewrite POST/PUT — interception + URL overrides drop form bodies and
+    // can bounce JSF submits to traces61contents.tdscpc.gov.in/auth/ (404).
+    if (req.method() !== "GET") {
       void req.continue()
-
+      return
     }
+    const url = rewriteTracesNewPortalUrlToTraces61(req.url())
+    if (url !== req.url()) {
+      void req.continue({ url })
+    } else {
+      void req.continue()
+    }
+  }
 
+  tagged[redirectGuardHandlerKey] = handler
+  await page.setRequestInterception(true)
+  page.on("request", handler)
+}
+
+/**
+ * Turn off the traces61 rewrite interceptor. Must run before JSF form POSTs
+ * (Conso Go, KYC, etc.) — Chromium drops POST bodies while interception is on.
+ */
+export async function detachTraces61RedirectGuard(page: Page): Promise<void> {
+  const tagged = page as PageWithGuard
+  if (!tagged[redirectGuardKey]) {
+    return
+  }
+  const handler = tagged[redirectGuardHandlerKey]
+  if (typeof handler === "function") {
+    page.off("request", handler as (...args: unknown[]) => void)
+  }
+  tagged[redirectGuardKey] = false
+  tagged[redirectGuardHandlerKey] = undefined
+  try {
+    await page.setRequestInterception(false)
+    log("detachTraces61RedirectGuard", "request interception disabled")
+  } catch (err) {
+    log(
+      "detachTraces61RedirectGuard",
+      "setRequestInterception(false) failed",
+      err instanceof Error ? err.message : String(err)
+    )
+  }
+}
+
+const httpsUpgradeKey = Symbol.for("traces61.httpsUpgrade")
+
+type CdpHeader = { name: string; value: string }
+
+/**
+ * After JSF Go, TRACES 302s to `http://traces61.../downloadreqspec.xhtml`.
+ * Rewrite that Location to HTTPS at the **response** stage so the POST body
+ * is already sent (Request-stage interception drops it and 404s).
+ */
+export async function attachTraces61HttpsUpgrade(page: Page): Promise<void> {
+  const tagged = page as PageWithGuard
+  if (tagged[httpsUpgradeKey]) {
+    return
+  }
+  tagged[httpsUpgradeKey] = true
+  const client = await page.createCDPSession()
+  await client.send("Fetch.enable", {
+    patterns: [
+      { urlPattern: "*://traces61.tdscpc.gov.in/*", requestStage: "Response" },
+      { urlPattern: "http://traces61.tdscpc.gov.in/*", requestStage: "Request" },
+    ],
   })
+  client.on(
+    "Fetch.requestPaused",
+    async (event: {
+      requestId: string
+      request: { url: string }
+      responseStatusCode?: number
+      responseHeaders?: CdpHeader[]
+    }) => {
+      try {
+        const reqUrl = event.request.url
+        if (!event.responseStatusCode && /^http:\/\//i.test(reqUrl)) {
+          const httpsUrl = rewriteTracesRedirectLocation(reqUrl)
+          log("attachTraces61HttpsUpgrade", `GET ${reqUrl} → ${httpsUrl}`)
+          await client.send("Fetch.continueRequest", {
+            requestId: event.requestId,
+            url: httpsUrl,
+          })
+          return
+        }
 
+        const headers = event.responseHeaders || []
+        const loc = headers.find((h) => h.name.toLowerCase() === "location")
+        const rewritten = loc ? rewriteTracesRedirectLocation(loc.value, reqUrl) : ""
+        if (loc && rewritten && rewritten !== loc.value) {
+          log("attachTraces61HttpsUpgrade", `Location ${loc.value} → ${rewritten}`)
+          const nextHeaders = headers.map((h) =>
+            h.name.toLowerCase() === "location" ? { name: h.name, value: rewritten } : h
+          )
+          await client.send("Fetch.fulfillRequest", {
+            requestId: event.requestId,
+            responseCode: event.responseStatusCode || 302,
+            responseHeaders: nextHeaders,
+            body: Buffer.from("").toString("base64"),
+          })
+          return
+        }
+        if (event.responseStatusCode) {
+          await client.send("Fetch.continueResponse", { requestId: event.requestId })
+        } else {
+          await client.send("Fetch.continueRequest", { requestId: event.requestId })
+        }
+      } catch (err) {
+        log(
+          "attachTraces61HttpsUpgrade",
+          "Fetch continue failed",
+          err instanceof Error ? err.message : String(err)
+        )
+        try {
+          await client.send("Fetch.continueRequest", { requestId: event.requestId })
+        } catch {
+          /* request already continued or finished */
+        }
+      }
+    }
+  )
+  log("attachTraces61HttpsUpgrade", "CDP Fetch: rewrite http Location → https on traces61 responses")
+}
+
+/** Call before Conso/JSF Go so the POST body is kept and the HTTP 302 is upgraded. */
+export async function prepareTraces61FormSubmit(page: Page): Promise<void> {
+  await detachTraces61RedirectGuard(page)
+  await attachTraces61HttpsUpgrade(page)
 }
 
 
@@ -283,77 +400,66 @@ export async function loginWithTracesApiAndPreauth(
   let authApiSetCookieLines: string[] = []
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-
     authApiSetCookieLines = []
 
-    const captchaMeta = await generateCaptcha(http, authApiSetCookieLines)
-
-    const captchaText = await resolveCaptchaFromImageBase64(captchaMeta.image)
-
-    const loginRes = await loginTraces(
-
-      http,
-
-      {
-
-        tan: credentials.tan,
-
-        userId: credentials.userId,
-
-        password: credentials.password,
-
-        captcha: captchaText,
-
-        captchaId: captchaMeta.id,
-
-      },
-
-      authApiSetCookieLines
-
-    )
+    let loginRes: TracesLoginResponse
+    try {
+      const captchaMeta = await generateCaptcha(http, authApiSetCookieLines)
+      const captchaText = await resolveCaptchaFromImageBase64(captchaMeta.image)
+      loginRes = await loginTraces(
+        http,
+        {
+          tan: credentials.tan,
+          userId: credentials.userId,
+          password: credentials.password,
+          captcha: captchaText,
+          captchaId: captchaMeta.id,
+        },
+        authApiSetCookieLines
+      )
+    } catch (err) {
+      // TRACES answers 502 / 504 under load and the captcha service can drop a connection;
+      // a gateway hiccup must not fail the whole job the way a rejected login does.
+      if (!isTransientTracesFailure(err) || attempt >= maxAttempts) {
+        throw err
+      }
+      const waitMs = tracesRetryDelayMs(attempt)
+      jobLog(
+        `TRACES login attempt ${attempt}/${maxAttempts} hit a transient error — ${
+          (err as Error).message
+        } — retrying in ${Math.round(waitMs / 1000)}s…`
+      )
+      await new Promise((resolve) => setTimeout(resolve, waitMs))
+      continue
+    }
 
     accessToken = loginRes.authTokenDto?.accessToken
-
     refreshToken = loginRes.authTokenDto?.refreshToken
 
     if (accessToken && refreshToken?.trim()) {
-
       jobLog(`TRACES login succeeded on attempt ${attempt}/${maxAttempts}`)
-
       break
-
     }
 
     const errorCode = loginRes.errorCode ?? "UNKNOWN"
-
-    const errorMessage = loginRes.message ?? "TRACES API login did not return authTokenDto.accessToken"
-
+    const errorMessage =
+      loginRes.message ?? "TRACES API login did not return authTokenDto.accessToken"
     jobLog(
-
       `TRACES login attempt ${attempt}/${maxAttempts} failed — errorCode=${errorCode} message=${errorMessage}`
-
     )
 
     if (attempt >= maxAttempts) {
-
       throw new Error(
-
         `TRACES login failed after ${maxAttempts} attempts: ${errorCode} — ${errorMessage}`
-
       )
-
     }
 
     if (!isRetryableLoginFailure(loginRes)) {
-
       throw new Error(`TRACES login failed (non-retryable): ${errorCode} — ${errorMessage}`)
-
     }
 
     jobLog(`Retrying TRACES login (new captcha)…`)
-
     await new Promise((resolve) => setTimeout(resolve, 800))
-
   }
 
   if (!accessToken) {

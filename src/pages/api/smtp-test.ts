@@ -1,4 +1,4 @@
-import { withApiAuth } from "src/utils/apiAuth"
+import { withApiAuth } from "src/shared/http"
 import { NextApiRequest, NextApiResponse } from "next"
 import nodemailer from "nodemailer"
 

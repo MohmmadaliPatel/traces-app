@@ -1,4 +1,4 @@
-import { withApiAuth } from "src/utils/apiAuth"
+import { withApiAuth } from "src/shared/http"
 import multer from "multer"
 import path from "path"
 import fs from "fs"

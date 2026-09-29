@@ -129,6 +129,13 @@ const Layout: BlitzLayout<{ title?: string; children?: React.ReactNode }> = ({
       notificationCounts.assessee
     ),
     getItem(
+      "LDC Utilisation",
+      "ldc-utilisation",
+      <DollarOutlined />,
+      undefined,
+      notificationCounts.assessee
+    ),
+    getItem(
       "Challan Management",
       "challan-management",
       <TeamOutlined />,
@@ -145,6 +152,27 @@ const Layout: BlitzLayout<{ title?: string; children?: React.ReactNode }> = ({
     getItem(
       "Return Status",
       "return-status",
+      <FileTextOutlined />,
+      undefined,
+      notificationCounts.assessee
+    ),
+    getItem(
+      "Clause 34(b)",
+      "clause-34b",
+      <FileTextOutlined />,
+      undefined,
+      notificationCounts.assessee
+    ),
+    getItem(
+      "Extract RRR",
+      "extract-rrr",
+      <FileTextOutlined />,
+      undefined,
+      notificationCounts.assessee
+    ),
+    getItem(
+      "Extract Acknowledgements",
+      "extract-form140",
       <FileTextOutlined />,
       undefined,
       notificationCounts.assessee

@@ -9,7 +9,6 @@ export default resolver.pipe(
     const saved:any = []
     const updated:any = []
     const errors:any = []
-    console.log("deducteeMasters", deducteeMasters)
     for (const master of deducteeMasters) {
       try {
         const existing = await db.deducteeMaster.findUnique({

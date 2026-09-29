@@ -557,6 +557,8 @@ export default function ItDocumentPage({ structure, virtualStructure }) {
   )
 }
 
+ItDocumentPage.authenticate = { redirectTo: "/auth/login" }
+
 export async function getServerSideProps() {
   const fs = require("fs")
   const path = require("path")

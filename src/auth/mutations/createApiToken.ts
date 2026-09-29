@@ -2,7 +2,7 @@ import { resolver } from "@blitzjs/rpc"
 import { hash256 } from "@blitzjs/auth"
 import { z } from "zod"
 import db from "db"
-import { generateApiTokenValue } from "src/utils/apiAuth"
+import { generateApiTokenValue } from "src/shared/http"
 
 const CreateApiTokenSchema = z.object({
   name: z.string().min(1).max(100),

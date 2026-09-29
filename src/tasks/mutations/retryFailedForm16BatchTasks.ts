@@ -95,6 +95,13 @@ export default resolver.pipe(
     const histories = await db.uploadHistory.findMany({ where: { batchId } })
     const taskComboMap = buildTaskComboMap(histories)
 
+    const useNewPortal = form16Type === "form16a" && filters.portalMode !== "old"
+    const passPeriod = useNewPortal || actionType === "send_request"
+    const portalMode =
+      filters.portalMode === "old" || filters.portalMode === "new"
+        ? (filters.portalMode as "new" | "old")
+        : undefined
+
     const retriedTaskIds: number[] = []
 
     for (const task of failedTasks) {
@@ -128,12 +135,11 @@ export default resolver.pipe(
         }
       }
 
-      const periodFinancialYear =
-        actionType === "send_request" ? normalizePeriodValue(combo?.financialYear) : undefined
-      const periodQuarter =
-        actionType === "send_request" ? normalizePeriodValue(combo?.quarter) : undefined
-      const periodFormType =
-        actionType === "send_request" ? normalizePeriodValue(combo?.formType) : undefined
+      const periodFinancialYear = passPeriod
+        ? normalizePeriodValue(combo?.financialYear)
+        : undefined
+      const periodQuarter = passPeriod ? normalizePeriodValue(combo?.quarter) : undefined
+      const periodFormType = passPeriod ? normalizePeriodValue(combo?.formType) : undefined
 
       NoticeDownloaderQueue.push(
         {
@@ -143,6 +149,7 @@ export default resolver.pipe(
           quarter: periodQuarter,
           formType: periodFormType,
           form16Type,
+          portalMode,
         },
         (err) => {
           if (err) {

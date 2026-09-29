@@ -29,6 +29,7 @@ import {
   ReloadOutlined,
   CheckCircleOutlined,
   UploadOutlined,
+  FileExcelOutlined,
 } from "@ant-design/icons"
 import getCompanies from "src/companies/queries/getCompanies"
 import getChallanData from "src/challan/queries/getChallanData"
@@ -40,13 +41,32 @@ import {
   parseIncomeTaxActCsv,
   type IncomeTaxActKind,
 } from "src/challan/utils/incomeTaxAct"
+import {
+  challanModeCsvColumnName,
+  parseChallanModeCsv,
+  type NewRegimeChallanMode,
+} from "src/challan/utils/challanMode"
+import {
+  buildEpayDownloadBatchItems,
+  parseCsvFileText,
+  type EpayCsvDownloadBatchItem,
+} from "src/challan/utils/parseChallanCsv"
 import { runWithConcurrency } from "src/challan/utils/runWithConcurrency"
+import { parsePaymentUnconsumedRows } from "src/shared/excel/paymentUnconsumed"
 import dayjs from "dayjs"
+import * as XLSX from "xlsx"
 
 const { Option } = Select
 const { Title, Text } = Typography
 
-type EpayDownloadFlow = "payment" | "generated"
+type EpayDownloadFlow = "payment" | "generated" | "csi"
+
+type EpayDownloadBatchItem = {
+  companyId: number
+  companyName?: string
+  incomeTaxAct?: IncomeTaxActKind
+  rowDownloadTargets?: EpayCsvDownloadBatchItem["rowDownloadTargets"]
+}
 
 type EpayDownloadResultRow = {
   companyId: number
@@ -61,6 +81,7 @@ type CreateBatchItem = {
   companyName: string
   assessmentYear: string
   sections: Array<{ sectionCode: string; amount: string; actType?: IncomeTaxActKind }>
+  newRegimeChallanMode?: NewRegimeChallanMode
 }
 
 type CreateResultRow = {
@@ -115,9 +136,9 @@ const ChallanManagementPage: BlitzPage = () => {
     Array<{ sectionCode: string; amount: string }>
   >([])
   const [createLoading, setCreateLoading] = useState(false)
-  const [downloadLoading, setDownloadLoading] = useState(false)
   const [downloadPaymentLoading, setDownloadPaymentLoading] = useState(false)
   const [downloadGeneratedChallansLoading, setDownloadGeneratedChallansLoading] = useState(false)
+  const [downloadCsiLoading, setDownloadCsiLoading] = useState(false)
   const [isModalVisible, setIsModalVisible] = useState(false)
   const [editingRecord, setEditingRecord] = useState<ChallanDataType | null>(null)
   const [form] = Form.useForm()
@@ -135,6 +156,14 @@ const ChallanManagementPage: BlitzPage = () => {
   const [csvFileList, setCsvFileList] = useState<any[]>([])
   const [companyPickerCsvFileList, setCompanyPickerCsvFileList] = useState<any[]>([])
   const [companyPickerCsvLoading, setCompanyPickerCsvLoading] = useState(false)
+
+  const [epayCsvFileList, setEpayCsvFileList] = useState<any[]>([])
+  const [epayCsvProcessing, setEpayCsvProcessing] = useState(false)
+  const [epayCsvFlow, setEpayCsvFlow] = useState<EpayDownloadFlow | null>(null)
+
+  const [unconsumedExcelFileList, setUnconsumedExcelFileList] = useState<any[]>([])
+  const [unconsumedExcelDownloading, setUnconsumedExcelDownloading] = useState(false)
+  const [unconsumedExcelSummary, setUnconsumedExcelSummary] = useState<string | null>(null)
 
   const [epayConcurrency, setEpayConcurrency] = useState(1)
   const [createConcurrency, setCreateConcurrency] = useState(1)
@@ -161,7 +190,11 @@ const ChallanManagementPage: BlitzPage = () => {
   } | null>(null)
   const [createRetryRowKeys, setCreateRetryRowKeys] = useState<number[]>([])
 
-  const epayDownloadBusy = downloadPaymentLoading || downloadGeneratedChallansLoading
+  const epayDownloadBusy =
+    downloadPaymentLoading ||
+    downloadGeneratedChallansLoading ||
+    downloadCsiLoading ||
+    epayCsvProcessing
   const createBusy = createLoading || csvProcessing
 
   // Fetch companies
@@ -282,35 +315,6 @@ const ChallanManagementPage: BlitzPage = () => {
     setSelectedSections([])
   }
 
-  const handleDownloadChallans = async () => {
-    if (selectedCompanyIds.length === 0) {
-      messageApi.error("Please select at least one company")
-      return
-    }
-
-    setDownloadLoading(true)
-    try {
-      for (const companyId of selectedCompanyIds) {
-        const response = await fetch("/api/challan/download", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ companyId }),
-        })
-
-        const data = await response.json()
-        if (data.success) {
-          messageApi.success(`Challans downloaded for company ${companyId}`)
-        } else {
-          messageApi.error(`Failed to download challans for company ${companyId}`)
-        }
-      }
-    } catch (error: any) {
-      messageApi.error(error.message || "Failed to download challans")
-    } finally {
-      setDownloadLoading(false)
-    }
-  }
-
   const resolveCompanyMeta = (companyId: number) => {
     const c = savedCompanies.find((x: any) => x.id === companyId)
     return {
@@ -383,6 +387,7 @@ const ChallanManagementPage: BlitzPage = () => {
               companyId: item.companyId,
               assessmentYear: item.assessmentYear,
               sections: item.sections,
+              newRegimeChallanMode: item.newRegimeChallanMode,
               skipDownload: true,
             }),
           })
@@ -448,39 +453,70 @@ const ChallanManagementPage: BlitzPage = () => {
     await runCreateBatch(items)
   }
 
-  const runEpayDownloadBatch = async (flow: EpayDownloadFlow, companyIds: number[]) => {
-    if (companyIds.length === 0) return
+  const epayFlowLabel = (flow: EpayDownloadFlow) =>
+    flow === "payment"
+      ? "Payment History"
+      : flow === "generated"
+      ? "Generated Challans"
+      : "CSI File"
 
-    const limit = Math.min(7, Math.max(1, epayConcurrency), companyIds.length)
-    const setLoading =
-      flow === "payment" ? setDownloadPaymentLoading : setDownloadGeneratedChallansLoading
+  const epayFlowEndpoint = (flow: EpayDownloadFlow) =>
+    flow === "payment"
+      ? "/api/challan/download-payment"
+      : flow === "generated"
+      ? "/api/challan/download-generated-challans"
+      : "/api/challan/download-csi"
+
+  const setEpayFlowLoading = (flow: EpayDownloadFlow, loading: boolean) => {
+    if (flow === "payment") setDownloadPaymentLoading(loading)
+    else if (flow === "generated") setDownloadGeneratedChallansLoading(loading)
+    else setDownloadCsiLoading(loading)
+  }
+
+  const runEpayDownloadBatch = async (flow: EpayDownloadFlow, items: EpayDownloadBatchItem[]) => {
+    if (items.length === 0) return
+
+    const limit = Math.min(7, Math.max(1, epayConcurrency), items.length)
 
     let completed = 0
     const bumpProgress = () => {
       completed += 1
-      setEpayDownloadProgress({ current: completed, total: companyIds.length })
+      setEpayDownloadProgress({ current: completed, total: items.length })
     }
 
-    setEpayDownloadProgress({ current: 0, total: companyIds.length })
-    setLoading(true)
+    setEpayDownloadProgress({ current: 0, total: items.length })
+    setEpayFlowLoading(flow, true)
 
-    const flowLabel = flow === "payment" ? "Payment History" : "Generated Challans"
+    const flowLabel = epayFlowLabel(flow)
+    const endpoint = epayFlowEndpoint(flow)
 
     try {
-      const results = await runWithConcurrency(companyIds, limit, async (companyId) => {
-        const endpoint =
-          flow === "payment"
-            ? "/api/challan/download-payment"
-            : "/api/challan/download-generated-challans"
-        const meta = resolveCompanyMeta(companyId)
-        const body = {
-          companyId,
-          fromDate: paymentDateRange?.[0],
-          toDate: paymentDateRange?.[1],
-          assessmentYear: paymentAssessmentYear || undefined,
-          paymentType: paymentType || undefined,
-          incomeTaxAct: paymentIncomeTaxAct,
+      const results = await runWithConcurrency(items, limit, async (item) => {
+        const meta = {
+          companyId: item.companyId,
+          companyName: item.companyName || resolveCompanyMeta(item.companyId).companyName,
+          tan: resolveCompanyMeta(item.companyId).tan,
         }
+        const incomeTaxAct = item.incomeTaxAct ?? paymentIncomeTaxAct
+        const body =
+          flow === "csi"
+            ? {
+                companyId: item.companyId,
+                fromDate: paymentDateRange?.[0],
+                toDate: paymentDateRange?.[1],
+                incomeTaxAct,
+              }
+            : {
+                companyId: item.companyId,
+                fromDate: item.rowDownloadTargets?.length ? undefined : paymentDateRange?.[0],
+                toDate: item.rowDownloadTargets?.length ? undefined : paymentDateRange?.[1],
+                assessmentYear: item.rowDownloadTargets?.length
+                  ? undefined
+                  : paymentAssessmentYear || undefined,
+                paymentType: paymentType || undefined,
+                incomeTaxAct,
+                rowDownloadTargets: item.rowDownloadTargets,
+              }
 
         try {
           const response = await fetch(endpoint, {
@@ -497,7 +533,7 @@ const ChallanManagementPage: BlitzPage = () => {
           }
 
           const row: EpayDownloadResultRow = {
-            companyId,
+            companyId: meta.companyId,
             companyName: meta.companyName,
             tan: meta.tan,
             success: response.ok && data.success === true,
@@ -509,7 +545,7 @@ const ChallanManagementPage: BlitzPage = () => {
           return row
         } catch (e: any) {
           return {
-            companyId,
+            companyId: meta.companyId,
             companyName: meta.companyName,
             tan: meta.tan,
             success: false,
@@ -538,7 +574,7 @@ const ChallanManagementPage: BlitzPage = () => {
     } catch (error: any) {
       messageApi.error(error.message || `Failed to run ${flowLabel} downloads`)
     } finally {
-      setLoading(false)
+      setEpayFlowLoading(flow, false)
       setEpayDownloadProgress(null)
     }
   }
@@ -548,7 +584,10 @@ const ChallanManagementPage: BlitzPage = () => {
       messageApi.error("Please select at least one company")
       return
     }
-    await runEpayDownloadBatch("payment", selectedCompanyIds)
+    await runEpayDownloadBatch(
+      "payment",
+      selectedCompanyIds.map((companyId) => ({ companyId }))
+    )
   }
 
   const handleDownloadGeneratedChallans = async () => {
@@ -556,7 +595,90 @@ const ChallanManagementPage: BlitzPage = () => {
       messageApi.error("Please select at least one company")
       return
     }
-    await runEpayDownloadBatch("generated", selectedCompanyIds)
+    await runEpayDownloadBatch(
+      "generated",
+      selectedCompanyIds.map((companyId) => ({ companyId }))
+    )
+  }
+
+  const handleDownloadCsiFiles = async () => {
+    if (selectedCompanyIds.length === 0) {
+      messageApi.error("Please select at least one company")
+      return
+    }
+    if (!paymentDateRange?.[0] || !paymentDateRange?.[1]) {
+      messageApi.error("Please select a Payment Date Range for CSI download")
+      return
+    }
+    await runEpayDownloadBatch(
+      "csi",
+      selectedCompanyIds.map((companyId) => ({ companyId }))
+    )
+  }
+
+  const resolveSelectedCsvFile = (fileList: any[]): File | undefined => {
+    const entry = fileList[0]
+    if (!entry) return undefined
+    if (entry instanceof File) return entry
+    return (entry.originFileObj as File | undefined) ?? entry
+  }
+
+  const handleEpayCsvDownload = (flow: EpayDownloadFlow) => {
+    const file = resolveSelectedCsvFile(epayCsvFileList)
+    if (!file) {
+      messageApi.error("Please select a CSV file first")
+      return
+    }
+    void handleEpayCsvUpload(file, flow)
+  }
+
+  const handleEpayCsvUpload = async (file: File, flow: EpayDownloadFlow) => {
+    if (!file.name.endsWith(".csv")) {
+      messageApi.error("Please upload a CSV file")
+      setEpayCsvFileList([])
+      return false
+    }
+
+    try {
+      setEpayCsvProcessing(true)
+      setEpayCsvFlow(flow)
+      const text = await file.text()
+      const csvData = parseCsvFileText(text).filter((row) => row["Company Name"]?.trim())
+
+      if (csvData.length === 0) {
+        messageApi.error("No valid data found in CSV")
+        return false
+      }
+
+      const batchItems = buildEpayDownloadBatchItems(csvData, savedCompanies)
+      if (batchItems.length === 0) {
+        messageApi.error("No matching companies or download targets found in CSV")
+        return false
+      }
+
+      const flowLabel = epayFlowLabel(flow)
+      messageApi.info(
+        `Starting CSV-based ${flowLabel} download for ${batchItems.length} company batch(es)...`
+      )
+
+      await runEpayDownloadBatch(
+        flow,
+        batchItems.map((item) => ({
+          companyId: item.companyId,
+          companyName: item.companyName,
+          incomeTaxAct: item.incomeTaxAct,
+          rowDownloadTargets: item.rowDownloadTargets,
+        }))
+      )
+      setEpayCsvFileList([])
+    } catch (error: any) {
+      messageApi.error(error.message || "Failed to process CSV for download")
+      setEpayCsvFileList([])
+    } finally {
+      setEpayCsvProcessing(false)
+      setEpayCsvFlow(null)
+    }
+    return false
   }
 
   const handleEpayRetrySelected = async () => {
@@ -566,7 +688,10 @@ const ChallanManagementPage: BlitzPage = () => {
       return
     }
     setEpayResultsModalOpen(false)
-    await runEpayDownloadBatch(lastEpayDownloadRun.flow, epayRetryRowKeys)
+    await runEpayDownloadBatch(
+      lastEpayDownloadRun.flow,
+      epayRetryRowKeys.map((companyId) => ({ companyId }))
+    )
   }
 
   const handleDelete = async (id: number) => {
@@ -583,37 +708,115 @@ const ChallanManagementPage: BlitzPage = () => {
     return new Promise((resolve, reject) => {
       const reader = new FileReader()
       reader.onload = (e) => {
-        const text = e.target?.result as string
-        const lines = text.split("\n").filter((line) => line.trim())
-        if (lines.length < 2) {
-          reject(new Error("CSV file is empty or invalid"))
-          return
+        try {
+          const text = e.target?.result as string
+          const data = parseCsvFileText(text)
+          resolve(data.filter((row) => row["Company Name"]))
+        } catch (err: any) {
+          reject(err)
         }
-
-        const headerLine = lines[0]
-        if (!headerLine) {
-          reject(new Error("CSV file has no headers"))
-          return
-        }
-
-        const headers = headerLine.split(",").map((h) => h.trim())
-        const data = lines.slice(1).map((line) => {
-          const values = line.split(",").map((v) => v.trim())
-          const row: any = {}
-          headers.forEach((header, index) => {
-            row[header] = values[index] || ""
-          })
-          return row
-        })
-
-        resolve(data.filter((row) => row["Company Name"])) // Filter out empty rows
       }
       reader.onerror = () => reject(new Error("Failed to read file"))
       reader.readAsText(file)
     })
   }
 
-  /** Same CSV as batch create: match each row by TAN (`Username`). Replaces current company selection. */
+  const parseUnconsumedExcelFiles = async (files: File[]) => {
+    const allRows: Array<{
+      tan: string
+      dateOfDeposit: string
+      challanAmount?: string | number
+      companyName?: string
+      sourceFile: string
+    }> = []
+
+    for (const file of files) {
+      const buffer = await file.arrayBuffer()
+      const workbook = XLSX.read(new Uint8Array(buffer), { type: "array" })
+      const sheetName = workbook.SheetNames[0]
+      if (!sheetName) continue
+      const json = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName]!) as Record<
+        string,
+        unknown
+      >[]
+      const parsed = parsePaymentUnconsumedRows(json, file.name)
+      for (const row of parsed) {
+        allRows.push({
+          tan: row.tan,
+          dateOfDeposit: row.dateOfDeposit,
+          challanAmount: row.challanAmount,
+          companyName: row.companyName,
+          sourceFile: row.sourceFile || file.name,
+        })
+      }
+    }
+
+    return allRows
+  }
+
+  const handleDownloadPdfsFromUploadedExcels = async () => {
+    const files = unconsumedExcelFileList
+      .map((f) => f.originFileObj as File | undefined)
+      .filter((f): f is File => !!f)
+
+    if (files.length === 0) {
+      messageApi.error("Please upload at least one Excel file")
+      return
+    }
+
+    setUnconsumedExcelDownloading(true)
+    setUnconsumedExcelSummary(null)
+    try {
+      const rows = await parseUnconsumedExcelFiles(files)
+      if (rows.length === 0) {
+        messageApi.error("No rows with TAN and Date of Deposit found in the uploaded Excel(s)")
+        return
+      }
+
+      const uniqueTans = new Set(rows.map((r) => r.tan))
+      messageApi.loading({
+        content: `Downloading payment PDFs for ${uniqueTans.size} TAN(s) / ${rows.length} row(s)...`,
+        key: "unconsumed-excel-pdfs",
+        duration: 0,
+      })
+
+      const response = await fetch("/api/challan/download-pdfs-from-uploaded-excels", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rows }),
+      })
+      const data = await response.json()
+      if (!response.ok || data.success === false) {
+        throw new Error(data.error || "Download failed")
+      }
+
+      const lines = (data.results || []).map((r: any) => {
+        if (r.success) {
+          return `✓ ${r.companyName || r.tan}: ${r.rowCount} row(s), ${r.fromDate} → ${r.toDate}`
+        }
+        return `✗ ${r.companyName || r.tan}: ${r.error}`
+      })
+      setUnconsumedExcelSummary(
+        `Success ${data.successCount}/${data.companies}\n` + lines.join("\n")
+      )
+      messageApi.success({
+        content: `Done — ${data.successCount} company(ies) succeeded, ${data.failedCount} failed`,
+        key: "unconsumed-excel-pdfs",
+      })
+    } catch (e: any) {
+      messageApi.error({
+        content: e.message || "Failed to download PDFs from Excel",
+        key: "unconsumed-excel-pdfs",
+      })
+    } finally {
+      setUnconsumedExcelDownloading(false)
+    }
+  }
+
+  /** Match each row by TAN (`Username` / `Tan` / `TAN` / `User ID`). Replaces current company selection. */
+  const resolveCsvTan = (row: Record<string, unknown>): string =>
+    String(row["Username"] ?? row["Tan"] ?? row["TAN"] ?? row["User ID"] ?? "").trim()
+
   const handleCompanySelectCsvUpload = async (file: File) => {
     if (!file.name.endsWith(".csv")) {
       messageApi.error("Please upload a CSV file")
@@ -636,7 +839,7 @@ const ChallanManagementPage: BlitzPage = () => {
 
       for (const row of csvData) {
         const companyName = String(row["Company Name"] ?? "").trim()
-        const tan = String(row["Username"] ?? "").trim()
+        const tan = resolveCsvTan(row)
         if (!companyName && !tan) continue
 
         const company = tan
@@ -656,7 +859,9 @@ const ChallanManagementPage: BlitzPage = () => {
       setSelectedCompanyIds(ids)
 
       if (ids.length === 0) {
-        messageApi.error("No companies matched. Check that Username (TAN) matches your saved companies.")
+        messageApi.error(
+          "No companies matched. Check that Tan / Username matches your saved companies."
+        )
       } else {
         messageApi.success(`Selected ${ids.length} compan${ids.length === 1 ? "y" : "ies"} from CSV`)
       }
@@ -703,6 +908,7 @@ const ChallanManagementPage: BlitzPage = () => {
         }
 
         const rowAct = parseIncomeTaxActCsv(row["Act"])
+        const newRegimeChallanMode = parseChallanModeCsv(row[challanModeCsvColumnName()])
         const sections: Array<{ sectionCode: string; amount: string; actType: IncomeTaxActKind }> =
           []
         const sectionHeaders = Object.keys(row).filter(
@@ -714,6 +920,7 @@ const ChallanManagementPage: BlitzPage = () => {
               "Password",
               "Assessment Year",
               "Act",
+              challanModeCsvColumnName(),
             ].includes(key) &&
             key.trim() !== "" &&
             row[key]
@@ -736,7 +943,7 @@ const ChallanManagementPage: BlitzPage = () => {
           continue
         }
 
-        if (rowAct === "new") {
+        if (rowAct === "new" && newRegimeChallanMode === "combined") {
           const duplicateCode = findDuplicateSectionCode(sections)
           if (duplicateCode) {
             messageApi.warning(
@@ -751,6 +958,7 @@ const ChallanManagementPage: BlitzPage = () => {
           companyName: company.name,
           assessmentYear: row["Assessment Year"],
           sections,
+          ...(rowAct === "new" ? { newRegimeChallanMode } : {}),
         })
       }
 
@@ -866,11 +1074,7 @@ const ChallanManagementPage: BlitzPage = () => {
       <Modal
         title={
           lastEpayDownloadRun
-            ? `e-Pay results — ${
-                lastEpayDownloadRun.flow === "payment"
-                  ? "Payment History"
-                  : "Generated Challans"
-              }`
+            ? `e-Pay results — ${epayFlowLabel(lastEpayDownloadRun.flow)}`
             : "e-Pay results"
         }
         open={epayResultsModalOpen}
@@ -885,12 +1089,10 @@ const ChallanManagementPage: BlitzPage = () => {
             key="retry"
             type="primary"
             onClick={handleEpayRetrySelected}
-            disabled={
-              epayRetryRowKeys.length === 0 ||
-              downloadPaymentLoading ||
-              downloadGeneratedChallansLoading
+            disabled={epayRetryRowKeys.length === 0 || epayDownloadBusy}
+            loading={
+              downloadPaymentLoading || downloadGeneratedChallansLoading || downloadCsiLoading
             }
-            loading={downloadPaymentLoading || downloadGeneratedChallansLoading}
           >
             Retry selected
           </Button>,
@@ -1094,7 +1296,7 @@ const ChallanManagementPage: BlitzPage = () => {
           <Space direction="vertical" size="middle" style={{ width: "100%" }}>
             <Alert
               message="Upload CSV File"
-              description="Upload a CSV file with company data to create challans for multiple companies concurrently (subject to the Concurrent creates setting above; creation is API-only and does not download PDFs). After the batch, use the 'Download Payment History' (or 'Download Generated Challans') section below — which supports its own concurrency — to fetch the receipt PDFs."
+              description={`Upload a CSV file with company data to create challans for multiple companies concurrently (subject to the Concurrent creates setting above; creation is API-only and does not download PDFs). For new-regime rows, an optional "${challanModeCsvColumnName()}" column controls whether section amounts on that row are merged into one challan (combined, default) or created as separate challans (separate). After the batch, use the 'Download Payment History' (or 'Download Generated Challans') section below — which supports its own concurrency — to fetch the receipt PDFs.`}
               type="info"
               showIcon
             />
@@ -1135,7 +1337,7 @@ const ChallanManagementPage: BlitzPage = () => {
           <Space direction="vertical" size="middle" style={{ width: "100%" }}>
             <Alert
               message="Select manually or load from CSV"
-              description="Use the same CSV template as batch create (Company Name and Username/TAN columns required per row). Other columns are ignored. Upload replaces the current selection."
+              description="Company Name plus Tan / TAN / Username / User ID required per row. Other columns are ignored. Upload replaces the current selection."
               type="info"
               showIcon
             />
@@ -1344,11 +1546,57 @@ const ChallanManagementPage: BlitzPage = () => {
         >
           <Space direction="vertical" size="middle" style={{ width: "100%" }}>
             <Alert
-              message="Payment History & Generated Challans"
-              description="Use the same optional filters below, then download either the Payment History tab or the Generated Challans tab from TRACES e-Pay."
+              message="Payment History, Generated Challans & CSI File"
+              description={`Download manually for selected companies (optional filters above), or upload the same challan CSV used for creation to download only rows matching each line's assessment year and section amount(s). Combined new-regime rows match the summed amount; separate rows match each section amount. If the portal has multiple matching challans, only the most recent one is downloaded. CSI File download uses the Challan Status Inquiry (CSI) File tab with the Payment Date Range (required) and saves under each company's CSI folder.`}
               type="info"
               showIcon
             />
+
+            <Alert
+              message="CSV-based download"
+              description="Upload your challan CSV (same template as batch create). Each row's Username/TAN, Assessment Year, Act, section amounts, and optional Challan Mode column determine which PDFs are fetched."
+              type="info"
+              showIcon
+            />
+
+            <Upload
+              accept=".csv"
+              fileList={epayCsvFileList}
+              beforeUpload={() => false}
+              onChange={({ fileList }) => setEpayCsvFileList(fileList)}
+              maxCount={1}
+              disabled={epayDownloadBusy}
+              onRemove={() => setEpayCsvFileList([])}
+            >
+              <Button icon={<UploadOutlined />} disabled={epayDownloadBusy}>
+                Select CSV for download
+              </Button>
+            </Upload>
+
+            <Space wrap>
+              <Button
+                icon={<CloudDownloadOutlined />}
+                loading={epayCsvProcessing && epayCsvFlow === "payment"}
+                disabled={
+                  epayCsvFileList.length === 0 ||
+                  epayDownloadBusy ||
+                  downloadGeneratedChallansLoading
+                }
+                onClick={() => handleEpayCsvDownload("payment")}
+              >
+                Download Payment History from CSV
+              </Button>
+              <Button
+                icon={<CloudDownloadOutlined />}
+                loading={epayCsvProcessing && epayCsvFlow === "generated"}
+                disabled={
+                  epayCsvFileList.length === 0 || epayDownloadBusy || downloadPaymentLoading
+                }
+                onClick={() => handleEpayCsvDownload("generated")}
+              >
+                Download Generated Challans from CSV
+              </Button>
+            </Space>
 
             <Row gutter={[16, 16]}>
               <Col span={12}>
@@ -1430,6 +1678,9 @@ const ChallanManagementPage: BlitzPage = () => {
               <div>
                 <strong>Payment Date Range:</strong>
               </div>
+              <Text type="secondary" style={{ fontSize: 12, display: "block" }}>
+                Optional for Payment History / Generated Challans. Required for CSI File download.
+              </Text>
               <DatePicker.RangePicker
                 format="DD-MMM-YYYY"
                 onChange={(dates) => {
@@ -1458,7 +1709,11 @@ const ChallanManagementPage: BlitzPage = () => {
                 icon={<CloudDownloadOutlined />}
                 onClick={handleDownloadPayments}
                 loading={downloadPaymentLoading}
-                disabled={selectedCompanyIds.length === 0 || downloadGeneratedChallansLoading}
+                disabled={
+                  selectedCompanyIds.length === 0 ||
+                  downloadGeneratedChallansLoading ||
+                  downloadCsiLoading
+                }
               >
                 Download Payment History
               </Button>
@@ -1466,11 +1721,84 @@ const ChallanManagementPage: BlitzPage = () => {
                 icon={<CloudDownloadOutlined />}
                 onClick={handleDownloadGeneratedChallans}
                 loading={downloadGeneratedChallansLoading}
-                disabled={selectedCompanyIds.length === 0 || downloadPaymentLoading}
+                disabled={
+                  selectedCompanyIds.length === 0 || downloadPaymentLoading || downloadCsiLoading
+                }
               >
                 Download Generated Challans
               </Button>
+              <Button
+                icon={<CloudDownloadOutlined />}
+                onClick={handleDownloadCsiFiles}
+                loading={downloadCsiLoading}
+                disabled={
+                  selectedCompanyIds.length === 0 ||
+                  downloadPaymentLoading ||
+                  downloadGeneratedChallansLoading ||
+                  !paymentDateRange
+                }
+              >
+                Download CSI File
+              </Button>
             </Space>
+          </Space>
+        </Card>
+
+        {/* Upload unconsumed / challan Excels → download payment PDFs by deposit date */}
+        <Card
+          title={
+            <Space>
+              <FileExcelOutlined />
+              <span>Download Payment PDFs from Excel</span>
+            </Space>
+          }
+        >
+          <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+            <Alert
+              type="info"
+              showIcon
+              message="Upload one or more Excel files"
+              description="Required columns: TAN (or Tan / Username) and Date of Deposit. Optional: Company Name, Challan Amount. Company is resolved by TAN from saved companies. Portal date filter uses one day before the earliest deposit date (From) and one day after the latest (To). Act: deposit on/before 30-Apr-2026 → Old Act; after 30-Apr-2026 → New Act."
+            />
+
+            <Upload
+              accept=".xlsx,.xls"
+              multiple
+              fileList={unconsumedExcelFileList}
+              beforeUpload={() => false}
+              onChange={({ fileList }) => setUnconsumedExcelFileList(fileList)}
+              onRemove={(file) => {
+                setUnconsumedExcelFileList((prev) => prev.filter((f) => f.uid !== file.uid))
+              }}
+              disabled={unconsumedExcelDownloading}
+            >
+              <Button icon={<UploadOutlined />} disabled={unconsumedExcelDownloading}>
+                Select Excel file(s)
+              </Button>
+            </Upload>
+
+            <Button
+              type="primary"
+              icon={<CloudDownloadOutlined />}
+              loading={unconsumedExcelDownloading}
+              disabled={unconsumedExcelFileList.length === 0}
+              onClick={handleDownloadPdfsFromUploadedExcels}
+            >
+              Download Payment History PDFs
+            </Button>
+
+            {unconsumedExcelSummary && (
+              <Alert
+                type="success"
+                showIcon
+                message="Download summary"
+                description={
+                  <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: 12 }}>
+                    {unconsumedExcelSummary}
+                  </pre>
+                }
+              />
+            )}
           </Space>
         </Card>
 

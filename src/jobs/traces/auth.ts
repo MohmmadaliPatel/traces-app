@@ -13,6 +13,118 @@ function log(fn: string, message: string, detail?: string) {
   console.log(`[TRACES] ${FILE} · ${fn} — ${message}${extra}`)
 }
 
+export const TRACES_MAX_LOGIN_ATTEMPTS = 5
+
+/** Tag an error with the HTTP status that produced it, for {@link isTransientTracesFailure}. */
+function withHttpStatus(err: Error, status: number): Error {
+  ;(err as Error & { status?: number }).status = status
+  return err
+}
+const CAPTCHA_RETRY_ERROR_CODES = new Set(["CPT403", "CPT401", "CPT400"])
+
+export function isRetryableTracesLoginFailure(loginRes: {
+  errorCode?: string
+  message?: string
+}): boolean {
+  const code = (loginRes.errorCode ?? "").toUpperCase()
+  if (CAPTCHA_RETRY_ERROR_CODES.has(code)) return true
+  const msg = (loginRes.message ?? "").toLowerCase()
+  return (
+    msg.includes("captcha") ||
+    msg.includes("verification code") ||
+    msg.includes("image data")
+  )
+}
+
+/** HTTP statuses below 500 that still mean "try again" rather than "credentials rejected". */
+const TRANSIENT_HTTP_STATUSES = new Set([408, 425, 429])
+
+/** Socket / DNS level failures that are worth another attempt. */
+const TRANSIENT_ERROR_CODES = new Set([
+  "ECONNRESET",
+  "ECONNABORTED",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "EAI_AGAIN",
+  "ENETUNREACH",
+  "ENETRESET",
+  "EHOSTUNREACH",
+  "EPIPE",
+  "ERR_NETWORK",
+  "ERR_BAD_RESPONSE",
+])
+
+/**
+ * True when a thrown captcha / login error is a transport or gateway hiccup rather than a
+ * rejection of the request itself. TRACES routinely answers with 504 / 502 under load, and
+ * those must not kill the job: the caller retries them with a fresh captcha.
+ */
+export function isTransientTracesFailure(err: unknown): boolean {
+  if (err == null) return false
+
+  const anyErr = err as {
+    code?: string
+    status?: number
+    response?: { status?: number }
+    message?: string
+  }
+
+  const status = anyErr.status ?? anyErr.response?.status
+  if (typeof status === "number" && (status >= 500 || TRANSIENT_HTTP_STATUSES.has(status))) {
+    return true
+  }
+
+  if (TRANSIENT_ERROR_CODES.has((anyErr.code ?? "").toUpperCase())) {
+    return true
+  }
+
+  // Status is not always attached (e.g. an HTML gateway page wrapped in a plain Error).
+  const msg = String(anyErr.message ?? err).toLowerCase()
+  return (
+    /\bhttp (?:408|425|429|5\d\d)\b/.test(msg) ||
+    /gateway time-?out/.test(msg) ||
+    msg.includes("bad gateway") ||
+    msg.includes("service unavailable") ||
+    msg.includes("socket hang up") ||
+    msg.includes("network error") ||
+    /timeout of \d+ms exceeded/.test(msg)
+  )
+}
+
+/** Backoff before the next TRACES attempt: ~2s, 4s, 8s, 16s, capped at 20s, plus jitter. */
+export function tracesRetryDelayMs(attempt: number): number {
+  const base = Math.min(2000 * 2 ** Math.max(0, attempt - 1), 20000)
+  return base + Math.floor(Math.random() * 500)
+}
+
+/** Pull CPT403 / captcha-mismatch details out of a thrown Axios or wrapped login error. */
+export function tracesLoginFailureFromUnknown(err: unknown): {
+  errorCode?: string
+  message?: string
+} | null {
+  if (err == null) return null
+  const anyErr = err as {
+    message?: string
+    response?: { data?: { errorCode?: string; message?: string } }
+  }
+  const data = anyErr.response?.data
+  if (data && typeof data === "object") {
+    const failure = {
+      errorCode: typeof data.errorCode === "string" ? data.errorCode : undefined,
+      message: typeof data.message === "string" ? data.message : undefined,
+    }
+    if (isRetryableTracesLoginFailure(failure)) return failure
+  }
+  const msg = String(anyErr.message ?? err)
+  if (isRetryableTracesLoginFailure({ message: msg }) || /CPT40[013]/i.test(msg)) {
+    return {
+      errorCode: data && typeof data.errorCode === "string" ? data.errorCode : "CPT403",
+      message: data && typeof data.message === "string" ? data.message : msg,
+    }
+  }
+  return null
+}
+
 function normalizeCaptchaResponse(data: unknown): GenerateCaptchaResponse {
   const d = data as Record<string, unknown>
   if (!d || typeof d !== "object") {
@@ -115,7 +227,10 @@ export async function generateCaptcha(
       : await http.get(path)
 
   if (res.status >= 400) {
-    throw new Error(`generateCaptcha failed HTTP ${res.status}: ${JSON.stringify(res.data)}`)
+    throw withHttpStatus(
+      new Error(`generateCaptcha failed HTTP ${res.status}: ${JSON.stringify(res.data)}`),
+      res.status
+    )
   }
   const cookieLines = extractSetCookieLinesFromAxiosResponse(res)
   if (collectSetCookieLines && cookieLines.length > 0) {
@@ -157,12 +272,39 @@ export async function loginTraces(
     captchaId: body.captchaId,
   }
 
-  const res = fullUrl
-    ? await axios.post(fullUrl, payload, { timeout: 120000 })
-    : await http.post(path, payload)
+  const requestConfig = { timeout: 120000, validateStatus: () => true }
+  let res
+  try {
+    res = fullUrl
+      ? await axios.post(fullUrl, payload, requestConfig)
+      : await http.post(path, payload, { validateStatus: () => true })
+  } catch (err) {
+    const failure = tracesLoginFailureFromUnknown(err)
+    if (failure) {
+      log(
+        "loginTraces",
+        "login rejected (retryable captcha, thrown)",
+        `errorCode=${failure.errorCode ?? "unknown"} message=${failure.message ?? "no message"}`
+      )
+      return failure
+    }
+    throw err
+  }
 
   if (res.status >= 400) {
-    throw new Error(`loginTraces failed HTTP ${res.status}: ${JSON.stringify(res.data)}`)
+    const rejected = normalizeLoginResponse(res.data)
+    if (isRetryableTracesLoginFailure(rejected)) {
+      log(
+        "loginTraces",
+        "login rejected (retryable captcha)",
+        `HTTP ${res.status} errorCode=${rejected.errorCode ?? "unknown"} message=${rejected.message ?? "no message"}`
+      )
+      return rejected
+    }
+    throw withHttpStatus(
+      new Error(`loginTraces failed HTTP ${res.status}: ${JSON.stringify(res.data)}`),
+      res.status
+    )
   }
   const cookieLines = extractSetCookieLinesFromAxiosResponse(res)
   if (collectSetCookieLines && cookieLines.length > 0) {

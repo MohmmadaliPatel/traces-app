@@ -1,4 +1,4 @@
-import { withApiAuth } from "src/utils/apiAuth"
+import { withApiAuth } from "src/shared/http"
 import { NextApiRequest, NextApiResponse } from "next"
 import db from "db"
 import { downloadGeneratedChallansWithFilters } from "src/scripts/downloadChallanPayment"
@@ -9,7 +9,8 @@ export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ct
   }
 
   try {
-    const { companyId, fromDate, toDate, assessmentYear, paymentType, incomeTaxAct } = req.body
+    const { companyId, fromDate, toDate, assessmentYear, paymentType, incomeTaxAct, rowDownloadTargets } =
+      req.body
 
     if (!companyId) {
       return res.status(400).json({ error: "Missing company ID" })
@@ -33,7 +34,10 @@ export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ct
       toDate,
       assessmentYear,
       paymentType,
-      { skipNewActRadio }
+      {
+        skipNewActRadio,
+        rowDownloadTargets: Array.isArray(rowDownloadTargets) ? rowDownloadTargets : undefined,
+      }
     )
 
     return res.status(200).json({ success: true, result })

@@ -17,13 +17,13 @@ import type { ColumnsType } from "antd/es/table"
 import {
   DollarOutlined,
   SyncOutlined,
-  DownloadOutlined,
   CloudDownloadOutlined,
 } from "@ant-design/icons"
 import { useQuery, invoke } from "@blitzjs/rpc"
 import Layout from "src/core/layouts/Layout"
 import getCompanies from "src/companies/queries/getCompanies"
 import getOutstandingDemand from "src/outstanding-demand/queries/getOutstandingDemand"
+import { ExportButtons } from "src/shared/ui"
 import { ConfigProvider } from "antd"
 import enGB from "antd/lib/locale/en_GB"
 
@@ -164,71 +164,6 @@ function OutstandingDemandPage() {
         `Completed! Success: ${successCount}, Errors: ${errorCount}`
       )
     }
-  }
-
-  const handleDownloadCSV = () => {
-    if (companySummaries.length === 0) {
-      messageApi.warning("No data to download")
-      return
-    }
-
-    const headers = [
-      "Company Name",
-      "TAN",
-      "Financial Year",
-      "Assessment Order Demand",
-      "CPC Demand",
-      "Total Demand",
-    ]
-
-    const rows: string[][] = []
-    companySummaries.forEach((summary) => {
-      summary.demands.forEach((demand) => {
-        rows.push([
-          summary.companyName,
-          summary.tan,
-          demand.finYr,
-          demand.aodmnd,
-          demand.cpcdmd,
-          (parseFloat(demand.aodmnd) + parseFloat(demand.cpcdmd)).toFixed(2),
-        ])
-      })
-    })
-
-    const escapeCSV = (value: string): string => {
-      if (value === null || value === undefined) return ""
-      const stringValue = String(value)
-      if (
-        stringValue.includes(",") ||
-        stringValue.includes('"') ||
-        stringValue.includes("\n")
-      ) {
-        return `"${stringValue.replace(/"/g, '""')}"`
-      }
-      return stringValue
-    }
-
-    const csvContent = [
-      headers.map(escapeCSV).join(","),
-      ...rows.map((row) => row.map(escapeCSV).join(",")),
-    ].join("\n")
-
-    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" })
-    const link = document.createElement("a")
-    const url = URL.createObjectURL(blob)
-
-    link.setAttribute("href", url)
-    link.setAttribute(
-      "download",
-      `outstanding-demand-${new Date().toISOString().split("T")[0]}.csv`
-    )
-    link.style.visibility = "hidden"
-    document.body.appendChild(link)
-    link.click()
-    document.body.removeChild(link)
-
-    URL.revokeObjectURL(url)
-    messageApi.success("CSV downloaded successfully")
   }
 
   // Expandable row columns
@@ -513,9 +448,10 @@ function OutstandingDemandPage() {
             }
             extra={
               <Space>
-                <Button icon={<DownloadOutlined />} onClick={handleDownloadCSV}>
-                  Download CSV
-                </Button>
+                <ExportButtons
+                  feature="outstanding-demand"
+                  disabled={companySummaries.length === 0}
+                />
                 <Button onClick={() => refetch()} icon={<SyncOutlined />}>
                   Refresh
                 </Button>

@@ -7,6 +7,38 @@ const axiosRetry = require("axios-retry").default
 const LOGIN_PAGE_URL = "https://eportal.incometax.gov.in/iec/foservices/#/login"
 const LOGIN_API_URL = "https://eportal.incometax.gov.in/iec/loginapi/login"
 const SAVE_ENTITY_URL = "https://eportal.incometax.gov.in/iec/servicesapi/auth/saveEntity"
+export const INCOME_TAX_ORIGIN = "https://eportal.incometax.gov.in"
+export const INCOME_TAX_REFERER = "https://eportal.incometax.gov.in/iec/foservices/"
+
+/** Portal WAF requires `sn` to match serviceName (see access-control-allow-headers). */
+export function viewFiledFormsRequestHeaders() {
+  return {
+    Accept: "application/json, text/plain, */*",
+    "Content-Type": "application/json",
+    Origin: INCOME_TAX_ORIGIN,
+    Referer: INCOME_TAX_REFERER,
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+    sn: "viewFiledForms",
+  }
+}
+
+export function buildViewFiledFormsPayload(
+  entityNum: string,
+  formTypeCd: string,
+  currentPage = 0,
+  pageSize = 5
+) {
+  return {
+    serviceName: "viewFiledForms",
+    entityNum,
+    formTypeCd,
+    currentPage: String(currentPage),
+    pageSize: String(pageSize),
+    filterParameterDetails: [] as unknown[],
+  }
+}
 
 function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -27,7 +59,8 @@ export function createIncomeTaxAxiosClient(): AxiosInstance {
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin",
         "sec-gpc": "1",
-        Referer: "https://eportal.incometax.gov.in/iec/foservices/",
+        Origin: INCOME_TAX_ORIGIN,
+        Referer: INCOME_TAX_REFERER,
         "Referrer-Policy": "strict-origin-when-cross-origin",
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.82 Safari/537.36",
@@ -35,6 +68,21 @@ export function createIncomeTaxAxiosClient(): AxiosInstance {
     } as any) as any
   ) as AxiosInstance
   axiosRetry(client, { retries: 3 })
+  client.interceptors.request.use((config) => {
+    const url = String(config.url || "")
+    if (url.includes("/servicesapi/auth/saveEntity")) {
+      const body = config.data
+      const serviceName =
+        body && typeof body === "object" && !Buffer.isBuffer(body)
+          ? (body as { serviceName?: unknown }).serviceName
+          : undefined
+      if (typeof serviceName === "string" && serviceName && !config.headers?.sn) {
+        config.headers = config.headers || {}
+        config.headers.sn = serviceName
+      }
+    }
+    return config
+  })
   return client
 }
 
@@ -175,7 +223,9 @@ export async function saveIncomeTaxUserProfile(client: AxiosInstance, tan: strin
 /** Request body for paymentapi/challan/paymenthistory (e-Pay session context). */
 export function buildPaymentHistoryRequestBody(
   tan: string,
-  actType: "O" | "N" = "O"
+  actType: "O" | "N" = "O",
+  pageNumber = 0,
+  pageSize = 50
 ): {
   header: { formName: string }
   formData: {
@@ -183,6 +233,8 @@ export function buildPaymentHistoryRequestBody(
     pan: string
     loggedInUserID: string
     loggedInUserType: string
+    pageNumber: number
+    pageSize: number
   }
 } {
   const pan = tan.toUpperCase()
@@ -193,6 +245,8 @@ export function buildPaymentHistoryRequestBody(
       pan,
       loggedInUserID: pan,
       loggedInUserType: "TDS",
+      pageNumber,
+      pageSize,
     },
   }
 }

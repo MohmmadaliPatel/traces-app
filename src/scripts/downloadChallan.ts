@@ -78,6 +78,11 @@ async function navigateToEpayTaxViaMenu(page: Page) {
   await waitForSecs(3000)
 }
 
+export type EpayRowDownloadTarget = {
+  assessmentYear: string
+  amount: number
+}
+
 export type DownloadChallansOptions = {
   /**
    * Old Income-tax Act (actType O): portal goes straight to Continue — do not select
@@ -85,6 +90,11 @@ export type DownloadChallansOptions = {
    * Omit or false when any created challan used the 2025 regime.
    */
   skipNewActRadio?: boolean
+  /**
+   * When set, only download e-Pay grid rows whose assessment year and amount match each target.
+   * If multiple portal rows match one target, only the most recently created row is downloaded.
+   */
+  rowDownloadTargets?: EpayRowDownloadTarget[]
 }
 
 export async function clickContinueAfterEpayLanding(page: Page) {

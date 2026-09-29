@@ -91,6 +91,8 @@ model Company {
   emails      String?  @default("")
   groupId     Int?
   isTemporary Boolean  @default(false)
+  // Windows cert store subject / friendly name used to auto-attach DSC on Form 16A PDFs
+  dscCertificateName String?
 
   History           History[]
   TldcData          TldcData[]

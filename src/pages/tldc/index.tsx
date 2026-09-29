@@ -25,13 +25,12 @@ import {
   CheckCircleOutlined,
   CloseCircleOutlined,
   SyncOutlined,
-  DownloadOutlined,
   PlusOutlined,
   EditOutlined,
   DeleteOutlined,
   CloudDownloadOutlined,
 } from "@ant-design/icons"
-import { useMutation, useQuery, invoke } from "@blitzjs/rpc"
+import { useMutation, useQuery } from "@blitzjs/rpc"
 import Layout from "src/core/layouts/Layout"
 import getCompanies from "src/companies/queries/getCompanies"
 import getTldcData from "src/tldc/queries/getTldcData"
@@ -39,6 +38,7 @@ import upsertTldcData from "src/tldc/mutations/upsertTldcData"
 import createQuickTldcData from "src/tldc/mutations/createQuickTldcData"
 import deleteTldcData from "src/tldc/mutations/deleteTldcData"
 import { TldcService } from "src/tldc/services/tldcService"
+import { ExportButtons } from "src/shared/ui"
 import dayjs from "dayjs"
 import "dayjs/locale/en-gb"
 import { ConfigProvider } from "antd"
@@ -81,6 +81,9 @@ function TldcPage() {
   // Company selection states
   const [selectedCompanyIds, setSelectedCompanyIds] = useState<number[]>([])
   const [selectedFy, setSelectedFy] = useState<string>("")
+  const [actType, setActType] = useState<"old" | "new">("old")
+  const [initiateIfNoRequest, setInitiateIfNoRequest] = useState(true)
+  const [forceInitiate, setForceInitiate] = useState(false)
   const [loading, setLoading] = useState(false)
 
   // Table and modal states
@@ -150,7 +153,13 @@ function TldcPage() {
     return years
   }
 
-  const handleFetchTldcData = async () => {
+  const COMPANY_FETCH_RETRIES = 3
+
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  const runForCompanies = async (
+    action: "fetch" | "update"
+  ) => {
     if (selectedCompanyIds.length === 0) {
       messageApi.error("Please select at least one company")
       return
@@ -161,63 +170,134 @@ function TldcPage() {
       return
     }
 
-    setLoading(true)
-    try {
-      const result = await TldcService.fetchTldcData({
-        companyId: selectedCompanyIds[0] || 0,
-        companyName: savedCompanies.find((company) => company.id === selectedCompanyIds[0])?.name || "",
-        tan: savedCompanies.find((company) => company.id === selectedCompanyIds[0])?.tan || "",
-        fy: selectedFy,
-        userId: savedCompanies.find((company) => company.id === selectedCompanyIds[0])?.user_id || "",
-        password: savedCompanies.find((company) => company.id === selectedCompanyIds[0])?.password || "",
-      })
+    const companies = selectedCompanyIds
+      .map((id) => savedCompanies.find((c) => c.id === id))
+      .filter((c): c is NonNullable<typeof c> => !!c)
 
-      if (result.success) {
-        messageApi.success(result.message || "TLDC data fetched successfully")
-        await refetch()
-      } else {
-        messageApi.error(result.message || "Failed to fetch TLDC data")
+    if (companies.length === 0) {
+      messageApi.error("No matching companies found")
+      return
+    }
+
+    setLoading(true)
+    let successCount = 0
+    let failCount = 0
+    const failures: string[] = []
+
+    try {
+      for (let i = 0; i < companies.length; i++) {
+        const company = companies[i]!
+        messageApi.loading({
+          content: `${action === "fetch" ? "Fetching" : "Updating"} ${i + 1}/${
+            companies.length
+          }: ${company.name}...`,
+          key: "tldc-batch",
+          duration: 0,
+        })
+
+        let lastError = ""
+        let ok = false
+
+        for (let attempt = 1; attempt <= COMPANY_FETCH_RETRIES; attempt++) {
+          try {
+            const result =
+              action === "fetch"
+                ? actType === "new"
+                  ? await TldcService.fetchTldcDataNewAct({
+                      companyId: company.id,
+                      companyName: company.name,
+                      tan: company.tan,
+                      fy: selectedFy,
+                      userId: company.user_id,
+                      password: company.password,
+                      initiateIfNoRequest,
+                      forceInitiate,
+                    })
+                  : await TldcService.fetchTldcData({
+                      companyId: company.id,
+                      companyName: company.name,
+                      tan: company.tan,
+                      fy: selectedFy,
+                      userId: company.user_id,
+                      password: company.password,
+                    })
+                : actType === "new"
+                  ? await TldcService.updateTldcDataNewAct({
+                      companyId: company.id,
+                      companyName: company.name,
+                      tan: company.tan,
+                      fy: selectedFy,
+                      userId: company.user_id,
+                      password: company.password,
+                    })
+                  : await TldcService.updateTldcData({
+                      companyId: company.id,
+                      companyName: company.name,
+                      tan: company.tan,
+                      fy: selectedFy,
+                      userId: company.user_id,
+                      password: company.password,
+                    })
+
+            if (result.success) {
+              ok = true
+              break
+            }
+            lastError = result.message || "Failed"
+            if (attempt < COMPANY_FETCH_RETRIES) {
+              messageApi.warning({
+                content: `${company.name} failed (attempt ${attempt}/${COMPANY_FETCH_RETRIES}), retrying...`,
+                key: "tldc-batch-retry",
+                duration: 2,
+              })
+              await sleep(1500 * attempt)
+            }
+          } catch (error: any) {
+            lastError = error?.message || "Failed"
+            if (attempt < COMPANY_FETCH_RETRIES) {
+              await sleep(1500 * attempt)
+            }
+          }
+        }
+
+        if (ok) {
+          successCount++
+        } else {
+          failCount++
+          failures.push(`${company.name}: ${lastError}`)
+        }
       }
-    } catch (error: any) {
-      messageApi.error(error.message || "Failed to fetch TLDC data")
+
+      messageApi.destroy("tldc-batch")
+      await refetch()
+
+      if (failCount === 0) {
+        messageApi.success(
+          `${action === "fetch" ? "Fetched" : "Updated"} TLDC for all ${successCount} compan(y/ies)`
+        )
+      } else {
+        messageApi.warning(
+          `Done: ${successCount} ok, ${failCount} failed of ${companies.length}`
+        )
+        for (const f of failures.slice(0, 5)) {
+          messageApi.error(f)
+        }
+        if (failures.length > 5) {
+          messageApi.warning(`${failures.length - 5} more failures — check server logs`)
+        }
+      }
     } finally {
+      messageApi.destroy("tldc-batch")
       setLoading(false)
     }
   }
 
+  const handleFetchTldcData = async () => {
+    await runForCompanies("fetch")
+  }
+
   const handleUpdateTldcData = async () => {
-    if (selectedCompanyIds.length === 0) {
-      messageApi.error("Please select at least one company")
-      return
-    }
-
-    if (!selectedFy) {
-      messageApi.error("Please select a financial year")
-      return
-    }
-
-    setLoading(true)
-    try {
-      const result = await TldcService.updateTldcData({
-        companyId: selectedCompanyIds[0] || 0,
-        companyName: savedCompanies.find((company) => company.id === selectedCompanyIds[0])?.name || "",
-        tan: savedCompanies.find((company) => company.id === selectedCompanyIds[0])?.tan || "",
-        fy: selectedFy,
-        userId: savedCompanies.find((company) => company.id === selectedCompanyIds[0])?.user_id || "",
-        password: savedCompanies.find((company) => company.id === selectedCompanyIds[0])?.password || "",
-      })
-
-      if (result.success) {
-        messageApi.success(result.message || "TLDC data updated successfully")
-        await refetch()
-      } else {
-        messageApi.error(result.message || "Failed to update TLDC data")
-      }
-    } catch (error: any) {
-      messageApi.error(error.message || "Failed to update TLDC data")
-    } finally {
-      setLoading(false)
-    }
+    await runForCompanies("update")
   }
 
   const handleAddTldcData = (quickMode = false) => {
@@ -313,30 +393,45 @@ function TldcPage() {
 
       messageApi.loading({ content: "Updating from portal...", key: "updating", duration: 0 })
 
-      const result = await fetch("/api/tldc/update-data", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          tan: company.tan,
-          year: record.fy,
-          credentials: {
+      // FY 2026-27+ → New Act child-certificate API; earlier → Old Act Puppeteer
+      const fyStart = parseInt(String(record.fy).split("-")[0] || "0", 10)
+      const useNewAct = fyStart >= 2026
+
+      const result = useNewAct
+        ? await TldcService.updateTldcDataNewAct({
+            companyId: company.id,
+            companyName: company.name,
+            tan: company.tan,
+            fy: record.fy,
             userId: company.user_id,
             password: company.password,
-            tan: company.tan,
-          },
-          companyId: company.id,
-          recordId: record.id,
-        }),
-      })
+            recordId: record.id,
+          })
+        : await (
+            await fetch("/api/tldc/update-data", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                tan: company.tan,
+                year: record.fy,
+                credentials: {
+                  userId: company.user_id,
+                  password: company.password,
+                  tan: company.tan,
+                },
+                companyId: company.id,
+                recordId: record.id,
+              }),
+            })
+          ).json()
 
-      const data = await result.json()
       messageApi.destroy("updating")
 
-      if (data.success) {
+      if (result.success) {
         messageApi.success("TLDC data updated from portal successfully")
         await refetch()
       } else {
-        messageApi.error(data.message || "Failed to update from portal")
+        messageApi.error(result.message || "Failed to update from portal")
       }
     } catch (error: any) {
       messageApi.destroy("updating")
@@ -345,110 +440,6 @@ function TldcPage() {
     } finally {
       setUpdatingRecordId(null)
     }
-  }
-
-  // Download CSV file
-  const handleDownloadCSV = async () => {
-    try {
-      // Fetch all data matching current filters (without pagination)
-      const allDataResult = await invoke(getTldcData, {
-        where: buildWhereClause(),
-        orderBy: { updatedAt: "desc" },
-        skip: 0,
-        take: 100000,
-      })
-
-      const allData: any = allDataResult.tldcData || []
-
-      if (allData.length === 0) {
-        messageApi.warning("No data to download")
-        return
-      }
-
-      // Convert to CSV
-      const csvContent = convertToCSV(allData)
-
-      // Create blob and download
-      const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" })
-      const link = document.createElement("a")
-      const url = URL.createObjectURL(blob)
-
-      link.setAttribute("href", url)
-      link.setAttribute("download", `tldc-data-${new Date().toISOString().split("T")[0]}.csv`)
-      link.style.visibility = "hidden"
-      document.body.appendChild(link)
-      link.click()
-      document.body.removeChild(link)
-
-      URL.revokeObjectURL(url)
-      messageApi.success("CSV downloaded successfully")
-    } catch (error) {
-      console.error("Error downloading CSV:", error)
-      messageApi.error("Failed to download CSV")
-    }
-  }
-
-  // Convert data to CSV format
-  const convertToCSV = (data: any[]): string => {
-    if (!data || data.length === 0) {
-      return ""
-    }
-
-    const headers = [
-      "ID",
-      "Company",
-      "Certificate Number",
-      "DIN",
-      "Financial Year",
-      "PAN",
-      "PAN Name",
-      "Section",
-      "Nature of Payment",
-      "TDS Rate",
-      "TDS Amount Limit",
-      "TDS Amount Consumed",
-      "Valid From",
-      "Valid To",
-      "Cancel Date",
-      "Status",
-    ]
-
-    const rows = data.map((item) => {
-      return [
-        item.id?.toString() || "",
-        item.company?.name || "",
-        item.certNumber || "",
-        item.din || "",
-        item.fy || "",
-        item.pan || "",
-        item.panName || "",
-        item.section || "",
-        item.NatureOfPayment || "",
-        item.tdsRate || "",
-        item.tdsAmountLimit || "",
-        item.tdsAmountConsumed || "",
-        item.validFrom ? new Date(item.validFrom).toLocaleDateString() : "",
-        item.validTo ? new Date(item.validTo).toLocaleDateString() : "",
-        item.cancelDate ? new Date(item.cancelDate).toLocaleDateString() : "",
-        item.isActive ? "Active" : "Inactive",
-      ]
-    })
-
-    const escapeCSV = (value: string): string => {
-      if (value === null || value === undefined) return ""
-      const stringValue = String(value)
-      if (stringValue.includes(",") || stringValue.includes('"') || stringValue.includes("\n")) {
-        return `"${stringValue.replace(/"/g, '""')}"`
-      }
-      return stringValue
-    }
-
-    const csvContent = [
-      headers.map(escapeCSV).join(","),
-      ...rows.map((row) => row.map(escapeCSV).join(",")),
-    ].join("\n")
-
-    return csvContent
   }
 
   const columns: ColumnsType<TldcDataType> = [
@@ -598,11 +589,30 @@ function TldcPage() {
                 <>
                   <Alert
                     message="Select Companies & Financial Year"
-                    description="Choose companies and financial year to fetch or update TLDC data from TRACES portal."
+                    description={
+                      actType === "new"
+                        ? "New Act: searchDeductor → download all ready PDFs → initiate only if no request exists (default) or force-initiate all → download again → child-certificate details + panName from PDF."
+                        : "Old Act: fetch certificates from TRACES inbox (Puppeteer) and enrich via Section 197 verification."
+                    }
                     type="info"
                     showIcon
                     style={{ marginBottom: 20 }}
                   />
+
+                  <div style={{ marginBottom: 16 }}>
+                    <label style={{ display: "block", marginBottom: 8, fontWeight: 500 }}>
+                      Income Tax Act *
+                    </label>
+                    <Radio.Group
+                      value={actType}
+                      onChange={(e) => setActType(e.target.value)}
+                      optionType="button"
+                      buttonStyle="solid"
+                    >
+                      <Radio.Button value="old">Old Act</Radio.Button>
+                      <Radio.Button value="new">New Act</Radio.Button>
+                    </Radio.Group>
+                  </div>
 
                   <div>
                     <div
@@ -673,6 +683,34 @@ function TldcPage() {
                     />
                   </div>
 
+                  {actType === "new" && (
+                    <Space direction="vertical" size="small" style={{ marginTop: 12, width: "100%" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                        <Switch
+                          checked={initiateIfNoRequest}
+                          onChange={setInitiateIfNoRequest}
+                          disabled={forceInitiate}
+                        />
+                        <span>
+                          Initiate if no download request exists (default) — skip if requests
+                          already exist
+                        </span>
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                        <Switch
+                          checked={forceInitiate}
+                          onChange={(v) => {
+                            setForceInitiate(v)
+                            if (v) setInitiateIfNoRequest(true)
+                          }}
+                        />
+                        <span>
+                          Force initiate all certificates + download all available PDFs
+                        </span>
+                      </div>
+                    </Space>
+                  )}
+
                   <Space style={{ marginTop: 20 }}>
                     <Button
                       type="primary"
@@ -726,9 +764,14 @@ function TldcPage() {
                     value: c.id,
                   }))}
                 />
-                <Button icon={<DownloadOutlined />} onClick={handleDownloadCSV}>
-                  Download CSV
-                </Button>
+                <ExportButtons
+                  feature="tldc"
+                  filters={{
+                    companyId: filterCompanyId,
+                    search: searchText || undefined,
+                  }}
+                  disabled={!tldcData || (tldcData as TldcDataType[]).length === 0}
+                />
                 <Button type="primary" icon={<PlusOutlined />} onClick={() => handleAddTldcData(true)}>
                   Quick Add
                 </Button>

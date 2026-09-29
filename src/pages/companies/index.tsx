@@ -32,52 +32,18 @@ import getCompanies from "src/companies/queries/getCompanies"
 import saveCompaniesFromExcel from "src/companies/mutations/saveCompaniesFromExcel"
 import deleteCompany from "src/companies/mutations/deleteCompany"
 import updateCompany from "src/companies/mutations/updateCompany"
-import * as XLSX from "xlsx"
 import { ConfigProvider } from "antd"
 import enGB from "antd/lib/locale/en_GB"
+import {
+  downloadCompanyCredentialsTemplateCsv,
+  downloadCompanyCredentialsTemplateExcel,
+  readCompanyCredentialsFromFile,
+  type CompanyCredentials,
+} from "src/shared/ui/readCompanyCredentialsFile"
 
 const { Title } = Typography
 
-const COMPANY_TEMPLATE_HEADERS = [
-  "Company Name",
-  "Tan",
-  "IT Password",
-  "User ID",
-  "Password",
-]
-const COMPANY_TEMPLATE_CSV =
-  COMPANY_TEMPLATE_HEADERS.join(",") + "\nABC Corporation Ltd,ABCD12345E,ITPass123,ABCD12345E,UserPass456"
-
-function parseFileToCompanies(
-  jsonData: any[],
-  columnMap: Record<string, string>
-): CompanyData[] {
-  return jsonData.map((row, index) => {
-    const name = row[columnMap.name || ""]
-    const tan = row[columnMap.tan || ""]
-    const it_password = row[columnMap.it_password || ""]
-    const user_id = row[columnMap.user_id || ""]
-    const password = row[columnMap.password || ""]
-    if (!name || !tan || !it_password || !user_id || !password) {
-      throw new Error(`Missing required fields in row ${index + 1}`)
-    }
-    return {
-      name: String(name).trim(),
-      tan: String(tan).trim().toUpperCase(),
-      it_password: String(it_password).trim(),
-      user_id: String(user_id).trim(),
-      password: String(password).trim(),
-    }
-  })
-}
-
-interface CompanyData {
-  name: string
-  tan: string
-  it_password: string
-  user_id: string
-  password: string
-}
+type CompanyData = CompanyCredentials & { dscCertificateName?: string }
 
 interface Company {
   id: number
@@ -86,6 +52,7 @@ interface Company {
   it_password: string
   user_id: string
   password: string
+  dscCertificateName?: string | null
   createdAt: Date
   updatedAt: Date
   isTemporary: boolean
@@ -124,72 +91,23 @@ function CompaniesPage() {
   })
 
   const handleFileUpload = async (file: File) => {
-    const isCsv = /\.csv$/i.test(file.name)
     try {
-      const reader = new FileReader()
-      reader.onload = (e) => {
-        try {
-          let jsonData: any[]
-          if (isCsv) {
-            const text = (e.target?.result as string) || ""
-            const workbook = XLSX.read(text, { type: "string", raw: false })
-            const sheetName = workbook.SheetNames[0]
-            if (!sheetName) throw new Error("No sheets found in file")
-            const worksheet = workbook.Sheets[sheetName]
-            jsonData = XLSX.utils.sheet_to_json(worksheet!) as any[]
-          } else {
-            const data = new Uint8Array(e.target?.result as ArrayBuffer)
-            const workbook = XLSX.read(data, { type: "array" })
-            const sheetName = workbook.SheetNames[0]
-            if (!sheetName) throw new Error("No sheets found in Excel file")
-            const worksheet = workbook.Sheets[sheetName]
-            jsonData = XLSX.utils.sheet_to_json(worksheet!) as any[]
-          }
-          const columnMap = {
-            name: "Company Name",
-            tan: "Tan",
-            it_password: "IT Password",
-            user_id: "User ID",
-            password: "Password",
-          }
-          const companies = parseFileToCompanies(jsonData, columnMap)
-          handleSaveCompanies(companies)
-        } catch (error: any) {
-          messageApi.error(error.message || "Failed to parse file")
-          setFileList([])
-        }
-      }
-      if (isCsv) {
-        reader.readAsText(file, "UTF-8")
-      } else {
-        reader.readAsArrayBuffer(file)
-      }
+      const companies = await readCompanyCredentialsFromFile(file)
+      void handleSaveCompanies(companies)
     } catch (error: any) {
       messageApi.error(error.message || "Failed to read file")
+      setFileList([])
     }
     return false // Prevent automatic upload
   }
 
   const downloadTemplateCSV = () => {
-    const blob = new Blob([COMPANY_TEMPLATE_CSV], { type: "text/csv;charset=utf-8;" })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement("a")
-    a.href = url
-    a.download = "companies-template.csv"
-    a.click()
-    URL.revokeObjectURL(url)
+    downloadCompanyCredentialsTemplateCsv()
     messageApi.success("CSV template downloaded")
   }
 
   const downloadTemplateExcel = () => {
-    const wsData = [
-      COMPANY_TEMPLATE_HEADERS,
-      ["ABC Corporation Ltd", "ABCD12345E", "ITPass123", "ABCD12345E", "UserPass456"],
-    ]
-    const ws = XLSX.utils.aoa_to_sheet(wsData)
-    const wb = XLSX.utils.book_new()
-    XLSX.utils.book_append_sheet(wb, ws, "Companies")
-    XLSX.writeFile(wb, "companies-template.xlsx")
+    downloadCompanyCredentialsTemplateExcel()
     messageApi.success("Excel template downloaded")
   }
 
@@ -240,6 +158,7 @@ function CompaniesPage() {
       it_password: company.it_password,
       user_id: company.user_id,
       password: company.password,
+      dscCertificateName: company.dscCertificateName || "",
     })
     setIsEditModalVisible(true)
   }
@@ -258,6 +177,7 @@ function CompaniesPage() {
           it_password: values.it_password.trim(),
           user_id: values.user_id.trim(),
           password: values.password.trim(),
+          dscCertificateName: (values.dscCertificateName || "").trim(),
         },
       })
 
@@ -298,6 +218,7 @@ function CompaniesPage() {
         it_password: values.it_password.trim(),
         user_id: values.user_id.trim(),
         password: values.password.trim(),
+        dscCertificateName: (values.dscCertificateName || "").trim() || undefined,
       }
       await handleSaveCompanies([companyData])
       setIsEditModalVisible(false)
@@ -508,6 +429,14 @@ function CompaniesPage() {
             >
               <Input.Password placeholder="Enter TRACES password" />
             </Form.Item>
+
+            <Form.Item
+              name="dscCertificateName"
+              label="DSC Certificate Name"
+              extra="Windows certificate subject / friendly name (e.g. HETAL SHAH). Used to auto-sign Form 16A PDFs after download."
+            >
+              <Input placeholder="Optional — leave blank to match by company name" />
+            </Form.Item>
           </Form>
         </Modal>
       </Layout>
@@ -515,4 +444,5 @@ function CompaniesPage() {
   )
 }
 
+CompaniesPage.authenticate = { redirectTo: "/auth/login" }
 export default CompaniesPage

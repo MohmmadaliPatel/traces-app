@@ -21,9 +21,11 @@
     "migrate:dev": "blitz prisma migrate dev",
     "seed": "blitz db seed",
     "generate": "blitz prisma generate",
-    "pup": "node src/pup.js",
-    "try": "node src/test.js",
-    "form16a:bulk": "node -r esbuild-register src/scripts/generateForm16PdfsCluster.ts"
+    "pdf:preview": "bash scripts/generate-and-preview.sh",
+    "dsc:test": "node scripts/dsc-test.js",
+    "dsc:unlock": "node scripts/run-ts.js src/scripts/dscUnlock.ts",
+    "dsc:sign": "node scripts/run-ts.js src/scripts/dscSignPending.ts",
+    "dsc:build-signer": "dotnet publish pdf-signer-src/pdf-signer.csproj -c Release -r win-x64 --self-contained false -o pdf-signer"
   },
   "prisma": {
     "schema": "db/schema.prisma"
@@ -54,11 +56,13 @@
     "better-queue-sql": "1.0.6",
     "better-queue-sqlite": "1.0.7",
     "blitz": "2.0.0-beta.23",
+    "canvas": "^2.11.2",
     "cheerio": "1.0.0",
     "crypto-js": "4.1.1",
     "csvtojson": "2.0.10",
     "dayjs": "1.11.7",
     "envfile": "6.18.0",
+    "exceljs": "4.4.0",
     "express": "4.21.2",
     "fs-extra": "11.1.0",
     "glob": "13.0.0",

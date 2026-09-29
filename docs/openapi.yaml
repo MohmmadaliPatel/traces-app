@@ -642,6 +642,74 @@ paths:
                           type: string
         '401':
           description: Unauthorized
+  /api/export/{feature}:
+    post:
+      tags: [Exports]
+      summary: Download tabular data as Excel, CSV, or PDF
+      description: |
+        Shared export for TLDC, LDC utilisation, outstanding demand, return status,
+        RRR extract, Form 140 extract, and deductee masters.
+      parameters:
+        - name: feature
+          in: path
+          required: true
+          schema:
+            type: string
+            enum:
+              - tldc
+              - ldc-utilisation
+              - outstanding-demand
+              - return-status
+              - rrr
+              - form140
+              - deductee-masters
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - format
+              properties:
+                format:
+                  type: string
+                  enum: [xlsx, csv, pdf]
+                companyId:
+                  oneOf:
+                    - type: integer
+                    - type: string
+                fy:
+                  type: string
+                  example: "2024-25"
+                search:
+                  type: string
+                formTypeCd:
+                  type: string
+                  enum: [T140, F26Q]
+                  description: Only for feature=form140
+      responses:
+        '200':
+          description: File download
+          content:
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                format: binary
+            text/csv:
+              schema:
+                type: string
+                format: binary
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: Invalid feature or format
+        '401':
+          description: Unauthorized
+        '404':
+          description: No data for filters
   /api/file/{slug}:
     get:
       tags: [Files]

@@ -1,4 +1,4 @@
-import { withApiAuth } from "src/utils/apiAuth"
+import { withApiAuth } from "src/shared/http"
 import { NextApiRequest, NextApiResponse } from "next"
 import db from "db"
 import { fetchPaymentHistory } from "src/scripts/fetchPaymentHistory"
@@ -9,7 +9,7 @@ export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ct
   }
 
   try {
-    const { companyId } = req.body
+    const { companyId, financialYears, acts, actType } = req.body
 
     if (!companyId) {
       return res.status(400).json({ error: "Missing company ID" })
@@ -23,16 +23,28 @@ export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ct
       return res.status(404).json({ error: "Company not found" })
     }
 
+    const parsedActs = Array.isArray(acts)
+      ? (acts.filter((a: string) => a === "O" || a === "N") as Array<"O" | "N">)
+      : undefined
+
+    const parsedFinancialYears = Array.isArray(financialYears)
+      ? financialYears.map(String)
+      : undefined
+
     const result = await fetchPaymentHistory({
       tan: company.tan,
       itPassword: company.it_password,
       companyName: company.name,
+      actType: actType === "O" || actType === "N" ? actType : undefined,
+      acts: parsedActs,
+      financialYears: parsedFinancialYears,
     })
 
     return res.status(200).json({
       success: true,
       companyName: company.name,
       tan: company.tan,
+      financialYears: result.financialYears,
       payments: result.payments,
       gaps: result.gaps,
       contentJsonPath: result.contentJsonPath,

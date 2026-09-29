@@ -5,6 +5,12 @@
 
 import puppeteer, { type Browser, type Page } from "puppeteer"
 import { PDFDocument } from "pdf-lib"
+import {
+  DSC_SIGBOX_CSS,
+  dscSigBoxAnchorHtml,
+  extractAndStripSigBoxAnchor,
+  storeSignatureBox,
+} from "src/form16/utils/dscSignatureBox"
 import { Form16AData } from "./form16AParserExact"
 import path from "path"
 import fs from "fs"
@@ -267,6 +273,14 @@ async function renderForm16APdfOnPage(page: Page, options: PdfGenerationOptions)
     for (const restPage of restPages) {
       merged.addPage(restPage)
     }
+    // Record where the DSC stamp belongs, and drop the anchor that marked it.
+    const sigBox = extractAndStripSigBoxAnchor(merged)
+    if (sigBox) {
+      storeSignatureBox(merged, sigBox)
+    } else {
+      console.warn(`Form 16A: signature-box anchor not found in ${path.basename(outputPath)}; the DSC stamp will fall back to its default position`)
+    }
+
     fs.writeFileSync(outputPath, await merged.save())
   }
 }
@@ -1071,6 +1085,7 @@ td { font-weight: 400; font-family: 'Times New Roman', Times, serif; }
     padding-bottom: 30px; /* Space for footer */
   }
 }
+${DSC_SIGBOX_CSS}
 </style>
 </head>
 <body>
@@ -1317,7 +1332,7 @@ I, <b>${footer.authPersonName}</b>, son/daughter of <b>${
   <table class="sig-table">
     <tr>
       <td style="width: 45%;"><b>Place :</b> ${footer.place}</td>
-      <td rowspan="2" style="width: 55%; text-align: center; vertical-align: bottom; padding-bottom: 8px;"><b>(Signature of person responsible for deduction of tax)</b></td>
+      <td rowspan="2" style="width: 55%; text-align: center; vertical-align: bottom; padding-bottom: 8px;">${dscSigBoxAnchorHtml(26)}<b>(Signature of person responsible for deduction of tax)</b></td>
     </tr>
     <tr>
       <td><b>Date :</b> ${footer.verificationDate}</td>

@@ -7,6 +7,7 @@
     "skipLibCheck": true,
     "strict": false,
     "strictNullChecks": true,
+    "downlevelIteration": true,
     "forceConsistentCasingInFileNames": true,
     "noEmit": true,
     "noUncheckedIndexedAccess": true,

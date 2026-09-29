@@ -40,6 +40,8 @@ import os from "os"
 import fs from "fs"
 import { fork } from "child_process"
 import { generatePdfsFromZipFolder } from "../utils/processZipsForForm16"
+import { attachDscToForm16aPdfs } from "../form16/utils/signForm16Pdfs"
+import { findGeneratedPdfs, partitionBySignature } from "../form16/utils/findGeneratedPdfs"
 
 interface WorkerParams {
   sourceFolder: string
@@ -113,7 +115,7 @@ async function runWorker(): Promise<void> {
     },
     // Only surface notable lines to the master to keep its output readable.
     logger: (msg: string) => {
-      if (/❌|⚠|Shard|Failed|error/i.test(msg)) {
+      if (/❌|⚠|ℹ|Auto-DSC|Attach DSC|Shard|Failed|error/i.test(msg)) {
         process.send?.({ type: "log", shard: params.shardIndex, msg })
       }
     },
@@ -239,7 +241,9 @@ async function runMaster(): Promise<void> {
     stats.set(globalShard, { success: 0, skipped: 0, failed: 0, done: false })
 
     const child = fork(__filename, [JSON.stringify(wp)], {
-      env: { ...process.env, FORM16A_WORKER: "1" },
+      // Children must not sign: N workers would raise N PIN dialogs. The master signs
+      // everything once, after they finish.
+      env: { ...process.env, FORM16A_WORKER: "1", DSC_SKIP_SIGNING: "1" },
       execArgv,
     })
 
@@ -309,6 +313,38 @@ async function runMaster(): Promise<void> {
     skipped += s.skipped
     failed += s.failed
   })
+  // Sign everything the workers produced in ONE signer run: one process, one PIN prompt.
+  let dscFailed = false
+  if (success > 0 || skipped > 0) {
+    const generated = await findGeneratedPdfs({
+      companyName,
+      financialYear,
+      quarter,
+      formType,
+      form16Type,
+    })
+    const { unsigned } = partitionBySignature(generated)
+    console.log("\n" + line)
+    console.log(`DSC: ${generated.length} PDF(s) found, ${unsigned.length} unsigned`)
+    if (unsigned.length > 0) {
+      const dscResult = await attachDscToForm16aPdfs({
+        companyName,
+        tan,
+        pdfPaths: unsigned,
+        log: (m) => console.log(`  ${m}`),
+      })
+      if (dscResult.signed) {
+        console.log(`✓ DSC attached to ${dscResult.signedCount} PDF(s)`)
+      } else if (dscResult.skippedReason) {
+        console.log(`ℹ DSC skipped: ${dscResult.skippedReason}`)
+      } else {
+        dscFailed = true
+        console.log(`⚠ DSC failed: ${dscResult.error}`)
+        console.log(`  Recover with: yarn dsc:unlock  then  yarn dsc:sign`)
+      }
+    }
+  }
+
   const secs = (Date.now() - started) / 1000
   const rate = success / Math.max(secs, 0.001)
   console.log("\n" + line)
@@ -318,7 +354,7 @@ async function runMaster(): Promise<void> {
   console.log(`  Failed         : ${fmt(failed)}`)
   console.log(`  Throughput     : ${rate.toFixed(1)}/s  (${fmt(rate * 60)}/min new PDFs)`)
   console.log(line)
-  process.exit(failed > 0 && success === 0 && skipped === 0 ? 1 : 0)
+  process.exit(dscFailed || (failed > 0 && success === 0 && skipped === 0) ? 1 : 0)
 }
 
 // ----------------------------------------------------------------------------

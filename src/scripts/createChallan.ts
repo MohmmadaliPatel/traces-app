@@ -1,12 +1,14 @@
 import { secCodes as oldSecCodes } from "../challan/utils/secCodes"
 import { secCodes as newSecCodes } from "../challan/utils/newSecCodes"
-import type { IncomeTaxActKind } from "../challan/utils/incomeTaxAct"
+import type { IncomeTaxActKind } from "src/shared/portals/act"
+import { actKindToPortalCode } from "src/shared/portals/act"
+import type { NewRegimeChallanMode } from "../challan/utils/challanMode"
 import { downloadChallans } from "./downloadChallan"
 import {
   createIncomeTaxAxiosClient,
   loginIncomeTaxPortal,
   saveIncomeTaxUserProfile,
-} from "src/utils/incomeTaxPortalAuth"
+} from "src/shared/portals/incomeTax"
 import type { AxiosInstance } from "axios"
 
 
@@ -108,7 +110,7 @@ function price_in_words(price: any): string {
   return str
 }
 
-export type { IncomeTaxActKind } from "../challan/utils/incomeTaxAct"
+export type { IncomeTaxActKind } from "src/shared/portals/act"
 
 interface CreateChallanParams {
   companyName: string
@@ -117,6 +119,7 @@ interface CreateChallanParams {
   password: string
   assessmentYear: string
   sections: Array<{ sectionCode: string; amount: string; actType?: IncomeTaxActKind }>
+  newRegimeChallanMode?: NewRegimeChallanMode
   skipDownload?: boolean
 }
 
@@ -304,10 +307,6 @@ async function createNewRegimeCombinedChallan(
   return results
 }
 
-function actKindToPortalCode(actType: IncomeTaxActKind | undefined): "O" | "N" {
-  return actType === "new" ? "N" : "O"
-}
-
 function secCodesForAct(actType: IncomeTaxActKind | undefined) {
   return actType === "new" ? newSecCodes : oldSecCodes
 }
@@ -320,6 +319,7 @@ export async function createChallan(params: CreateChallanParams) {
     sections,
     companyName,
     companyCode,
+    newRegimeChallanMode = "combined",
     skipDownload = false,
   } = params
 
@@ -338,13 +338,25 @@ export async function createChallan(params: CreateChallanParams) {
   const otherSections = sections.filter((s) => s.actType !== "new")
 
   if (newRegimeSections.length > 0) {
-    const combinedResults = await createNewRegimeCombinedChallan(
-      client,
-      username,
-      assessmentYear,
-      newRegimeSections
-    )
-    results.push(...combinedResults)
+    if (newRegimeChallanMode === "separate") {
+      for (const section of newRegimeSections) {
+        const sectionResults = await createNewRegimeCombinedChallan(
+          client,
+          username,
+          assessmentYear,
+          [section]
+        )
+        results.push(...sectionResults)
+      }
+    } else {
+      const combinedResults = await createNewRegimeCombinedChallan(
+        client,
+        username,
+        assessmentYear,
+        newRegimeSections
+      )
+      results.push(...combinedResults)
+    }
   }
 
   for (const section of otherSections) {

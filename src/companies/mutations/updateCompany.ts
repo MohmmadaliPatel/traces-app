@@ -10,6 +10,7 @@ const UpdateCompanySchema = z.object({
     it_password: z.string().min(1, "IT password is required"),
     user_id: z.string().min(1, "User ID is required"),
     password: z.string().min(1, "Password is required"),
+    dscCertificateName: z.string().optional(),
   }),
 })
 
@@ -33,6 +34,7 @@ export default resolver.pipe(
         it_password: data.it_password,
         user_id: data.user_id,
         password: data.password,
+        dscCertificateName: data.dscCertificateName?.trim() || null,
       },
     })
 

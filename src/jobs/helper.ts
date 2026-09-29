@@ -7,6 +7,7 @@ import axios from "axios"
 import rateLimit from "axios-rate-limit"
 import { HttpCookieAgent, HttpsCookieAgent } from "http-cookie-agent/http"
 import CryptoJS from "crypto-js"
+import { findMatchingCompanyFolder as matchCompanyFolder } from "src/shared/jobs/workers/taskHelpers"
 
 // Default function to handle 401 errors
 let on401Handler: () => Promise<void> = async () => {
@@ -68,6 +69,29 @@ export function getAxiostClient() {
       // maxRPS: 1,
     }) as any
   }
+
+  axiosInstance.interceptors.request.use((config) => {
+    const url = String(config.url || "")
+    if (!url.includes("eportal.incometax.gov.in")) return config
+    config.headers = config.headers || {}
+    if (!config.headers.Origin && !config.headers.origin) {
+      config.headers.Origin = "https://eportal.incometax.gov.in"
+    }
+    if (!config.headers.Referer && !config.headers.referer) {
+      config.headers.Referer = "https://eportal.incometax.gov.in/iec/foservices/"
+    }
+    if (url.includes("/servicesapi/auth/saveEntity")) {
+      const body = config.data
+      const serviceName =
+        body && typeof body === "object" && !Buffer.isBuffer(body)
+          ? (body as { serviceName?: unknown }).serviceName
+          : undefined
+      if (typeof serviceName === "string" && serviceName && !config.headers.sn) {
+        config.headers.sn = serviceName
+      }
+    }
+    return config
+  })
 
   // Add response interceptor to handle 401 errors
   axiosInstance.interceptors.response.use(
@@ -223,7 +247,7 @@ export async function findAndProcessTxtFiles(
       logger.log(`Processing: ${txtFilePath}`)
 
       // Extract formType and quarter from path
-      const pathInfo = extractFormTypeAndQuarterFromPath(txtFilePath, companyFolder)
+      const pathInfo = extractFormTypeAndQuarterFromPath(txtFilePath, companyFolder, baseFolder)
       if (!pathInfo) {
         logger.log(`Could not extract formType and quarter from path: ${txtFilePath}`)
         continue
@@ -338,61 +362,71 @@ function findTxtFilesRecursively(dirPath: string): string[] {
 }
 
 /**
- * Extract formType and quarter from file path
+ * Extract formType, quarter and financial year from a txt file's path.
+ *
+ * The folders between the financial-year folder and the txt file are not fixed: quarter
+ * and form-type folders may sit above the company folder (`<fy>/Q1/<company>/...`) or
+ * below it (`<company>/26Q/Q1/...`), in any order, and may be missing entirely (in which
+ * case the filename, e.g. `CHIT26Q2.txt`, is used).
  */
 function extractFormTypeAndQuarterFromPath(
   txtFilePath: string,
-  companyFolder: string
+  companyFolder: string,
+  baseFolder?: string
 ): { formType: string; quarter: string; financialYear: string } | null {
   const path = require("path")
-  const relativePath = path.relative(companyFolder, txtFilePath)
-  const pathParts = relativePath.split(path.sep)
 
-  // Look for patterns like F24Q, F26Q, F27Q, F27EQ in the path
-  const formTypePattern = /(\d+)(Q|EQ)/i
-  const quarterPattern = /Q\d+|EQ/i
+  // Scan everything below the financial-year folder when we know it, so quarter / form
+  // type folders placed *above* the company folder are picked up too.
+  const scanRoot = baseFolder && txtFilePath.startsWith(baseFolder) ? baseFolder : companyFolder
+  const companyFolderName = path.basename(companyFolder)
+  const pathParts = path
+    .relative(scanRoot, txtFilePath)
+    .split(path.sep)
+    .filter((part: string) => part && part !== companyFolderName)
+
+  // Form type: 24Q / 26Q / 27Q / 27EQ, optionally prefixed with F and suffixed with the quarter
+  const formTypePattern = /(\d{2})\s*_?-?(EQ|Q)/i
+  // Quarter: Q1..Q4, Q_1, Q-1, "Quarter 2"
+  const quarterPattern = /(?:^|[^A-Z0-9])(?:Q|QUARTER)[\s_-]*([1-4])(?![0-9])/i
 
   let formType = ""
   let quarter = ""
   let financialYear = ""
 
-  // Extract from path parts
   for (const part of pathParts) {
-    // Check for form type
-    const formMatch = part.match(formTypePattern)
-    if (formMatch) {
-      formType = formMatch[1] + formMatch[2].toUpperCase()
+    if (!formType) {
+      const formMatch = part.match(formTypePattern)
+      if (formMatch) {
+        formType = formMatch[1] + formMatch[2].toUpperCase()
+      }
     }
 
-    // Check for quarter
-    const quarterMatch = part.match(quarterPattern)
-    if (quarterMatch) {
-      quarter = quarterMatch[0].toUpperCase()
+    if (!quarter) {
+      const quarterMatch = part.match(quarterPattern)
+      if (quarterMatch) {
+        quarter = `Q${quarterMatch[1]}`
+      }
     }
 
-    // Check for financial year (format like 2025-26)
-    const yearMatch = part.match(/(\d{4})-(\d{2})/)
-    if (yearMatch) {
-      financialYear = yearMatch[0]
+    if (!financialYear) {
+      const yearMatch = part.match(/(\d{4})-(\d{2})/)
+      if (yearMatch) {
+        financialYear = yearMatch[0]
+      }
     }
   }
 
-  // If form type or quarter not found in path, try to extract from filename
-  // Example: CHIT26Q2.txt -> formType: 26Q, quarter: Q2
+  // Fall back to the filename, e.g. CHIT26Q2.txt -> formType: 26Q, quarter: Q2
   if (!formType || !quarter) {
     const filename = path.basename(txtFilePath, ".txt")
-
-    // Pattern to match form type and quarter in filename
-    // Matches patterns like: 24Q1, 26Q2, 27Q3, 27EQ4
-    const filenamePattern = /(\d{2})(Q|EQ)(\d)/i
-    const filenameMatch = filename.match(filenamePattern)
+    const filenameMatch = filename.match(/(\d{2})(EQ|Q)([1-4])/i)
 
     if (filenameMatch) {
       if (!formType) {
         formType = filenameMatch[1] + filenameMatch[2].toUpperCase()
       }
       if (!quarter) {
-        // Convert quarter number to Q format (1 -> Q1, 2 -> Q2, etc.)
         quarter = `Q${filenameMatch[3]}`
       }
     }
@@ -402,12 +436,22 @@ function extractFormTypeAndQuarterFromPath(
     return null
   }
 
-  // If financial year not found in path, try to infer from parent folder
+  // Financial year comes from the year folder itself when the inner folders don't carry it.
   if (!financialYear) {
-    const yearFolder = path.basename(path.dirname(companyFolder))
-    const yearMatch = yearFolder.match(/(\d{4})-(\d{2})/)
-    if (yearMatch) {
-      financialYear = yearMatch[0]
+    for (const candidate of [baseFolder, path.dirname(companyFolder), companyFolder]) {
+      if (!candidate) continue
+      const name = path.basename(candidate)
+      const dashed = name.match(/(\d{4})-(\d{2})/)
+      if (dashed) {
+        financialYear = dashed[0]
+        break
+      }
+      // Compact form, e.g. 202526
+      const compact = name.match(/^(\d{4})(\d{2})$/)
+      if (compact) {
+        financialYear = `${compact[1]}-${compact[2]}`
+        break
+      }
     }
   }
 
@@ -415,43 +459,10 @@ function extractFormTypeAndQuarterFromPath(
 }
 
 /**
- * Find matching company folder (handles case variations)
+ * Find matching company folder underneath the financial-year folder.
+ * Delegates to the shared resolver, which also handles company folders nested behind
+ * structural folders (e.g. `<fy>/Q1/<company>` or `<fy>/26Q/Q1/<company>`).
  */
 function findMatchingCompanyFolder(companyName: string, baseFolder: string): string | null {
-  const fs = require("fs")
-  const path = require("path")
-  console.log("baseFolder", baseFolder)
-  console.log("companyName", companyName)
-  try {
-    const folders = fs
-      .readdirSync(baseFolder, { withFileTypes: true })
-      .filter((dirent: any) => dirent.isDirectory())
-      .map((dirent: any) => dirent.name)
-
-    // Normalize company name for comparison
-    const normalizeName = (name: string) =>
-      (name || "")
-        .toLowerCase()
-        .replace(/private limited/gi, "pvt ltd")
-        .replace(/pvt\./gi, "pvt")
-        .replace(/ltd\./gi, "ltd")
-        .replace(/\s+/g, " ")
-        .trim()
-
-    const normalizedTarget = normalizeName(companyName)
-
-    for (const folder of folders) {
-      const normalizedFolder = normalizeName(folder)
-      if (
-        normalizedFolder.includes(normalizedTarget) ||
-        normalizedTarget.includes(normalizedFolder)
-      ) {
-        return path.join(baseFolder, folder)
-      }
-    }
-  } catch (error) {
-    // Base folder doesn't exist or can't be read
-  }
-
-  return null
+  return matchCompanyFolder(companyName, baseFolder)
 }

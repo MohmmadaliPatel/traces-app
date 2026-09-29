@@ -1,71 +1,54 @@
-import React, { useState } from "react"
+import React, { useEffect, useMemo, useRef, useState } from "react"
 import {
   Button,
-  Table,
   Card,
   Space,
   message,
   Select,
-  Upload,
-  Tag,
   Alert,
   Radio,
   Divider,
 } from "antd"
-import type { ColumnsType } from "antd/es/table"
 import {
-  UploadOutlined,
-  FileExcelOutlined,
-  CheckCircleOutlined,
-  CloseCircleOutlined,
-  SyncOutlined,
   SendOutlined,
   DownloadOutlined,
+  ReloadOutlined,
 } from "@ant-design/icons"
 import { useMutation, useQuery } from "@blitzjs/rpc"
 import Layout from "src/core/layouts/Layout"
-import processExcelUpload from "src/companies/mutations/processExcelUploadConso"
+import processExcelUpload from "src/conso/mutations/processExcelUploadConso"
 import getUploadHistory from "src/companies/queries/getUploadHistory"
 import getCompanies from "src/companies/queries/getCompanies"
-import * as XLSX from "xlsx"
+import retryFailedConsoBatchTasks from "src/tasks/mutations/retryFailedConsoBatchTasks"
+import type { ConsoBatchProgress } from "src/tasks/consoBatchProgress"
 import dayjs from "dayjs"
 import "dayjs/locale/en-gb"
 import { ConfigProvider } from "antd"
 import enGB from "antd/lib/locale/en_GB"
+import { type CompanyCredentials } from "src/shared/ui/readCompanyCredentialsFile"
+import { CompanyCredentialsUpload } from "src/shared/ui/CompanyCredentialsUpload"
+import { UploadHistoryTable } from "src/shared/ui/UploadHistoryTable"
+import { BatchProgressPoller } from "src/shared/ui/BatchProgressPoller"
+import { FailedTasksRetryModal } from "src/shared/ui/FailedTasksRetryModal"
 
 // Set dayjs locale to en-gb (starts week on Monday)
 dayjs.locale("en-gb")
 
-interface CompanyData {
-  name: string
-  tan: string
-  it_password: string
-  user_id: string
-  password: string
-}
-
-interface UploadHistoryRecord {
-  id: number
-  companyName: string
-  tan: string
-  status: string
-  filePath: string | null
-  financialYear: string
-  quarter: string
-  errorMessage: string | null
-  createdAt: Date
-  updatedAt: Date
-  batchId: number | null
-}
+type CompanyData = CompanyCredentials
 
 function ConsoFilesPage() {
   const [messageApi, contextHolder] = message.useMessage()
   const [processExcelUploadMutation] = useMutation(processExcelUpload)
-  const [uploadHistoryResponse, { refetch }] = useQuery(getUploadHistory, {
-    skip: 0,
-    take: 100,
-    type: "conso",
-  })
+  const [retryFailedMutation] = useMutation(retryFailedConsoBatchTasks)
+  const [uploadHistoryResponse, { refetch }] = useQuery(
+    getUploadHistory,
+    {
+      skip: 0,
+      take: 100,
+      type: "conso",
+    },
+    { refetchOnWindowFocus: false }
+  )
 
   const [excelData, setExcelData] = useState<CompanyData[]>([])
   const [selectedCompanyIds, setSelectedCompanyIds] = useState<number[]>([])
@@ -77,14 +60,69 @@ function ConsoFilesPage() {
   const [formType, setFormType] = useState<string[]>([])
   const [loading, setLoading] = useState(false)
   const [fileList, setFileList] = useState<any[]>([])
+  const [activeBatchId, setActiveBatchId] = useState<number | null>(null)
+  const [retrying, setRetrying] = useState(false)
+  const [retryModalOpen, setRetryModalOpen] = useState(false)
+  const [selectedFailedTaskIds, setSelectedFailedTaskIds] = useState<number[]>([])
+  const wasBatchCompleteRef = useRef(false)
 
-  const [companiesResponse] = useQuery(getCompanies, {
-    orderBy: { name: "asc" },
-    skip: 0,
-    take: 10000,
-  })
+  const [companiesResponse] = useQuery(
+    getCompanies,
+    {
+      orderBy: { name: "asc" },
+      skip: 0,
+      take: 10000,
+    },
+    { refetchOnWindowFocus: false }
+  )
 
-  const savedCompanies:any = companiesResponse?.companies || []
+  const savedCompanies: any = companiesResponse?.companies || []
+  const [batchProgress, setBatchProgress] = useState<ConsoBatchProgress | null>(null)
+
+  useEffect(() => {
+    wasBatchCompleteRef.current = false
+    setRetryModalOpen(false)
+    setSelectedFailedTaskIds([])
+    setBatchProgress(null)
+    if (!activeBatchId) return
+
+    const source = new EventSource(`/api/conso/batch-progress?batchId=${activeBatchId}`)
+    source.onmessage = (event) => {
+      try {
+        const next = JSON.parse(event.data) as ConsoBatchProgress
+        if (next?.batchId !== activeBatchId) return
+        setBatchProgress(next)
+      } catch {
+        /* ignore malformed frames */
+      }
+    }
+    source.onerror = () => {
+      /* EventSource reconnects on its own; do not RPC-poll */
+    }
+
+    return () => {
+      source.close()
+    }
+  }, [activeBatchId])
+
+  useEffect(() => {
+    if (!activeBatchId || batchProgress?.batchId !== activeBatchId) return
+    const complete = Boolean(batchProgress?.isComplete)
+    const failedItems = (batchProgress?.items || []).filter((i) => i.status === "Failed")
+    if (complete && !wasBatchCompleteRef.current && failedItems.length > 0) {
+      setSelectedFailedTaskIds(failedItems.map((i) => i.taskId))
+      setRetryModalOpen(true)
+      void refetch()
+    }
+    if (batchProgress?.batchId === activeBatchId) {
+      wasBatchCompleteRef.current = complete
+    }
+  }, [activeBatchId, batchProgress?.batchId, batchProgress?.isComplete, batchProgress?.items, refetch])
+
+  const failedProgressItems = useMemo(
+    () => (batchProgress?.items || []).filter((i) => i.status === "Failed"),
+    [batchProgress?.items]
+  )
 
   // Generate financial year options
   const generateFinancialYears = (): Array<{ label: string; value: string }> => {
@@ -113,58 +151,6 @@ function ConsoFilesPage() {
     { label: "27Q", value: "27Q" },
     { label: "27EQ", value: "27EQ" },
   ]
-
-  const handleFileUpload = async (file: File) => {
-    try {
-      const reader = new FileReader()
-      reader.onload = (e) => {
-        try {
-          const data = new Uint8Array(e.target?.result as ArrayBuffer)
-          const workbook = XLSX.read(data, { type: "array" })
-          const sheetName = workbook.SheetNames[0]
-          if (!sheetName) {
-            throw new Error("No sheets found in Excel file")
-          }
-          const worksheet = workbook.Sheets[sheetName]
-          const jsonData = XLSX.utils.sheet_to_json(worksheet!) as any[]
-
-          console.log(jsonData)
-
-          // Validate and transform data
-          const companies: CompanyData[] = jsonData.map((row, index) => {
-            if (
-              !row["Company Name"] ||
-              !row["Tan"] ||
-              !row["IT Password"] ||
-              !row["User ID"] ||
-              !row["Password"]
-            ) {
-              throw new Error(`Missing required fields in row ${index + 1}`)
-            }
-
-            return {
-              name: String(row["Company Name"]).trim(),
-              tan: String(row["Tan"]).trim().toUpperCase(),
-              it_password: String(row["IT Password"]).trim(),
-              user_id: String(row["User ID"]).trim(),
-              password: String(row["Password"]).trim(),
-            }
-          })
-
-          setExcelData(companies)
-          setFileList([file])
-          messageApi.success(`Successfully loaded ${companies.length} companies from Excel`)
-        } catch (error: any) {
-          messageApi.error(error.message || "Failed to parse Excel file")
-          setFileList([])
-        }
-      }
-      reader.readAsArrayBuffer(file)
-    } catch (error: any) {
-      messageApi.error(error.message || "Failed to read file")
-    }
-    return false // Prevent automatic upload
-  }
 
   const handleSubmit = async () => {
     let companiesToProcess: CompanyData[] = []
@@ -217,24 +203,25 @@ function ConsoFilesPage() {
 
     setLoading(true)
     try {
-      await processExcelUploadMutation({
+      const result = await processExcelUploadMutation({
         companies: companiesToProcess,
         financialYear: actionType === "send_request" && !sendToAllPeriods ? financialYear : [],
         quarter: actionType === "send_request" && !sendToAllPeriods ? quarter : [],
         formType: actionType === "send_request" && !sendToAllPeriods ? formType : [],
         actionType,
         sendToAllPeriods: actionType === "send_request" ? sendToAllPeriods : false,
-        jobTypes: actionType === "send_request" ? ["SendRequest"] : ["DownloadFile"], // Default job type, can be made configurable
+        jobTypes: actionType === "send_request" ? ["SendRequest"] : ["DownloadFile"],
       })
 
       const actionMessage =
         actionType === "send_request"
           ? sendToAllPeriods
-            ? "Send request jobs for all periods added to queue successfully"
-            : "Send request jobs added to queue successfully"
-          : "Download jobs added to queue successfully"
+            ? `Send request jobs for all periods queued — Batch #${result.batchId}`
+            : `Send request jobs queued — Batch #${result.batchId}`
+          : `Download jobs queued — Batch #${result.batchId}`
       messageApi.success(actionMessage)
 
+      setActiveBatchId(result.batchId)
       setExcelData([])
       setFileList([])
       setSelectedCompanyIds([])
@@ -250,155 +237,32 @@ function ConsoFilesPage() {
     }
   }
 
-  const getStatusTag = (status: string) => {
-    switch (status) {
-      case "Success":
-        return (
-          <Tag icon={<CheckCircleOutlined />} color="success">
-            Success
-          </Tag>
-        )
-      case "Failed":
-        return (
-          <Tag icon={<CloseCircleOutlined />} color="error">
-            Failed
-          </Tag>
-        )
-      case "Processing":
-        return (
-          <Tag icon={<SyncOutlined spin />} color="processing">
-            Processing
-          </Tag>
-        )
-      default:
-        return <Tag>{status}</Tag>
+  const handleRetryFailedTasks = async (taskIds?: number[]) => {
+    if (!activeBatchId) return
+    const ids = taskIds && taskIds.length > 0 ? taskIds : selectedFailedTaskIds
+    if (!ids.length) {
+      messageApi.warning("Select at least one failed task to retry")
+      return
+    }
+    setRetrying(true)
+    try {
+      const result = await retryFailedMutation({
+        batchId: activeBatchId,
+        taskIds: ids,
+      })
+      messageApi.success(result.message)
+      setRetryModalOpen(false)
+      setSelectedFailedTaskIds([])
+      wasBatchCompleteRef.current = false
+      await refetch()
+    } catch (error: any) {
+      messageApi.error(error.message || "Retry failed")
+    } finally {
+      setRetrying(false)
     }
   }
 
-  const columns: ColumnsType<UploadHistoryRecord> = [
-    {
-      title: "Company Name",
-      dataIndex: "companyName",
-      key: "companyName",
-      width: 150,
-    },
-    {
-      title: "TAN",
-      dataIndex: "tan",
-      key: "tan",
-      width: 120,
-    },
-    {
-      title: "Financial Year",
-      dataIndex: "financialYear",
-      key: "financialYear",
-      width: 120,
-    },
-    {
-      title: "Quarter",
-      dataIndex: "quarter",
-      key: "quarter",
-      width: 100,
-    },
-    {
-      title: "Status",
-      dataIndex: "status",
-      key: "status",
-      render: (status: string) => getStatusTag(status),
-      width: 120,
-    },
-    {
-      title: "Details",
-      dataIndex: "errorMessage",
-      key: "details",
-      render: (error: string | null) => {
-        if (!error) return "-"
 
-        // Try to parse as JSON first (new format)
-        try {
-          const data = JSON.parse(error)
-
-          if (data.combinations && Array.isArray(data.combinations)) {
-            // New format with combinations
-            return (
-              <Space direction="vertical" size="small" style={{ maxWidth: 300 }}>
-                <Tag color="blue">{data.action}</Tag>
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
-                  {data.combinations.map((combo: any, index: number) => {
-                    const statusColor =
-                      combo.status === "Success"
-                        ? "green"
-                        : combo.status === "Failed"
-                        ? "red"
-                        : "orange"
-
-                    const label =
-                      combo.formType !== "N/A"
-                        ? `${combo.financialYear} ${combo.quarter} ${combo.formType}`
-                        : `${combo.financialYear} ${combo.quarter}`
-
-                    return combo.formType !== "N/A" ? (
-                      <Tag
-                        key={index}
-                        color={statusColor}
-                        icon={
-                          combo.status === "Success" ? (
-                            <CheckCircleOutlined />
-                          ) : combo.status === "Failed" ? (
-                            <CloseCircleOutlined />
-                          ) : (
-                            <SyncOutlined spin />
-                          )
-                        }
-                        title={combo.errorMessage || combo.status}
-                        style={{ marginBottom: 2 }}
-                      >
-                        {label}
-                      </Tag>
-                    ) : null
-                  })}
-                </div>
-              </Space>
-            )
-          } else if (data.error) {
-            // Error format
-            return (
-              <Space direction="vertical" size="small">
-                <Tag color="blue">{data.action}</Tag>
-                <Tag color="red">Error: {data.error}</Tag>
-              </Space>
-            )
-          }
-        } catch (e) {
-          // Not JSON, try old format
-          if (error.includes("Form Type:")) {
-            const formTypeMatch = error.match(/Form Type: (\w+)/)
-            const actionMatch = error.match(/Action: ([^,]+)/)
-
-            return (
-              <Space direction="vertical" size="small">
-                <Tag color="blue">{actionMatch?.[1] || "N/A"}</Tag>
-                {formTypeMatch && <Tag color="purple">{formTypeMatch[1]}</Tag>}
-              </Space>
-            )
-          } else if (error.includes("Action:")) {
-            const actionMatch = error.match(/Action: ([^,]+)/)
-            return <Tag color="green">{actionMatch?.[1] || "Download"}</Tag>
-          }
-        }
-
-        return error
-      },
-      width: 320,
-    },
-    {
-      title: "Date",
-      dataIndex: "createdAt",
-      key: "createdAt",
-      render: (date: Date) => dayjs(date).format("DD/MM/YYYY HH:mm"),
-      width: 150,
-    },
-  ]
 
   return (
     <ConfigProvider locale={enGB}>
@@ -508,20 +372,22 @@ function ConsoFilesPage() {
                   type="info"
                   showIcon
                 />
-                <Upload
-                  beforeUpload={handleFileUpload}
+                <CompanyCredentialsUpload
                   fileList={fileList}
-                  onRemove={() => {
+                  onFileListChange={setFileList}
+                  onParsed={(companies) => {
+                    setExcelData(companies)
+                    if (companies.length > 0) {
+                      messageApi.success(`Successfully loaded ${companies.length} companies from Excel`)
+                    }
+                  }}
+                  onError={(msg) => {
+                    messageApi.error(msg)
                     setFileList([])
-                    setExcelData([])
                   }}
                   accept=".xlsx,.xls"
-                  maxCount={1}
-                >
-                  <Button icon={<UploadOutlined />} size="large">
-                    Select Excel File
-                  </Button>
-                </Upload>
+                  buttonText="Select Excel File"
+                />
 
                 {excelData.length > 0 && (
                   <Alert
@@ -660,48 +526,68 @@ function ConsoFilesPage() {
                 </>
               )}
 
-              <Button
-                type="primary"
-                size="large"
-                loading={loading}
-                onClick={handleSubmit}
-                disabled={
-                  (dataSource === "excel" && excelData.length === 0) ||
-                  (dataSource === "companies" && selectedCompanyIds.length === 0) ||
-                  (actionType === "send_request" &&
-                    !sendToAllPeriods &&
-                    (financialYear.length === 0 || quarter.length === 0 || formType.length === 0))
-                }
-                style={{ marginTop: 30 }}
-                icon={actionType === "send_request" ? <SendOutlined /> : <DownloadOutlined />}
-              >
-                {actionType === "send_request" ? "Send Request" : "Download Conso Files"}
-              </Button>
+              <Space style={{ marginTop: 30 }} wrap>
+                <Button
+                  type="primary"
+                  size="large"
+                  loading={loading}
+                  onClick={handleSubmit}
+                  disabled={
+                    (dataSource === "excel" && excelData.length === 0) ||
+                    (dataSource === "companies" && selectedCompanyIds.length === 0) ||
+                    (actionType === "send_request" &&
+                      !sendToAllPeriods &&
+                      (financialYear.length === 0 || quarter.length === 0 || formType.length === 0))
+                  }
+                  icon={actionType === "send_request" ? <SendOutlined /> : <DownloadOutlined />}
+                >
+                  {actionType === "send_request" ? "Send Request" : "Download Conso Files"}
+                </Button>
+              </Space>
             </Space>
           </Card>
 
-          {/* History Table */}
-          <Card
+          {activeBatchId && (
+            <Card
+              title={`Batch #${activeBatchId} progress`}
+              extra={
+                failedProgressItems.length > 0 && batchProgress?.isComplete ? (
+                  <Button
+                    danger
+                    icon={<ReloadOutlined />}
+                    onClick={() => {
+                      setSelectedFailedTaskIds(failedProgressItems.map((i) => i.taskId))
+                      setRetryModalOpen(true)
+                    }}
+                  >
+                    Review failed ({failedProgressItems.length})
+                  </Button>
+                ) : null
+              }
+            >
+              <BatchProgressPoller batchId={activeBatchId} progress={batchProgress} />
+            </Card>
+          )}
+
+          <FailedTasksRetryModal
+            open={retryModalOpen}
+            batchId={activeBatchId}
+            items={failedProgressItems}
+            selectedTaskIds={selectedFailedTaskIds}
+            retrying={retrying}
+            onChangeSelected={setSelectedFailedTaskIds}
+            onRetry={handleRetryFailedTasks}
+            onClose={() => setRetryModalOpen(false)}
+          />
+
+          <UploadHistoryTable
             title="Upload History"
-            extra={
-              <Button onClick={() => refetch()} icon={<SyncOutlined />}>
-                Refresh
-              </Button>
-            }
-          >
-            <Table
-              rowKey="id"
-              columns={columns}
-              dataSource={uploadHistoryResponse?.uploadHistory || []}
-              pagination={{
-                total: uploadHistoryResponse?.count || 0,
-                pageSize: 100,
-                showTotal: (total) => `Total ${total} records`,
-              }}
-              scroll={{ x: 1200 }}
-            />
-          </Card>
-        </Space>
+            records={uploadHistoryResponse?.uploadHistory || []}
+            total={uploadHistoryResponse?.count || 0}
+            onRefresh={() => refetch()}
+            onSelectBatch={setActiveBatchId}
+          />
+</Space>
       </Layout>
     </ConfigProvider>
   )

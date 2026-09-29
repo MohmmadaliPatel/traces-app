@@ -1,7 +1,7 @@
 import React, { useState, useMemo } from "react"
 import { BlitzPage } from "@blitzjs/next"
 import { useMutation, useQuery } from "@blitzjs/rpc"
-import processExcelUploadChallanStatus from "src/companies/mutations/processExcelUploadChallanStatus"
+import processExcelUploadChallanStatus from "src/challan/mutations/processExcelUploadChallanStatus"
 import Layout from "src/core/layouts/Layout"
 import {
   Card,
@@ -17,6 +17,7 @@ import {
   Statistic,
   Switch,
   Typography,
+  Radio,
 } from "antd"
 import type { ColumnsType } from "antd/es/table"
 import {
@@ -26,6 +27,7 @@ import {
   CloseCircleOutlined,
 } from "@ant-design/icons"
 import getCompanies from "src/companies/queries/getCompanies"
+import type { IncomeTaxActKind } from "src/shared/portals/act"
 import dayjs from "dayjs"
 
 const { Title, Text } = Typography
@@ -71,6 +73,7 @@ function PaymentHistoryGapsPage() {
   const [rows, setRows] = useState<PaymentRow[]>([])
   const [cached, setCached] = useState(false)
   const [downloadMissingLoading, setDownloadMissingLoading] = useState(false)
+  const [incomeTaxAct, setIncomeTaxAct] = useState<IncomeTaxActKind>("old")
   const [coverageLoading, setCoverageLoading] = useState(false)
   const [challanStatusRunLoading, setChallanStatusRunLoading] = useState(false)
   const [challanStatusCoverage, setChallanStatusCoverage] = useState<ChallanStatusCoverage | null>(
@@ -158,7 +161,7 @@ function PaymentHistoryGapsPage() {
       const res = await fetch("/api/challan/download-missing-payment-pdfs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ companyId: selectedCompanyId, incomeTaxAct: "old" }),
+        body: JSON.stringify({ companyId: selectedCompanyId, incomeTaxAct }),
       })
       const data = await res.json()
       if (!res.ok || !data.success) {
@@ -418,6 +421,17 @@ function PaymentHistoryGapsPage() {
               >
                 Download missing PDFs ({missingCount})
               </Button>
+              <Radio.Group
+                value={incomeTaxAct}
+                onChange={(e) => setIncomeTaxAct(e.target.value)}
+                optionType="button"
+                buttonStyle="solid"
+                size="small"
+                options={[
+                  { label: "Old Act", value: "old" },
+                  { label: "New Act", value: "new" },
+                ]}
+              />
               <Button
                 loading={coverageLoading}
                 disabled={!selectedCompanyId || loading || downloadMissingLoading}

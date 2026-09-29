@@ -1,0 +1,5 @@
+{
+  "_comment": "Map company TAN (preferred) or company name → Windows certificate subject / friendly name. Used for auto-attach DSC after Form 16A PDF generation when Company.dscCertificateName is empty.",
+  "EXAMPLE000A": "HETAL SHAH",
+  "Example Company Pvt Ltd": "HETAL SHAH"
+}

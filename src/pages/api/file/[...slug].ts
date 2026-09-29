@@ -1,4 +1,4 @@
-import { withApiAuth } from "src/utils/apiAuth"
+import { withApiAuth } from "src/shared/http"
 import fs from "fs/promises"
 import mime from "mime-types"
 import path from "path"

@@ -1,7 +1,8 @@
 import { NextApiRequest, NextApiResponse } from "next"
 import db from "db"
 import { createChallan } from "src/scripts/createChallan"
-import { withApiAuth } from "src/utils/apiAuth"
+import { withApiAuth } from "src/shared/http"
+import type { NewRegimeChallanMode } from "src/challan/utils/challanMode"
 
 export default withApiAuth(async (req, res, _ctx) => {
   if (req.method !== "POST") {
@@ -9,7 +10,8 @@ export default withApiAuth(async (req, res, _ctx) => {
   }
 
   try {
-    const { companyId, assessmentYear, sections, skipDownload = false } = req.body
+    const { companyId, assessmentYear, sections, skipDownload = false, newRegimeChallanMode } =
+      req.body
 
     // createChallan now creates a fresh isolated AxiosInstance + CookieJar per call
     // (via createIncomeTaxAxiosClient + loginIncomeTaxPortal from the shared util).
@@ -35,7 +37,9 @@ export default withApiAuth(async (req, res, _ctx) => {
     }
 
     const newSections = sections.filter((s: { actType?: string }) => s.actType === "new")
-    if (newSections.length > 0) {
+    const challanMode: NewRegimeChallanMode =
+      newRegimeChallanMode === "separate" ? "separate" : "combined"
+    if (newSections.length > 0 && challanMode === "combined") {
       const seen = new Set<string>()
       for (const s of newSections) {
         const code = String(s.sectionCode ?? "").trim()
@@ -56,6 +60,7 @@ export default withApiAuth(async (req, res, _ctx) => {
       password: company.it_password,
       assessmentYear,
       sections,
+      newRegimeChallanMode: challanMode,
       skipDownload: skipDownload !== false,
     })
 

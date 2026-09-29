@@ -74,6 +74,31 @@ export const TRACES_NEW_PORTAL_HOST = "traces.tdscpc.gov.in"
 export const TRACES_PREAUTH_REFERER =
   process.env.TRACES_PREAUTH_REFERER ?? `https://${TRACES_NEW_PORTAL_HOST}/`
 
+/** TRACES JSF redirects often use `http://traces61...`; Secure cookies are dropped on that hop. */
+export function rewriteTracesHttpToHttps(url: string): string {
+  try {
+    const u = new URL(url)
+    if (u.protocol === "http:" && /(^|\.)tdscpc\.gov\.in$/i.test(u.hostname)) {
+      u.protocol = "https:"
+      return u.toString()
+    }
+  } catch {
+    /* ignore */
+  }
+  return url
+}
+
+/** Rewrite a 302 Location so the next hop stays on HTTPS traces61 (not http:// or the new portal). */
+export function rewriteTracesRedirectLocation(location: string, baseUrl = TRACES61_ORIGIN): string {
+  let absolute = location
+  try {
+    absolute = new URL(location, baseUrl).toString()
+  } catch {
+    /* keep */
+  }
+  return rewriteTracesHttpToHttps(absolute)
+}
+
 /** If a URL targets the new portal, rewrite it to {@link TRACES61_ORIGIN}. */
 export function rewriteTracesNewPortalUrlToTraces61(url: string): string {
   try {

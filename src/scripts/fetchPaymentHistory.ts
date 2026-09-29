@@ -6,6 +6,8 @@ import fs from "fs"
 import type { AxiosInstance } from "axios"
 import {
   analyzePaymentHistoryGaps,
+  filterPaymentsByFinancialYears,
+  getLastNIndianFinancialYears,
   paymentHistoryContentJsonPath,
   paymentHistoryGapsJsonPath,
   resolveCompanyChallanFolder,
@@ -18,7 +20,7 @@ import {
   createIncomeTaxAxiosClient,
   loginIncomeTaxPortal,
   saveIncomeTaxUserProfile,
-} from "src/utils/incomeTaxPortalAuth"
+} from "src/shared/portals/incomeTax"
 
 const PAYMENT_HISTORY_URL =
   "https://eportal.incometax.gov.in/iec/paymentapi/auth/challan/paymenthistory"
@@ -47,43 +49,29 @@ async function fetchPaymentHistoryPage(
   pageSize: number,
   actType: "O" | "N" = "O"
 ): Promise<PaymentHistoryApiResponse> {
+  // Portal rejects pagination query params — pageNumber/pageSize must be in formData
   const res = await client.post(
     PAYMENT_HISTORY_URL,
-    buildPaymentHistoryRequestBody(tan, actType),
-    {
-      params: { pageNum, size: pageSize },
-    }
+    buildPaymentHistoryRequestBody(tan, actType, pageNum, pageSize)
   )
   return res.data as PaymentHistoryApiResponse
 }
 
-export async function fetchPaymentHistory(params: {
-  tan: string
-  itPassword: string
-  companyName: string
-  pageSize?: number
-  /** Income-tax Act: O = 1961 (old), N = 2025 (new). Default O. */
-  actType?: "O" | "N"
-}): Promise<{
-  payments: PaymentHistoryItem[]
-  gaps: PaymentHistoryGapsResult
-  contentJsonPath: string
-  gapsJsonPath: string
-}> {
-  const { tan, itPassword, companyName, pageSize = 50, actType = "O" } = params
-  const client = createIncomeTaxAxiosClient()
-
-  console.log(`[fetchPaymentHistory] Logging in for ${companyName} (${tan})...`)
-  await loginIncomeTaxPortal(client, tan, itPassword)
-  await saveIncomeTaxUserProfile(client, tan.toUpperCase())
-
-  const allPayments: PaymentHistoryItem[] = []
-  const seenCins = new Set<string>()
+async function fetchAllPagesForAct(
+  client: AxiosInstance,
+  tan: string,
+  pageSize: number,
+  actType: "O" | "N",
+  seenCins: Set<string>,
+  allPayments: PaymentHistoryItem[]
+): Promise<void> {
   let pageNum = 0
   let totalPages = 1
 
   while (pageNum < totalPages) {
-    console.log(`[fetchPaymentHistory] Fetching page ${pageNum + 1}/${totalPages}...`)
+    console.log(
+      `[fetchPaymentHistory] actType=${actType} page ${pageNum + 1}/${totalPages}...`
+    )
     const data = await fetchPaymentHistoryPage(client, tan, pageNum, pageSize, actType)
 
     if (data.successFlag === false) {
@@ -94,30 +82,91 @@ export async function fetchPaymentHistory(params: {
 
     const content = data.paymentList?.content ?? []
     for (const item of content) {
-      if (item.cin && !seenCins.has(item.cin)) {
-        seenCins.add(item.cin)
-        allPayments.push(item)
-      }
+      if (!item.cin || seenCins.has(item.cin)) continue
+      seenCins.add(item.cin)
+      allPayments.push({
+        ...item,
+        actType: item.actType || actType,
+      })
     }
 
     totalPages = data.paymentList?.totalPages ?? pageNum + 1
     const isLast = data.paymentList?.last === true
 
     console.log(
-      `[fetchPaymentHistory] Page ${pageNum + 1}: ${content.length} rows, total collected: ${allPayments.length}`
+      `[fetchPaymentHistory] actType=${actType} page ${pageNum + 1}: ${content.length} rows, total collected: ${allPayments.length}`
     )
 
     pageNum++
     if (isLast) break
     await delay(400)
   }
+}
+
+export async function fetchPaymentHistory(params: {
+  tan: string
+  itPassword: string
+  companyName: string
+  pageSize?: number
+  /** Income-tax Act: O = 1961 (old), N = 2025 (new). Ignored when `acts` is set. */
+  actType?: "O" | "N"
+  /** Acts to fetch. Default both. */
+  acts?: Array<"O" | "N">
+  /** Filter by paymentTime Indian FY. Default last 2 FYs. Pass empty array to keep all. */
+  financialYears?: string[]
+}): Promise<{
+  payments: PaymentHistoryItem[]
+  gaps: PaymentHistoryGapsResult
+  contentJsonPath: string
+  gapsJsonPath: string
+  financialYears: string[]
+}> {
+  const {
+    tan,
+    itPassword,
+    companyName,
+    pageSize = 50,
+    actType,
+    acts,
+    financialYears: financialYearsParam,
+  } = params
+
+  const actsToFetch: Array<"O" | "N"> =
+    acts && acts.length > 0 ? acts : actType ? [actType] : ["O", "N"]
+
+  const financialYears =
+    financialYearsParam !== undefined
+      ? financialYearsParam
+      : getLastNIndianFinancialYears(2)
+
+  const client = createIncomeTaxAxiosClient()
+
+  console.log(`[fetchPaymentHistory] Logging in for ${companyName} (${tan})...`)
+  await loginIncomeTaxPortal(client, tan, itPassword)
+  await saveIncomeTaxUserProfile(client, tan.toUpperCase())
+
+  const allPayments: PaymentHistoryItem[] = []
+  const seenCins = new Set<string>()
+
+  for (const act of actsToFetch) {
+    await fetchAllPagesForAct(client, tan, pageSize, act, seenCins, allPayments)
+  }
+
+  const filteredPayments =
+    financialYears.length > 0
+      ? filterPaymentsByFinancialYears(allPayments, financialYears)
+      : allPayments
+
+  console.log(
+    `[fetchPaymentHistory] Raw ${allPayments.length} payments; after FY filter [${financialYears.join(", ") || "none"}]: ${filteredPayments.length}`
+  )
 
   const companyFolder = resolveCompanyChallanFolder(companyName)
   if (!fs.existsSync(companyFolder)) {
     fs.mkdirSync(companyFolder, { recursive: true })
   }
 
-  const gaps = analyzePaymentHistoryGaps(companyName, allPayments)
+  const gaps = analyzePaymentHistoryGaps(companyName, filteredPayments)
   const fetchedAt = new Date().toISOString()
 
   const contentJsonPath = paymentHistoryContentJsonPath(companyName)
@@ -130,8 +179,11 @@ export async function fetchPaymentHistory(params: {
         fetchedAt,
         companyName,
         tan: tan.toUpperCase(),
-        totalElements: allPayments.length,
-        payments: allPayments,
+        financialYears,
+        acts: actsToFetch,
+        totalElements: filteredPayments.length,
+        totalBeforeFyFilter: allPayments.length,
+        payments: filteredPayments,
       },
       null,
       2
@@ -145,6 +197,7 @@ export async function fetchPaymentHistory(params: {
       {
         fetchedAt,
         companyName,
+        financialYears,
         summary: gaps.summary,
         missing: gaps.missing,
         present: gaps.present,
@@ -156,16 +209,17 @@ export async function fetchPaymentHistory(params: {
   )
 
   console.log(
-    `[fetchPaymentHistory] Done: ${allPayments.length} payments, ${gaps.summary.pdfsMissing} missing PDFs`
+    `[fetchPaymentHistory] Done: ${filteredPayments.length} payments, ${gaps.summary.pdfsMissing} missing PDFs`
   )
   console.log(`[fetchPaymentHistory] Wrote ${contentJsonPath}`)
   console.log(`[fetchPaymentHistory] Wrote ${gapsJsonPath}`)
 
   return {
-    payments: allPayments,
+    payments: filteredPayments,
     gaps,
     contentJsonPath,
     gapsJsonPath,
+    financialYears,
   }
 }
 

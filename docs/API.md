@@ -11,17 +11,21 @@ Integration guide for external clients. All examples use **placeholder credentia
 ## Table of Contents
 
 1. [How to Call the API](#how-to-call-the-api)
-2. [Authentication](#authentication)
-3. [Job Monitoring (all async features)](#job-monitoring-all-async-features)
-4. [Conso Files](#conso-files)
-5. [Form 16 / Form 16A](#form-16--form-16a)
-6. [Justification Report](#justification-report)
-7. [Challan Status (TRACES)](#challan-status-traces)
-8. [Challan Management (Income Tax Portal)](#challan-management-income-tax-portal)
-9. [TLDC (Lower Deduction Certificates)](#tldc-lower-deduction-certificates)
-10. [Outstanding Demand](#outstanding-demand)
-11. [Return Status (TDS Returns)](#return-status-tds-returns)
-12. [Error Reference](#error-reference)
+2. [Downloads (PDF / Excel)](#downloads-pdf--excel)
+3. [Authentication](#authentication)
+4. [Job Monitoring (all async features)](#job-monitoring-all-async-features)
+5. [Conso Files](#conso-files)
+6. [Form 16 / Form 16A](#form-16--form-16a)
+7. [Justification Report](#justification-report)
+8. [Challan Status (TRACES)](#challan-status-traces)
+9. [Challan Management (Income Tax Portal)](#challan-management-income-tax-portal)
+10. [TLDC (Lower Deduction Certificates)](#tldc-lower-deduction-certificates)
+11. [LDC Utilisation](#ldc-utilisation)
+12. [Outstanding Demand](#outstanding-demand)
+13. [Return Status (TDS Returns)](#return-status-tds-returns)
+14. [Extract Form 140 / Acknowledgements](#extract-form-140--acknowledgements)
+15. [Extract RRR](#extract-rrr)
+16. [Error Reference](#error-reference)
 
 ---
 
@@ -87,6 +91,68 @@ Used by Conso, Form 16, Justification, and Challan Status uploads:
 | `it_password` | Income Tax e-filing portal password |
 | `user_id` | TRACES login user ID |
 | `password` | TRACES portal password |
+
+---
+
+## Downloads (PDF / Excel)
+
+Tabular features share one export endpoint. Portal download jobs keep writing files under `public/pdf/...` and are retrieved via the file API.
+
+### Shared tabular export
+
+```http
+POST /api/export/{feature}
+Authorization: Bearer tt_example_token_abc123def4567890
+Content-Type: application/json
+
+{
+  "format": "xlsx",
+  "companyId": 1,
+  "fy": "2024-25",
+  "search": "ABCDE1234F"
+}
+```
+
+| Path param `{feature}` | Description |
+|------------------------|-------------|
+| `tldc` | TLDC certificate rows |
+| `ldc-utilisation` | Limit / consumed / remaining / % |
+| `outstanding-demand` | Outstanding demand by company × FY |
+| `return-status` | TDS return status rows |
+| `rrr` | Last RRR extract (`public/pdf/return/rrr-extract/`) |
+| `form140` | Last Form 140 / 26Q extract (pass `formTypeCd`: `T140` or `F26Q`) |
+| `deductee-masters` | Deductee PAN/email masters |
+
+| Body field | Required | Description |
+|------------|----------|-------------|
+| `format` | yes | `xlsx`, `csv`, or `pdf` |
+| `companyId` | no | Filter by company |
+| `fy` | no | Financial year filter (where applicable) |
+| `search` | no | Text search (cert / PAN / name where applicable) |
+| `formTypeCd` | no | For `form140` only: `T140` (default) or `F26Q` |
+
+**Success:** binary file with `Content-Disposition: attachment; filename="..."`.
+
+**Empty data:** `404` `{ "success": false, "error": "No data to export for the selected filters" }`.
+
+### Portal file downloads
+
+After Conso / Form 16 / Justification / Challan jobs finish, files land under `public/pdf/...`. Fetch them with:
+
+```http
+GET /api/file/pdf/traces/Example%20Deductor%20Pvt%20Ltd/some-file.zip
+Authorization: Bearer tt_example_token_abc123def4567890
+```
+
+| Feature | Typical folder |
+|---------|----------------|
+| Conso / Justification | `public/pdf/traces/{Company}/` |
+| Conso Excel | `public/pdf/traces_excel/{Company}/` |
+| Form 16 / 16A | `public/pdf/form16-download/`, `public/pdf/form16a-download/` |
+| Challans | `public/pdf/challans/{Company}/...` |
+| TLDC certificate PDFs | `public/pdf/tldc-downloads/` |
+| RRR extract | `public/pdf/return/rrr-extract/` |
+| Form 140 / 26Q | `public/pdf/Acknowledgement/form140/` (or `form26q/`) |
 
 ---
 
@@ -346,6 +412,11 @@ Authorization: Bearer tt_example_token_abc123def4567890
 
 Consolidated TDS statement files from TRACES — **send request** (request generation) or **download file** (download ready files).
 
+### Downloads
+
+- Portal files: `public/pdf/traces/{Company}/` and Excel under `public/pdf/traces_excel/{Company}/`
+- Retrieve via `GET /api/file/pdf/traces/...` (see [Downloads (PDF / Excel)](#downloads-pdf--excel))
+
 ### Send Request
 
 Queues TRACES jobs to send conso file generation requests for selected FY / quarter / form type combinations.
@@ -440,6 +511,11 @@ Downloaded files are saved under the server `public/` directory by the backgroun
 ## Form 16 / Form 16A
 
 Certificate download and processing from TRACES.
+
+### Downloads
+
+- Portal ZIPs/PDFs: `public/pdf/form16-download/`, `public/pdf/form16a-download/`, company folders under `public/pdf/traces/{Company}/`
+- Retrieve via `GET /api/file/pdf/...` (see [Downloads (PDF / Excel)](#downloads-pdf--excel))
 
 ### Send Request
 
@@ -623,6 +699,11 @@ Authorization: Bearer tt_example_token_abc123def4567890
 
 Justification report send request and download from TRACES. Same pattern as Conso Files.
 
+### Downloads
+
+- Portal files: `public/pdf/traces/{Company}/`
+- Retrieve via `GET /api/file/pdf/traces/...` (see [Downloads (PDF / Excel)](#downloads-pdf--excel))
+
 ### Send Request
 
 ```http
@@ -707,6 +788,12 @@ Authorization: Bearer tt_example_token_abc123def4567890
 
 Downloads challan status / payment PDF information from TRACES for companies listed in the upload.
 
+### Downloads
+
+- Unconsumed Excel: `public/pdf/unconsumed_challan_results/`
+- Related payment PDFs via challan APIs under `public/pdf/challans/...`
+- Retrieve via `GET /api/file/pdf/...` (see [Downloads (PDF / Excel)](#downloads-pdf--excel))
+
 ### Download Challan Status
 
 ```http
@@ -756,6 +843,13 @@ Authorization: Bearer tt_example_token_abc123def4567890
 ## Challan Management (Income Tax Portal)
 
 Create and download challans via the Income Tax e-filing portal. These are **REST** endpoints (no `params` wrapper).
+
+### Downloads
+
+- Receipt / payment PDFs: `public/pdf/challans/{Company}/...` (PaymentHistory, GeneratedChallans, CSI)
+- Excel rebuilds: `public/pdf/challans-excel-export/`
+- Retrieve via `GET /api/file/pdf/challans/...` (see [Downloads (PDF / Excel)](#downloads-pdf--excel))
+- Also: `POST /api/challan/download-csi`, `download-payment`, `download-generated-challans`, `download-missing-payment-pdfs`, `download-pdfs-from-unconsumed-excel`, `download-pdfs-from-uploaded-excels`
 
 ### Create Challans
 
@@ -947,7 +1041,12 @@ Authorization: Bearer tt_example_token_abc123def4567890
 
 ## TLDC (Lower Deduction Certificates)
 
-### Fetch from TRACES portal
+### Downloads
+
+- Tabular export: `POST /api/export/tldc` with `{ "format": "xlsx" | "csv" | "pdf", "companyId?", "fy?", "search?" }`
+- Certificate PDFs from portal: `public/pdf/tldc-downloads/` via `GET /api/file/pdf/tldc-downloads/...`
+
+### Fetch from TRACES portal (Old Act)
 
 ```http
 POST /api/tldc/fetch-data
@@ -986,7 +1085,45 @@ Authorization: Bearer tt_example_token_abc123def4567890
 
 ---
 
-### Refresh existing records
+### Fetch from TRACES portal (New Act)
+
+```http
+POST /api/tldc/fetch-data-new-act
+Authorization: Bearer tt_example_token_abc123def4567890
+
+{
+  "tan": "MUMB12345E",
+  "year": "2026-27",
+  "companyId": 1,
+  "initiateIfNoRequest": true,
+  "forceInitiate": false,
+  "credentials": {
+    "userId": "traces_deductor_user_id",
+    "password": "traces_portal_password",
+    "tan": "MUMB12345E"
+  }
+}
+```
+
+### Refresh existing records (New Act)
+
+```http
+POST /api/tldc/update-data-new-act
+Authorization: Bearer tt_example_token_abc123def4567890
+
+{
+  "tan": "MUMB12345E",
+  "year": "2026-27",
+  "companyId": 1,
+  "credentials": {
+    "userId": "traces_deductor_user_id",
+    "password": "traces_portal_password",
+    "tan": "MUMB12345E"
+  }
+}
+```
+
+### Refresh existing records (Old Act)
 
 ```http
 POST /api/tldc/update-data
@@ -1050,7 +1187,40 @@ Authorization: Bearer tt_example_token_abc123def4567890
 
 ---
 
+## LDC Utilisation
+
+Certificate utilisation (limit vs consumed) derived from stored TLDC rows. Refresh numbers by running TLDC fetch/update first.
+
+### Downloads
+
+- `POST /api/export/ldc-utilisation` with `{ "format": "xlsx" | "csv" | "pdf", "companyId?", "fy?", "search?" }`
+
+### List utilisation (RPC)
+
+```http
+POST /api/rpc/getLdcUtilisation
+Authorization: Bearer tt_example_token_abc123def4567890
+
+{
+  "params": {
+    "where": { "companyId": 1, "fy": "2024-25" },
+    "skip": 0,
+    "take": 50,
+    "search": "ABCDE1234F"
+  },
+  "meta": {}
+}
+```
+
+**Response fields per row:** `amountLimit`, `amountConsumed`, `amountRemaining`, `utilisationPct`, plus certificate identity (`certNumber`, `pan`, `section`, `fy`, company, …).
+
+---
+
 ## Outstanding Demand
+
+### Downloads
+
+- `POST /api/export/outstanding-demand` with `{ "format": "xlsx" | "csv" | "pdf", "companyId?", "fy?" }`
 
 ### Fetch from Income Tax portal
 
@@ -1130,6 +1300,10 @@ Authorization: Bearer tt_example_token_abc123def4567890
 
 ## Return Status (TDS Returns)
 
+### Downloads
+
+- `POST /api/export/return-status` with `{ "format": "xlsx" | "csv" | "pdf", "companyId?", "fy?" }`
+
 ### Fetch from portal
 
 ```http
@@ -1191,6 +1365,60 @@ Authorization: Bearer tt_example_token_abc123def4567890
 
 ---
 
+## Extract Form 140 / Acknowledgements
+
+Pull acknowledgement / Form 140 (or Form 26Q) receipts from the Income Tax portal for selected companies.
+
+### Downloads
+
+- Tabular export: `POST /api/export/form140` with `{ "format": "xlsx" | "csv" | "pdf", "formTypeCd": "T140" | "F26Q" }`
+- Server also writes Excel/JSON under `public/pdf/Acknowledgement/form140/` (or `form26q/`)
+- Receipt PDFs under the same tree; retrieve via `GET /api/file/pdf/Acknowledgement/...`
+
+### Extract
+
+```http
+POST /api/form140/extract
+Authorization: Bearer tt_example_token_abc123def4567890
+
+{
+  "companyIds": [1, 2],
+  "formTypeCd": "T140",
+  "financialYears": ["2024-25"],
+  "quarters": ["Q1", "Q2"],
+  "concurrency": 2
+}
+```
+
+---
+
+## Extract RRR
+
+Extract RRR / acknowledgement numbers from the Income Tax portal for selected companies, FYs, quarters, and form types.
+
+### Downloads
+
+- Tabular export: `POST /api/export/rrr` with `{ "format": "xlsx" | "csv" | "pdf" }`
+- Aggregate files: `public/pdf/return/rrr-extract/rrr_extract.csv` and `.json`
+- Retrieve via `GET /api/file/pdf/return/rrr-extract/...`
+
+### Extract
+
+```http
+POST /api/rrr/extract
+Authorization: Bearer tt_example_token_abc123def4567890
+
+{
+  "companyIds": [1, 2],
+  "financialYears": ["2024-25"],
+  "quarters": ["Q1"],
+  "formTypes": ["24Q", "26Q"],
+  "concurrency": 2
+}
+```
+
+---
+
 ## Error Reference
 
 | Status | When | Example body |
@@ -1215,6 +1443,8 @@ Authorization: Bearer tt_example_token_abc123def4567890
 
 | Feature | Operation | Method | Path |
 |---------|-----------|--------|------|
+| Export | Excel / CSV / PDF | POST | `/api/export/{feature}` |
+| Files | Portal download | GET | `/api/file/{slug}` |
 | Conso | Send request | POST | `/api/rpc/processExcelUploadConso` |
 | Conso | Download file | POST | `/api/rpc/processExcelUploadConso` |
 | Form 16 | Send request | POST | `/api/rpc/processExcelUploadForm16` |
@@ -1228,7 +1458,14 @@ Authorization: Bearer tt_example_token_abc123def4567890
 | Challan | Download | POST | `/api/challan/download` |
 | Challan | Payment history | POST | `/api/challan/fetch-payment-history` |
 | Challan | Payment PDFs | POST | `/api/challan/download-payment` |
+| Challan | CSI download | POST | `/api/challan/download-csi` |
 | Payment gaps | Read cache | GET | `/api/challan/payment-history-gaps` |
+| TLDC | Fetch (Old Act) | POST | `/api/tldc/fetch-data` |
+| TLDC | Fetch (New Act) | POST | `/api/tldc/fetch-data-new-act` |
+| TLDC | Update (New Act) | POST | `/api/tldc/update-data-new-act` |
+| LDC utilisation | List | POST | `/api/rpc/getLdcUtilisation` |
+| Form 140 | Extract | POST | `/api/form140/extract` |
+| RRR | Extract | POST | `/api/rrr/extract` |
 | Jobs | Monitor batch | POST | `/api/rpc/getTaskBatch` |
 | Auth | Create token | POST | `/api/rpc/createApiToken` |
 

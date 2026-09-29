@@ -1,4 +1,4 @@
-import React, { useState } from "react"
+import React, { useEffect, useMemo, useRef, useState } from "react"
 import {
   Button,
   Table,
@@ -12,6 +12,7 @@ import {
   Radio,
   Divider,
   Checkbox,
+  Modal,
 } from "antd"
 import type { ColumnsType } from "antd/es/table"
 import {
@@ -25,19 +26,28 @@ import {
   MailOutlined,
   LockOutlined,
   DeleteOutlined,
+  ReloadOutlined,
 } from "@ant-design/icons"
 import { useMutation, useQuery } from "@blitzjs/rpc"
 import Layout from "src/core/layouts/Layout"
-import processExcelUpload from "src/companies/mutations/processExcelUploadForm16"
+import processExcelUpload from "src/form16/mutations/processExcelUploadForm16"
 import getUploadHistory from "src/companies/queries/getUploadHistory"
 import getCompanies from "src/companies/queries/getCompanies"
 import sendForm16Emails from "src/companies/mutations/sendForm16Emails"
 import deleteUploadHistory from "src/companies/mutations/deleteUploadHistory"
 import generateForm16PdfsFromZips from "src/companies/mutations/generateForm16PdfsFromZips"
+import getForm16BatchProgress from "src/tasks/queries/getForm16BatchProgress"
+import retryFailedForm16BatchTasks from "src/tasks/mutations/retryFailedForm16BatchTasks"
 import * as XLSX from "xlsx"
 import dayjs from "dayjs"
 import "dayjs/locale/en-gb"
 import { ConfigProvider, Input } from "antd"
+import { readCompanyCredentialsFromFile } from "src/shared/ui/readCompanyCredentialsFile"
+import { CompanyCredentialsUpload } from "src/shared/ui/CompanyCredentialsUpload"
+import { UploadHistoryTable } from "src/shared/ui/UploadHistoryTable"
+import { BatchProgressPoller } from "src/shared/ui/BatchProgressPoller"
+import { UploadHistoryStatusTag } from "src/shared/ui/UploadHistoryStatusTag"
+import { DscCertificatePicker } from "src/form16/components/DscCertificatePicker"
 import enGB from "antd/lib/locale/en_GB"
 
 // Set dayjs locale to en-gb (starts week on Monday)
@@ -51,36 +61,23 @@ interface CompanyData {
   password: string
 }
 
-interface UploadHistoryRecord {
-  id: number
-  companyName: string
-  tan: string
-  status: string
-  filePath: string | null
-  financialYear: string
-  quarter: string
-  errorMessage: string | null
-  createdAt: Date
-  updatedAt: Date
-  batchId: number | null
-}
 
 function Form16Page() {
   const [messageApi, contextHolder] = message.useMessage()
   const [processExcelUploadMutation] = useMutation(processExcelUpload)
   const [sendForm16EmailsMutation] = useMutation(sendForm16Emails)
   const [deleteUploadHistoryMutation] = useMutation(deleteUploadHistory)
+  const [retryFailedForm16Mutation] = useMutation(retryFailedForm16BatchTasks)
   const [form16Type, setForm16Type] = useState<"form16" | "form16a">("form16")
+  const [portalMode, setPortalMode] = useState<"new" | "old">("new")
   const [uploadHistoryResponse, { refetch }] = useQuery(
     getUploadHistory,
     {
       skip: 0,
       take: 100,
       type: form16Type,
-      batchId: 3,
     },
     {
-      // Refetch when form16Type changes
       refetchOnMount: true,
     }
   )
@@ -90,8 +87,8 @@ function Form16Page() {
   const [dataSource, setDataSource] = useState<"excel" | "companies">("companies")
   const [actionType, setActionType] = useState<"send_request" | "download_file" | "sign_pdf">("download_file")
   const [sendToAllPeriods, setSendToAllPeriods] = useState<boolean>(false)
-  const [financialYear, setFinancialYear] = useState<string[]>([])
-  const [quarter, setQuarter] = useState<string[]>([])
+  const [financialYear, setFinancialYear] = useState<string[]>(["2026-27"])
+  const [quarter, setQuarter] = useState<string[]>(["Q1"])
   const [formType, setFormType] = useState<string[]>([])
   const [loading, setLoading] = useState(false)
   const [fileList, setFileList] = useState<any[]>([])
@@ -107,6 +104,11 @@ function Form16Page() {
   const [certificateName, setCertificateName] = useState("")
   const [selectedHistoryRowKeys, setSelectedHistoryRowKeys] = useState<number[]>([])
   const [deleteHistoryLoading, setDeleteHistoryLoading] = useState(false)
+  const [activeBatchId, setActiveBatchId] = useState<number | null>(null)
+  const [retrying, setRetrying] = useState(false)
+  const [retryModalOpen, setRetryModalOpen] = useState(false)
+  const [selectedFailedTaskIds, setSelectedFailedTaskIds] = useState<number[]>([])
+  const wasBatchCompleteRef = useRef(false)
 
   // === NEW: Generate PDFs from existing local ZIP folder (separate feature) ===
   const [generateZipMutation] = useMutation(generateForm16PdfsFromZips)
@@ -128,6 +130,88 @@ function Form16Page() {
 
   const savedCompanies = companiesResponse?.companies || []
   const uploadHistoryRecords = uploadHistoryResponse?.uploadHistory || []
+
+  const [batchProgress, { refetch: refetchProgress }] = useQuery(
+    getForm16BatchProgress,
+    { batchId: activeBatchId || 0 },
+    {
+      enabled: !!activeBatchId,
+      refetchInterval: activeBatchId ? 2000 : false,
+      suspense: false,
+    }
+  )
+
+  useEffect(() => {
+    wasBatchCompleteRef.current = false
+    setRetryModalOpen(false)
+    setSelectedFailedTaskIds([])
+  }, [activeBatchId])
+
+  useEffect(() => {
+    if (!activeBatchId || batchProgress?.batchId !== activeBatchId) return
+    const complete = Boolean(batchProgress?.isComplete)
+    const failedItems = (batchProgress?.items || []).filter((i) => i.status === "Failed")
+    if (complete && !wasBatchCompleteRef.current && failedItems.length > 0) {
+      setSelectedFailedTaskIds(failedItems.map((i) => i.taskId))
+      setRetryModalOpen(true)
+      void refetch()
+    }
+    if (batchProgress?.batchId === activeBatchId) {
+      wasBatchCompleteRef.current = complete
+    }
+  }, [activeBatchId, batchProgress?.batchId, batchProgress?.isComplete, batchProgress?.items, refetch])
+
+  const failedProgressItems = useMemo(
+    () => (batchProgress?.items || []).filter((i) => i.status === "Failed"),
+    [batchProgress?.items]
+  )
+
+  const handleRetryFailedTasks = async (taskIds?: number[]) => {
+    if (!activeBatchId) return
+    const ids = taskIds && taskIds.length > 0 ? taskIds : selectedFailedTaskIds
+    if (!ids.length) {
+      messageApi.warning("Select at least one failed task to retry")
+      return
+    }
+    setRetrying(true)
+    try {
+      const result = await retryFailedForm16Mutation({
+        batchId: activeBatchId,
+        taskIds: ids,
+      })
+      messageApi.success(result.message)
+      setRetryModalOpen(false)
+      setSelectedFailedTaskIds([])
+      await refetchProgress()
+      await refetch()
+    } catch (error: any) {
+      messageApi.error(error.message || "Retry failed")
+    } finally {
+      setRetrying(false)
+    }
+  }
+
+  const retryModalColumns: ColumnsType<any> = [
+    { title: "Company", dataIndex: "companyName", key: "companyName", width: 200 },
+    { title: "TAN", dataIndex: "tan", key: "tan", width: 120 },
+    { title: "FY", dataIndex: "financialYear", key: "financialYear", width: 100 },
+    { title: "Quarter", dataIndex: "quarter", key: "quarter", width: 80 },
+    { title: "Form", dataIndex: "formType", key: "formType", width: 80 },
+    {
+      title: "Status",
+      dataIndex: "status",
+      key: "status",
+      width: 110,
+      render: (status: string) => <UploadHistoryStatusTag status={status} />,
+    },
+    {
+      title: "Error",
+      dataIndex: "errorMessage",
+      key: "errorMessage",
+      ellipsis: true,
+      render: (msg: string | null) => msg || "-",
+    },
+  ]
 
   const handleSelectFailedHistory = () => {
     const failedIds = uploadHistoryRecords.filter((r) => r.status === "Failed").map((r) => r.id)
@@ -206,7 +290,12 @@ function Form16Page() {
   }
 
   // Generate financial year options
+  const useNewPortalForm16a = form16Type === "form16a" && portalMode === "new"
+
   const generateFinancialYears = (): Array<{ label: string; value: string }> => {
+    if (useNewPortalForm16a) {
+      return [{ label: "2026-27", value: "2026-27" }]
+    }
     const currentYear = new Date().getFullYear()
     const years: Array<{ label: string; value: string }> = []
     for (let i = 0; i < 10; i++) {
@@ -219,71 +308,32 @@ function Form16Page() {
     return years
   }
 
-  const quarterOptions = [
-    { label: "Q1 (Apr-Jun)", value: "Q1" },
-    { label: "Q2 (Jul-Sep)", value: "Q2" },
-    { label: "Q3 (Oct-Dec)", value: "Q3" },
-    { label: "Q4 (Jan-Mar)", value: "Q4" },
-  ]
+  const quarterOptions = useNewPortalForm16a
+    ? [{ label: "Q1 (Apr-Jun)", value: "Q1" }]
+    : [
+        { label: "Q1 (Apr-Jun)", value: "Q1" },
+        { label: "Q2 (Jul-Sep)", value: "Q2" },
+        { label: "Q3 (Oct-Dec)", value: "Q3" },
+        { label: "Q4 (Jan-Mar)", value: "Q4" },
+      ]
 
-  const formTypeOptions = [
-    { label: "24Q", value: "24Q" },
-    { label: "26Q", value: "26Q" },
-    { label: "27Q", value: "27Q" },
-    { label: "27EQ", value: "27EQ" },
-  ]
+  const formTypeOptions = useNewPortalForm16a
+    ? [
+        { label: "130", value: "130" },
+        { label: "131", value: "131" },
+        { label: "133", value: "133" },
+      ]
+    : [
+        { label: "24Q", value: "24Q" },
+        { label: "26Q", value: "26Q" },
+        { label: "27Q", value: "27Q" },
+        { label: "27EQ", value: "27EQ" },
+      ]
 
-  const handleFileUpload = async (file: File) => {
-    try {
-      const reader = new FileReader()
-      reader.onload = (e) => {
-        try {
-          const data = new Uint8Array(e.target?.result as ArrayBuffer)
-          const workbook = XLSX.read(data, { type: "array" })
-          const sheetName = workbook.SheetNames[0]
-          if (!sheetName) {
-            throw new Error("No sheets found in Excel file")
-          }
-          const worksheet = workbook.Sheets[sheetName]
-          const jsonData = XLSX.utils.sheet_to_json(worksheet!) as any[]
-
-          console.log(jsonData)
-
-          // Validate and transform data
-          const companies: CompanyData[] = jsonData.map((row, index) => {
-            if (
-              !row["Company Name"] ||
-              !row["Tan"] ||
-              !row["IT Password"] ||
-              !row["User ID"] ||
-              !row["Password"]
-            ) {
-              throw new Error(`Missing required fields in row ${index + 1}`)
-            }
-
-            return {
-              name: String(row["Company Name"]).trim(),
-              tan: String(row["Tan"]).trim().toUpperCase(),
-              it_password: String(row["IT Password"]).trim(),
-              user_id: String(row["User ID"]).trim(),
-              password: String(row["Password"]).trim(),
-            }
-          })
-
-          setExcelData(companies)
-          setFileList([file])
-          messageApi.success(`Successfully loaded ${companies.length} companies from Excel`)
-        } catch (error: any) {
-          messageApi.error(error.message || "Failed to parse Excel file")
-          setFileList([])
-        }
-      }
-      reader.readAsArrayBuffer(file)
-    } catch (error: any) {
-      messageApi.error(error.message || "Failed to read file")
-    }
-    return false // Prevent automatic upload
-  }
+  /** New portal Form 16A needs FY/Q/form for both send and download. Old portal only for send. */
+  const needsPeriodSelection = useNewPortalForm16a
+    ? actionType === "send_request" || actionType === "download_file"
+    : actionType === "send_request"
 
   const handleSendEmails = async () => {
     // Get company name if company is selected
@@ -342,8 +392,8 @@ function Form16Page() {
         }))
     }
 
-    // Validation for send_request action
-    if (actionType === "send_request" && !sendToAllPeriods) {
+    // Validation when period selection is required
+    if (needsPeriodSelection && !sendToAllPeriods) {
       if (!financialYear || financialYear.length === 0) {
         messageApi.error("Please select at least one financial year")
         return
@@ -361,20 +411,24 @@ function Form16Page() {
     }
 
     if (actionType === "sign_pdf" && !certificateName) {
-      messageApi.error("Please enter Certificate Name")
+      messageApi.error("Please select a DSC certificate")
+      return
     }
+
+    const passPeriods = needsPeriodSelection && !sendToAllPeriods
 
     setLoading(true)
     try {
-      await processExcelUploadMutation({
+      const result = await processExcelUploadMutation({
         companies: companies,
-        financialYear: actionType === "send_request" && !sendToAllPeriods ? financialYear : [],
-        quarter: actionType === "send_request" && !sendToAllPeriods ? quarter : [],
-        formType: actionType === "send_request" && !sendToAllPeriods ? formType : [],
+        financialYear: passPeriods ? financialYear : [],
+        quarter: passPeriods ? quarter : [],
+        formType: passPeriods ? formType : [],
         actionType,
         sendToAllPeriods: actionType === "send_request" ? sendToAllPeriods : false,
-        jobTypes: actionType === "send_request" ? ["SendRequest"] : ["DownloadFile"], // Default job type, can be made configurable
-        form16Type, // Pass the form 16 type (form16 or form16a)
+        jobTypes: actionType === "send_request" ? ["SendRequest"] : ["DownloadFile"],
+        form16Type,
+        portalMode: form16Type === "form16a" ? portalMode : undefined,
         certificateName
       })
 
@@ -383,15 +437,32 @@ function Form16Page() {
           ? sendToAllPeriods
             ? "Send request jobs for all periods added to queue successfully"
             : "Send request jobs added to queue successfully"
-          : "Download jobs added to queue successfully"
+          : actionType === "sign_pdf"
+            ? "Attach DSC completed"
+            : "Download jobs added to queue successfully"
       messageApi.success(actionMessage)
+
+      if (
+        actionType !== "sign_pdf" &&
+        result &&
+        typeof result === "object" &&
+        "batchId" in result &&
+        typeof (result as { batchId?: number }).batchId === "number"
+      ) {
+        setActiveBatchId((result as { batchId: number }).batchId)
+      }
 
       setExcelData([])
       setFileList([])
       setSelectedCompanyIds([])
       setSendToAllPeriods(false)
-      setFinancialYear([])
-      setQuarter([])
+      if (form16Type === "form16a" && portalMode === "new") {
+        setFinancialYear(["2026-27"])
+        setQuarter(["Q1"])
+      } else {
+        setFinancialYear([])
+        setQuarter([])
+      }
       setFormType([])
       await refetch()
     } catch (error: any) {
@@ -401,155 +472,7 @@ function Form16Page() {
     }
   }
 
-  const getStatusTag = (status: string) => {
-    switch (status) {
-      case "Success":
-        return (
-          <Tag icon={<CheckCircleOutlined />} color="success">
-            Success
-          </Tag>
-        )
-      case "Failed":
-        return (
-          <Tag icon={<CloseCircleOutlined />} color="error">
-            Failed
-          </Tag>
-        )
-      case "Processing":
-        return (
-          <Tag icon={<SyncOutlined spin />} color="processing">
-            Processing
-          </Tag>
-        )
-      default:
-        return <Tag>{status}</Tag>
-    }
-  }
 
-  const columns: ColumnsType<UploadHistoryRecord> = [
-    {
-      title: "Company Name",
-      dataIndex: "companyName",
-      key: "companyName",
-      width: 150,
-    },
-    {
-      title: "TAN",
-      dataIndex: "tan",
-      key: "tan",
-      width: 120,
-    },
-    {
-      title: "Financial Year",
-      dataIndex: "financialYear",
-      key: "financialYear",
-      width: 120,
-    },
-    {
-      title: "Quarter",
-      dataIndex: "quarter",
-      key: "quarter",
-      width: 100,
-    },
-    {
-      title: "Status",
-      dataIndex: "status",
-      key: "status",
-      render: (status: string) => getStatusTag(status),
-      width: 120,
-    },
-    {
-      title: "Details",
-      dataIndex: "errorMessage",
-      key: "details",
-      render: (error: string | null) => {
-        if (!error) return "-"
-
-        // Try to parse as JSON first (new format)
-        try {
-          const data = JSON.parse(error)
-
-          if (data.combinations && Array.isArray(data.combinations)) {
-            // New format with combinations
-            return (
-              <Space direction="vertical" size="small" style={{ maxWidth: 300 }}>
-                <Tag color="blue">{data.action}</Tag>
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
-                  {data.combinations.map((combo: any, index: number) => {
-                    const statusColor =
-                      combo.status === "Success"
-                        ? "green"
-                        : combo.status === "Failed"
-                        ? "red"
-                        : "orange"
-
-                    const label =
-                      combo.formType !== "N/A"
-                        ? `${combo.financialYear} ${combo.quarter} ${combo.formType}`
-                        : `${combo.financialYear} ${combo.quarter}`
-
-                    return combo.formType !== "N/A" ? (
-                      <Tag
-                        key={index}
-                        color={statusColor}
-                        icon={
-                          combo.status === "Success" ? (
-                            <CheckCircleOutlined />
-                          ) : combo.status === "Failed" ? (
-                            <CloseCircleOutlined />
-                          ) : (
-                            <SyncOutlined spin />
-                          )
-                        }
-                        title={combo.errorMessage || combo.status}
-                        style={{ marginBottom: 2 }}
-                      >
-                        {label}
-                      </Tag>
-                    ) : null
-                  })}
-                </div>
-              </Space>
-            )
-          } else if (data.error) {
-            // Error format
-            return (
-              <Space direction="vertical" size="small">
-                <Tag color="blue">{data.action}</Tag>
-                <Tag color="red">Error: {data.error}</Tag>
-              </Space>
-            )
-          }
-        } catch (e) {
-          // Not JSON, try old format
-          if (error.includes("Form Type:")) {
-            const formTypeMatch = error.match(/Form Type: (\w+)/)
-            const actionMatch = error.match(/Action: ([^,]+)/)
-
-            return (
-              <Space direction="vertical" size="small">
-                <Tag color="blue">{actionMatch?.[1] || "N/A"}</Tag>
-                {formTypeMatch && <Tag color="purple">{formTypeMatch[1]}</Tag>}
-              </Space>
-            )
-          } else if (error.includes("Action:")) {
-            const actionMatch = error.match(/Action: ([^,]+)/)
-            return <Tag color="green">{actionMatch?.[1] || "Download"}</Tag>
-          }
-        }
-
-        return error
-      },
-      width: 320,
-    },
-    {
-      title: "Date",
-      dataIndex: "createdAt",
-      key: "createdAt",
-      render: (date: Date) => dayjs(date).format("DD/MM/YYYY HH:mm"),
-      width: 150,
-    },
-  ]
 
   return (
     <ConfigProvider locale={enGB}>
@@ -659,20 +582,22 @@ function Form16Page() {
                   type="info"
                   showIcon
                 />
-                <Upload
-                  beforeUpload={handleFileUpload}
+                <CompanyCredentialsUpload
                   fileList={fileList}
-                  onRemove={() => {
+                  onFileListChange={setFileList}
+                  onParsed={(companies) => {
+                    setExcelData(companies)
+                    if (companies.length > 0) {
+                      messageApi.success(`Successfully loaded ${companies.length} companies from Excel`)
+                    }
+                  }}
+                  onError={(msg) => {
+                    messageApi.error(msg)
                     setFileList([])
-                    setExcelData([])
                   }}
                   accept=".xlsx,.xls"
-                  maxCount={1}
-                >
-                  <Button icon={<UploadOutlined />} size="large">
-                    Select Excel File
-                  </Button>
-                </Upload>
+                  buttonText="Select Excel File"
+                />
 
                 {excelData.length > 0 && (
                   <Alert
@@ -692,7 +617,18 @@ function Form16Page() {
               </label>
               <Radio.Group
                 value={form16Type}
-                onChange={(e) => setForm16Type(e.target.value)}
+                onChange={(e) => {
+                  const next = e.target.value as "form16" | "form16a"
+                  setForm16Type(next)
+                  setFormType([])
+                  if (next === "form16a" && portalMode === "new") {
+                    setFinancialYear(["2026-27"])
+                    setQuarter(["Q1"])
+                  } else {
+                    setFinancialYear([])
+                    setQuarter([])
+                  }
+                }}
                 style={{ width: "100%" }}
               >
                 <Space direction="horizontal" size="large">
@@ -706,6 +642,45 @@ function Form16Page() {
               </Radio.Group>
             </div>
 
+            {form16Type === "form16a" && (
+              <div style={{ marginBottom: 20 }}>
+                <label style={{ display: "block", marginBottom: 12, fontWeight: 600, fontSize: 16 }}>
+                  Portal Method *
+                </label>
+                <Radio.Group
+                  value={portalMode}
+                  onChange={(e) => {
+                    const next = e.target.value as "new" | "old"
+                    setPortalMode(next)
+                    setFormType([])
+                    if (next === "new") {
+                      setFinancialYear(["2026-27"])
+                      setQuarter(["Q1"])
+                    } else {
+                      setFinancialYear([])
+                      setQuarter([])
+                    }
+                  }}
+                  style={{ width: "100%" }}
+                >
+                  <Space direction="vertical" size="middle">
+                    <Radio value="new">
+                      <span>
+                        <strong>New Portal (REST)</strong> — forms 130/131/133, FY 2026-27 Q1 via
+                        tdscertificatesservice
+                      </span>
+                    </Radio>
+                    <Radio value="old">
+                      <span>
+                        <strong>Old Portal (Puppeteer)</strong> — traces61 bulk Form 16A download /
+                        send (24Q/26Q/27Q/27EQ)
+                      </span>
+                    </Radio>
+                  </Space>
+                </Radio.Group>
+              </div>
+            )}
+
             <Divider />
 
             <div style={{ marginBottom: 20 }}>
@@ -714,7 +689,12 @@ function Form16Page() {
               </label>
               <Radio.Group
                 value={actionType}
-                onChange={(e) => setActionType(e.target.value)}
+                onChange={(e) => {
+                  setActionType(e.target.value)
+                  if (e.target.value !== "send_request") {
+                    setSendToAllPeriods(false)
+                  }
+                }}
                 style={{ width: "100%" }}
               >
                 <Space direction="vertical" size="middle">
@@ -734,11 +714,11 @@ function Form16Page() {
                       </span>
                     </Space>
                   </Radio>
-                    <Radio value="sign_pdf">
+                  <Radio value="sign_pdf">
                     <Space>
                       <LockOutlined />
                       <span>
-                        <strong>Attach DSC</strong> - Digitally Sign PDF files
+                        <strong>Attach DSC</strong> - Digitally Sign PDF files (manual fallback)
                       </span>
                     </Space>
                   </Radio>
@@ -746,44 +726,68 @@ function Form16Page() {
               </Radio.Group>
             </div>
 
-            {actionType === "send_request" && (
+            {form16Type === "form16a" && actionType === "download_file" && (
+              <Alert
+                type="info"
+                showIcon
+                style={{ marginTop: 16, marginBottom: 8 }}
+                message="Auto-attach DSC after PDF generation"
+                description="When Form 16A PDFs are generated, the job signs them automatically if the company has a DSC Certificate Name (Companies page) or an entry in pdf-signer/dsc-map.json (TAN or company name → Windows cert subject). If no DSC is configured, download still succeeds and PDFs stay unsigned — use Attach DSC manually as a fallback."
+              />
+            )}
+
+            {needsPeriodSelection && (
               <>
                 <Divider orientation="left">Request Options</Divider>
-                <div style={{ marginBottom: 20 }}>
-                  <label
-                    style={{ display: "block", marginBottom: 12, fontWeight: 600, fontSize: 16 }}
-                  >
-                    Period Selection *
-                  </label>
-                  <Radio.Group
-                    value={sendToAllPeriods ? "all_periods" : "specific_period"}
-                    onChange={(e) => setSendToAllPeriods(e.target.value === "all_periods")}
-                    style={{ width: "100%" }}
-                  >
-                    <Space direction="vertical" size="middle">
-                      <Radio value="specific_period">
-                        <Space>
-                          <span>
-                            <strong>Specific Period</strong> - Select specific financial year,
-                            quarter, and form type
-                          </span>
-                        </Space>
-                      </Radio>
-                      <Radio value="all_periods">
-                        <Space>
-                          <span>
-                            <strong>All Periods</strong> - Send requests for all possible years,
-                            quarters, and form types
-                          </span>
-                        </Space>
-                      </Radio>
-                    </Space>
-                  </Radio.Group>
-                </div>
+                {actionType === "send_request" && (
+                  <div style={{ marginBottom: 20 }}>
+                    <label
+                      style={{ display: "block", marginBottom: 12, fontWeight: 600, fontSize: 16 }}
+                    >
+                      Period Selection *
+                    </label>
+                    <Radio.Group
+                      value={sendToAllPeriods ? "all_periods" : "specific_period"}
+                      onChange={(e) => setSendToAllPeriods(e.target.value === "all_periods")}
+                      style={{ width: "100%" }}
+                    >
+                      <Space direction="vertical" size="middle">
+                        <Radio value="specific_period">
+                          <Space>
+                            <span>
+                              <strong>Specific Period</strong> - Select specific financial year,
+                              quarter, and form type
+                            </span>
+                          </Space>
+                        </Radio>
+                        <Radio value="all_periods">
+                          <Space>
+                            <span>
+                              <strong>All Periods</strong> -{" "}
+                              {useNewPortalForm16a
+                                ? "Send requests for 2026-27 Q1 forms 130, 131, 133"
+                                : "Send requests for all possible years, quarters, and form types"}
+                            </span>
+                          </Space>
+                        </Radio>
+                      </Space>
+                    </Radio.Group>
+                  </div>
+                )}
 
-                {!sendToAllPeriods && (
+                {(!sendToAllPeriods || actionType === "download_file") && (
                   <>
-                    <Divider orientation="left">Request Details</Divider>
+                    <Divider orientation="left">
+                      {useNewPortalForm16a ? "Certificate Details (New Portal)" : "Request Details"}
+                    </Divider>
+                    {useNewPortalForm16a && (
+                      <Alert
+                        type="info"
+                        showIcon
+                        style={{ marginBottom: 16 }}
+                        message="Form 16A New Portal uses TRACES REST (tdscertificatesservice). Select form type(s) 130, 131, or 133 for FY 2026-27 Q1."
+                      />
+                    )}
                     <Space
                       direction="vertical"
                       size="middle"
@@ -836,8 +840,16 @@ function Form16Page() {
               </>
             )}
 
-            {actionType === "sign_pdf" && (
-              <Input placeholder="Certificate Name..." value={certificateName} onChange={e => setCertificateName(e.target.value)} />
+            {(actionType === "sign_pdf" || actionType === "download_file") && (
+              <DscCertificatePicker
+                value={certificateName}
+                onChange={setCertificateName}
+                hint={
+                  actionType === "sign_pdf"
+                    ? "Signs the PDFs already generated for the selected companies."
+                    : "Signs each certificate as it is generated. Leave empty to use the company's own DSC setting."
+                }
+              />
             )}
             <Button
               type="primary"
@@ -848,7 +860,7 @@ function Form16Page() {
                 (dataSource === "excel"
                   ? excelData.length === 0
                   : selectedCompanyIds.length === 0) ||
-                (actionType === "send_request" &&
+                (needsPeriodSelection &&
                   !sendToAllPeriods &&
                   (financialYear.length === 0 || quarter.length === 0 || formType.length === 0))
               }
@@ -1285,49 +1297,80 @@ function Form16Page() {
           </Card>
 
           {/* History Table */}
-          <Card
-            title="Upload History"
-            extra={
-              <Space wrap>
-                <Button size="small" onClick={handleSelectFailedHistory}>
-                  Select failed
-                </Button>
-                <Button size="small" onClick={() => setSelectedHistoryRowKeys([])}>
-                  Clear selection
-                </Button>
+          {activeBatchId && (
+            <Card
+              title={`Batch #${activeBatchId} progress`}
+              extra={
+                failedProgressItems.length > 0 && batchProgress?.isComplete ? (
+                  <Button
+                    danger
+                    icon={<ReloadOutlined />}
+                    onClick={() => {
+                      setSelectedFailedTaskIds(failedProgressItems.map((i) => i.taskId))
+                      setRetryModalOpen(true)
+                    }}
+                  >
+                    Review failed ({failedProgressItems.length})
+                  </Button>
+                ) : null
+              }
+            >
+              <BatchProgressPoller batchId={activeBatchId} progress={batchProgress} />
+            </Card>
+          )}
+
+          <Modal
+            title={
+              activeBatchId
+                ? `Failed tasks — Batch #${activeBatchId}`
+                : "Failed tasks"
+            }
+            open={retryModalOpen}
+            onCancel={() => setRetryModalOpen(false)}
+            width={960}
+            footer={
+              <Space>
+                <Button onClick={() => setRetryModalOpen(false)}>Close</Button>
                 <Button
-                  size="small"
-                  danger
-                  icon={<DeleteOutlined />}
-                  loading={deleteHistoryLoading}
-                  disabled={selectedHistoryRowKeys.length === 0}
-                  onClick={handleDeleteSelectedHistory}
+                  type="primary"
+                  icon={<ReloadOutlined />}
+                  loading={retrying}
+                  disabled={selectedFailedTaskIds.length === 0}
+                  onClick={() => handleRetryFailedTasks(selectedFailedTaskIds)}
                 >
-                  Delete selected ({selectedHistoryRowKeys.length})
-                </Button>
-                <Button onClick={() => refetch()} icon={<SyncOutlined />}>
-                  Refresh
+                  Retry selected ({selectedFailedTaskIds.length})
                 </Button>
               </Space>
             }
           >
-            <Table
-              rowKey="id"
-              columns={columns}
-              dataSource={uploadHistoryRecords}
-              rowSelection={{
-                selectedRowKeys: selectedHistoryRowKeys,
-                onChange: (keys) => setSelectedHistoryRowKeys(keys as number[]),
-              }}
-              pagination={{
-                total: uploadHistoryResponse?.count || 0,
-                pageSize: 100,
-                showTotal: (total) => `Total ${total} records`,
-              }}
-              scroll={{ x: 1200 }}
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginBottom: 16 }}
+              message={`${failedProgressItems.length} task(s) failed after captcha retries. Select rows to retry.`}
             />
-          </Card>
-        </Space>
+            <Table
+              rowKey="taskId"
+              size="small"
+              columns={retryModalColumns}
+              dataSource={failedProgressItems}
+              pagination={false}
+              scroll={{ y: 360 }}
+              rowSelection={{
+                selectedRowKeys: selectedFailedTaskIds,
+                onChange: (keys) => setSelectedFailedTaskIds(keys as number[]),
+              }}
+            />
+          </Modal>
+
+          <UploadHistoryTable
+            title="Upload History"
+            records={uploadHistoryResponse?.uploadHistory || []}
+            total={uploadHistoryResponse?.count || 0}
+            onRefresh={() => refetch()}
+            onSelectBatch={setActiveBatchId}
+          />
+</Space>
       </Layout>
     </ConfigProvider>
   )

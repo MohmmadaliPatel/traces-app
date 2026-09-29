@@ -397,4 +397,5 @@ function SmtpConfigsPage() {
   )
 }
 
+SmtpConfigsPage.authenticate = { redirectTo: "/auth/login" }
 export default SmtpConfigsPage

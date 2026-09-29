@@ -19,7 +19,6 @@ import type { ColumnsType } from "antd/es/table"
 import {
   FileTextOutlined,
   SyncOutlined,
-  DownloadOutlined,
   CloudDownloadOutlined,
   CheckCircleOutlined,
   CloseCircleOutlined,
@@ -31,6 +30,7 @@ import { useQuery, invoke } from "@blitzjs/rpc"
 import Layout from "src/core/layouts/Layout"
 import getCompanies from "src/companies/queries/getCompanies"
 import getReturnStatus from "src/return-status/queries/getReturnStatus"
+import { ExportButtons } from "src/shared/ui"
 import { ConfigProvider } from "antd"
 import enGB from "antd/lib/locale/en_GB"
 
@@ -191,74 +191,6 @@ function ReturnStatusPage() {
     if (successCount > 0) {
       messageApi.success(`Completed! Success: ${successCount}, Errors: ${errorCount}`)
     }
-  }
-
-  const handleDownloadCSV = () => {
-    if (returnStatus.length === 0) {
-      messageApi.warning("No data to download")
-      return
-    }
-
-    const headers = [
-      "Company Name",
-      "TAN",
-      "Financial Year",
-      "Quarter",
-      "Form Type",
-      "Token Number",
-      "Date of Filing",
-      "Status",
-      "Date of Processing",
-      "Statement Type",
-    ]
-
-    const rows: string[][] = returnStatus.map((item: ReturnStatusType) => [
-      item.company.name,
-      item.company.tan,
-      item.finyear,
-      item.quarter,
-      item.formtype,
-      item.tokenno,
-      item.dtoffiling,
-      item.status,
-      item.dtofprcng,
-      item.stmnttype,
-    ])
-
-    const escapeCSV = (value: string): string => {
-      if (value === null || value === undefined) return ""
-      const stringValue = String(value)
-      if (
-        stringValue.includes(",") ||
-        stringValue.includes('"') ||
-        stringValue.includes("\n")
-      ) {
-        return `"${stringValue.replace(/"/g, '""')}"`
-      }
-      return stringValue
-    }
-
-    const csvContent = [
-      headers.map(escapeCSV).join(","),
-      ...rows.map((row) => row.map(escapeCSV).join(",")),
-    ].join("\n")
-
-    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" })
-    const link = document.createElement("a")
-    const url = URL.createObjectURL(blob)
-
-    link.setAttribute("href", url)
-    link.setAttribute(
-      "download",
-      `return-status-${new Date().toISOString().split("T")[0]}.csv`
-    )
-    link.style.visibility = "hidden"
-    document.body.appendChild(link)
-    link.click()
-    document.body.removeChild(link)
-
-    URL.revokeObjectURL(url)
-    messageApi.success("CSV downloaded successfully")
   }
 
   const showRejectionReason = (rejectionMsg: string) => {
@@ -637,9 +569,11 @@ function ReturnStatusPage() {
                     value: c.id,
                   }))}
                 />
-                <Button icon={<DownloadOutlined />} onClick={handleDownloadCSV}>
-                  Download CSV
-                </Button>
+                <ExportButtons
+                  feature="return-status"
+                  filters={{ companyId: filterCompanyId }}
+                  disabled={returnStatus.length === 0}
+                />
                 <Button onClick={() => refetch()} icon={<SyncOutlined />}>
                   Refresh
                 </Button>

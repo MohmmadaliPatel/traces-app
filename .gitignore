@@ -61,3 +61,16 @@ lib-cov
 
 public/pdf/
 dist
+
+# DSC diagnostic output (yarn dsc:test)
+/tmp/
+/temp/
+
+# .NET build output for the DSC signer (the built binary lives in pdf-signer/)
+pdf-signer-src/bin/
+pdf-signer-src/obj/
+
+# Large build/data archives - keep out of git (files stay on disk)
+.next.zip
+pdf-signer.zip
+public/Swiggy_Q4.zip

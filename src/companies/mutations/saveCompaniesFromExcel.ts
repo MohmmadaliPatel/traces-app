@@ -8,6 +8,7 @@ const CompanyDataSchema = z.object({
   it_password: z.string(),
   user_id: z.string(),
   password: z.string(),
+  dscCertificateName: z.string().optional(),
 })
 
 const SaveCompaniesFromExcelSchema = z.object({
@@ -40,6 +41,9 @@ export default resolver.pipe(
               user_id: company.user_id,
               password: company.password,
               isTemporary: isTemporary,
+              ...(company.dscCertificateName !== undefined
+                ? { dscCertificateName: company.dscCertificateName.trim() || null }
+                : {}),
             },
           })
           updatedCompanies.push(updated)
@@ -54,6 +58,7 @@ export default resolver.pipe(
               password: company.password,
               isTemporary: isTemporary,
               emails: "",
+              dscCertificateName: company.dscCertificateName?.trim() || null,
             },
           })
           savedCompanies.push(created)
