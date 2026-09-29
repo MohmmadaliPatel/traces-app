@@ -56,7 +56,6 @@
     "better-queue-sql": "1.0.6",
     "better-queue-sqlite": "1.0.7",
     "blitz": "2.0.0-beta.23",
-    "canvas": "^2.11.2",
     "cheerio": "1.0.0",
     "crypto-js": "4.1.1",
     "csvtojson": "2.0.10",
