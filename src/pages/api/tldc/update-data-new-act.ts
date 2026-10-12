@@ -1,7 +1,10 @@
 import { withApiAuth } from "src/shared/http"
+import { unmaskPortalCredentials } from "src/shared/security/portalCredentials"
 import db from "db"
 import { NextApiRequest, NextApiResponse } from "next"
 import { updateTldcDataNewAct } from "src/scripts/fetchTldcDataNewAct"
+import { sendTldcError, sendTldcException, TldcWarning } from "src/tldc/errors"
+import { serializeTldcRow } from "src/tldc/serialize"
 
 /**
  * New Act TLDC update: refresh existing DB rows via child-certificate API.
@@ -12,7 +15,9 @@ export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ct
   }
 
   try {
-    const { tan, fy, credentials, companyId, companyName, recordId } = req.body || {}
+    const { tan, fy, credentials: rawCredentials, companyId, companyName, recordId } = req.body || {}
+    // The UI sends a masked password; use the stored one for this company
+    const credentials = await unmaskPortalCredentials(rawCredentials, { companyId, tan })
 
     if (
       !tan ||
@@ -21,10 +26,7 @@ export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ct
       !credentials.password ||
       !credentials.tan
     ) {
-      return res.status(400).json({
-        success: false,
-        message: "Missing required parameters",
-      })
+      return sendTldcError(res, "LDC_INVALID_INPUT", "Missing required parameters (tan, credentials)")
     }
 
     const companyIdNum = companyId != null ? parseInt(String(companyId), 10) : undefined
@@ -46,7 +48,7 @@ export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ct
       return res.status(200).json({
         success: true,
         message: "No TLDC records found to update",
-        data: { updated: 0 },
+        data: { updated: 0, fetched: 0, records: [], warnings: [] },
       })
     }
 
@@ -69,6 +71,17 @@ export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ct
     })
 
     let updated = 0
+    const warnings: TldcWarning[] = []
+    const refreshed = new Set(rows.map((row) => row.certNumber.toUpperCase()))
+    for (const record of records) {
+      if (!refreshed.has(record.certNumber.toUpperCase())) {
+        warnings.push({
+          certNumber: record.certNumber,
+          errorCode: "LDC_CERT_DETAIL_FAILED",
+          message: "Certificate detail unavailable from TRACES; stored values left unchanged",
+        })
+      }
+    }
     for (const row of rows) {
       if (!row.certNumber) continue
       const result = await db.tldcData.updateMany({
@@ -88,22 +101,31 @@ export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ct
           tdsRate: row.tdsRate || undefined,
           validFrom: row.validFrom,
           validTo: row.validTo,
+          issueDate: row.issueDate ?? undefined,
+          pdfPath: row.pdfPath ?? undefined,
           isActive: row.isActive,
         },
       })
       updated += result.count
     }
 
+    const savedRecords = await db.tldcData.findMany({
+      where: { id: { in: records.map((r) => r.id) } },
+      orderBy: { certNumber: "asc" },
+    })
+
     return res.status(200).json({
       success: true,
       message: `New Act TLDC updated ${updated} record(s)`,
-      data: { updated, fetched: rows.length },
+      data: {
+        updated,
+        fetched: rows.length,
+        records: savedRecords.map(serializeTldcRow),
+        warnings,
+      },
     })
   } catch (error) {
     console.error("API Error (New Act TLDC update):", error)
-    return res.status(500).json({
-      success: false,
-      message: error instanceof Error ? error.message : "Unknown error occurred",
-    })
+    return sendTldcException(res, error)
   }
 })

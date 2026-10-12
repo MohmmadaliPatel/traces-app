@@ -150,7 +150,7 @@ Authorization: Bearer tt_example_token_abc123def4567890
 | Conso Excel | `public/pdf/traces_excel/{Company}/` |
 | Form 16 / 16A | `public/pdf/form16-download/`, `public/pdf/form16a-download/` |
 | Challans | `public/pdf/challans/{Company}/...` |
-| TLDC certificate PDFs | `public/pdf/tldc-downloads/` |
+| TLDC certificate PDFs | Use `records[].pdfUrl`. Files: `public/pdf/child-certificates/{Company}/` (new Act), `public/pdf/tldc-downloads/certificates/` (old Act) |
 | RRR extract | `public/pdf/return/rrr-extract/` |
 | Form 140 / 26Q | `public/pdf/Acknowledgement/form140/` (or `form26q/`) |
 
@@ -1044,7 +1044,7 @@ Authorization: Bearer tt_example_token_abc123def4567890
 ### Downloads
 
 - Tabular export: `POST /api/export/tldc` with `{ "format": "xlsx" | "csv" | "pdf", "companyId?", "fy?", "search?" }`
-- Certificate PDFs from portal: `public/pdf/tldc-downloads/` via `GET /api/file/pdf/tldc-downloads/...`
+- Certificate PDFs: each record's `pdfUrl` (`GET` with the same Bearer token)
 
 ### Fetch from TRACES portal (Old Act)
 
@@ -1054,8 +1054,72 @@ Authorization: Bearer tt_example_token_abc123def4567890
 
 {
   "tan": "MUMB12345E",
-  "year": "2024-25",
+  "year": "2024",
   "companyId": 1,
+  "credentials": {
+    "userId": "traces_deductor_user_id",
+    "password": "traces_portal_password",
+    "tan": "MUMB12345E"
+  }
+}
+```
+
+**Response example:**
+
+`year` is the FY **start year** (`"2024"` for 2024-25).
+
+```json
+{
+  "success": true,
+  "data": { "extractedData": [ /* raw rows scraped from TRACES */ ] },
+  "cached": false,
+  "records": [
+    {
+      "id": 7,
+      "companyId": 1,
+      "act": "old",
+      "fy": "2024-25",
+      "certNumber": "1234567890ABC",
+      "din": "DIN0001",
+      "pan": "ABCDE1234F",
+      "panName": "Example Vendor Pvt Ltd",
+      "section": "94J",
+      "sectionDesc": "194J",
+      "natureOfPayment": "Fees for professional or technical services",
+      "tdsRate": 2,
+      "tdsAmountLimit": 500000,
+      "tdsAmountConsumed": 125000,
+      "tdsAmountBalance": 375000,
+      "issueDate": "15-04-2024",
+      "validFrom": "15-04-2024",
+      "validTo": "31-03-2025",
+      "cancelDate": null,
+      "isActive": true,
+      "pdfUrl": "/api/file/pdf/tldc-downloads/certificates/1234567890ABC.pdf",
+      "lastSyncedAt": "2024-05-02T09:12:44.000Z"
+    }
+  ],
+  "warnings": [],
+  "message": "Successfully fetched TLDC data"
+}
+```
+
+`records[]` uses the client field set described in [TLDC record fields](#tldc-record-fields). Per-certificate problems are listed in `warnings[]` (`{ certNumber, errorCode, message }`) and do not fail the call.
+
+---
+
+### Fetch from TRACES portal (New Act)
+
+```http
+POST /api/tldc/fetch-data-new-act
+Authorization: Bearer tt_example_token_abc123def4567890
+
+{
+  "tan": "MUMB12345E",
+  "fy": "2026-27",
+  "companyId": 1,
+  "initiateIfNoRequest": true,
+  "forceInitiate": false,
   "credentials": {
     "userId": "traces_deductor_user_id",
     "password": "traces_portal_password",
@@ -1069,41 +1133,21 @@ Authorization: Bearer tt_example_token_abc123def4567890
 ```json
 {
   "success": true,
-  "data": [
-    {
-      "certNumber": "CERT001",
-      "pan": "ABCDE1234F",
-      "panName": "Example Vendor Pvt Ltd",
-      "section": "194C",
-      "fy": "2024-25"
-    }
-  ],
-  "cached": false,
-  "message": "Fetched 5 TLDC records"
-}
-```
-
----
-
-### Fetch from TRACES portal (New Act)
-
-```http
-POST /api/tldc/fetch-data-new-act
-Authorization: Bearer tt_example_token_abc123def4567890
-
-{
-  "tan": "MUMB12345E",
-  "year": "2026-27",
-  "companyId": 1,
-  "initiateIfNoRequest": true,
-  "forceInitiate": false,
-  "credentials": {
-    "userId": "traces_deductor_user_id",
-    "password": "traces_portal_password",
-    "tan": "MUMB12345E"
+  "message": "New Act TLDC: 1 created, 0 updated, 0 missing in PDFs",
+  "data": {
+    "created": 1,
+    "updated": 0,
+    "searchCount": 1,
+    "downloadedPdfs": 1,
+    "missingCertNumbers": [],
+    "initiated": [],
+    "records": [ /* TLDC record fields */ ],
+    "warnings": []
   }
 }
 ```
+
+Certificates whose PDF TRACES has not prepared yet are listed in `missingCertNumbers`. Their data rows are still saved, so call again later to collect the PDFs.
 
 ### Refresh existing records (New Act)
 
@@ -1113,7 +1157,7 @@ Authorization: Bearer tt_example_token_abc123def4567890
 
 {
   "tan": "MUMB12345E",
-  "year": "2026-27",
+  "fy": "2026-27",
   "companyId": 1,
   "credentials": {
     "userId": "traces_deductor_user_id",
@@ -1122,6 +1166,8 @@ Authorization: Bearer tt_example_token_abc123def4567890
   }
 }
 ```
+
+Response: `{ success, message, data: { updated, fetched, records[], warnings[] } }`.
 
 ### Refresh existing records (Old Act)
 
@@ -1141,6 +1187,79 @@ Authorization: Bearer tt_example_token_abc123def4567890
   }
 }
 ```
+
+---
+
+`year` accepts `"2024"` or `"2024-25"`. A certificate that shows a Cancel Date on TRACES is stored with `isActive: false`.
+
+---
+
+### List stored certificates (REST, recommended for integrations)
+
+Reads from the database only. It makes no TRACES call and needs no credentials.
+
+```http
+POST /api/tldc/list
+Authorization: Bearer tt_example_token_abc123def4567890
+
+{
+  "companyId": 1,
+  "fy": "2026-27",
+  "act": "new",
+  "isActive": true,
+  "skip": 0,
+  "take": 1000
+}
+```
+
+| Body field | Required | Description |
+|------------|----------|-------------|
+| `companyId` or `tan` | one of | Deductor |
+| `fy` | no | `"2026-27"` or `"2026"` |
+| `act` | no | `"old"` (FY ≤ 2025-26) or `"new"` (tax year ≥ 2026-27) |
+| `certNumber`, `pan` | no | Exact match |
+| `isActive` | no | `true` = active, `false` = cancelled |
+| `skip`, `take` | no | Paging (max `take` 5000) |
+
+Response: `{ success, company: {id, name, tan}, count, skip, take, records[] }`.
+
+### TLDC record fields
+
+| Field | Format | Source |
+|-------|--------|--------|
+| `act` | `"old"` / `"new"` | Derived from `fy` |
+| `fy` | `YYYY-YY` | TRACES FY / tax year |
+| `certNumber` | string | Certificate number (update key with `companyId` + `fy`) |
+| `din` | string | Old Act: DIN in 197 inbox. New Act: parent certificate number. Reference only. |
+| `pan`, `panName` | string | Deductee |
+| `section` | string | TRACES code, e.g. `94J` (old) or `1027` (new) |
+| `sectionDesc` | string \| null | Statutory section for the code |
+| `natureOfPayment` | string | As shown on TRACES (not the PDF) |
+| `tdsRate` | number | % as per certificate |
+| `tdsAmountLimit`, `tdsAmountConsumed`, `tdsAmountBalance` | number | ₹ |
+| `issueDate`, `validFrom`, `validTo`, `cancelDate` | `DD-MM-YYYY` \| null | IST calendar dates, no time |
+| `isActive` | boolean | `false` = cancelled on TRACES |
+| `pdfUrl` | string \| null | Download URL of this certificate's PDF (`GET` with the same Bearer token). `null` until TRACES has prepared the PDF. |
+| `lastSyncedAt` | ISO timestamp | Last write from TRACES |
+
+### TLDC errors
+
+Failed TLDC calls return `{ "success": false, "errorCode": "...", "message": "...", "retryable": true|false }`.
+
+| errorCode | HTTP | Retryable | Meaning |
+|-----------|------|-----------|---------|
+| `LDC_INVALID_INPUT` | 400 | no | Missing or invalid parameter |
+| `LDC_COMPANY_NOT_FOUND` | 404 | no | Unknown `companyId` / `tan` |
+| `LDC_AUTH_INVALID` | 401 | no | TRACES rejected the credentials (not retried, to avoid account lock) |
+| `LDC_CAPTCHA_FAILED` | 502 | yes | Captcha not solved in 5 attempts |
+| `LDC_CAPTCHA_SERVICE_UNAVAILABLE` | 503 | yes | Captcha decoder not reachable |
+| `LDC_SESSION_EXPIRED` | 502 | yes | TRACES ended the session mid-run |
+| `LDC_PORTAL_UNAVAILABLE` | 503 | yes | TRACES down or returned 5xx |
+| `LDC_TIMEOUT` | 504 | yes | TRACES did not respond in time |
+| `LDC_PDF_DOWNLOAD_FAILED` | 502 | yes | Certificate PDF download failed |
+| `LDC_INTERNAL_ERROR` | 500 | yes | Unexpected error |
+
+Warnings in `warnings[]`: `LDC_CERT_NOT_FOUND` (not on the 197 verification page) and `LDC_CERT_DETAIL_FAILED` (saved from search data only).
 
 ---
 
@@ -1179,6 +1298,7 @@ Authorization: Bearer tt_example_token_abc123def4567890
     "tdsRate": "1",
     "validFrom": "2024-04-01T00:00:00.000Z",
     "validTo": "2025-03-31T00:00:00.000Z",
+    "issueDate": "2024-03-20T00:00:00.000Z",
     "isActive": true
   },
   "meta": {}
@@ -1222,7 +1342,7 @@ Authorization: Bearer tt_example_token_abc123def4567890
 
 - `POST /api/export/outstanding-demand` with `{ "format": "xlsx" | "csv" | "pdf", "companyId?", "fy?" }`
 
-### Fetch from Income Tax portal
+### Fetch from TRACES
 
 ```http
 POST /api/outstanding-demand/fetch
@@ -1462,7 +1582,9 @@ Authorization: Bearer tt_example_token_abc123def4567890
 | Payment gaps | Read cache | GET | `/api/challan/payment-history-gaps` |
 | TLDC | Fetch (Old Act) | POST | `/api/tldc/fetch-data` |
 | TLDC | Fetch (New Act) | POST | `/api/tldc/fetch-data-new-act` |
+| TLDC | Update (Old Act) | POST | `/api/tldc/update-data` |
 | TLDC | Update (New Act) | POST | `/api/tldc/update-data-new-act` |
+| TLDC | List (client shape) | POST | `/api/tldc/list` |
 | LDC utilisation | List | POST | `/api/rpc/getLdcUtilisation` |
 | Form 140 | Extract | POST | `/api/form140/extract` |
 | RRR | Extract | POST | `/api/rrr/extract` |

@@ -969,7 +969,7 @@ export default class NoticeDownloaderForm16 {
 
   async getTracesData(company: any) {
     try {
-      this.logger.log(`Getting Traces Data for ${JSON.stringify(company)}`)
+      this.logger.log(`Getting Traces Data for ${company?.name} (${company?.tan})`)
       const isManualCaptcha = process.env.IS_CAPTCHA_MANUAL == "true"
 
       // Function to get captcha image
@@ -3228,7 +3228,7 @@ export default class NoticeDownloaderForm16 {
         this.form16Type === "form16a" ? " (Old Portal Puppeteer)" : ""
       } for ${this.company.name}`
     )
-    console.log("Company", this.company)
+    console.log("Company", this.company?.name, this.company?.tan)
 
     const result = await this.getTracesFilepuppeteer(this.company)
     console.log("result", result)

@@ -127,7 +127,6 @@ export async function downloadChallans(
   const skipNewActRadio = options?.skipNewActRadio === true
 
   console.log("USERNAME", Username)
-  console.log("PASSWORD", Password)
   console.log("COMPANY NAME", companyName)
   console.log("NUMBER OF CHALLANS TO DOWNLOAD:", downloadCount)
   console.log("e-pay flow: skip Income-tax Act 2025 radio (old-act only):", skipNewActRadio)

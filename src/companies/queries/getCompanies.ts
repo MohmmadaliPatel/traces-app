@@ -1,6 +1,6 @@
 import { paginate } from "blitz"
 import { resolver } from "@blitzjs/rpc"
-import db, { Prisma } from "db"
+import db, { maskCompanySecrets, Prisma } from "db"
 
 interface GetCompaniesInput
   extends Pick<Prisma.CompanyFindManyArgs, "where" | "orderBy" | "skip" | "take"> {}
@@ -23,7 +23,8 @@ export default resolver.pipe(
     })
 
     return {
-      companies,
+      // Portal passwords never go to the browser; writes that send the mask back keep the stored value
+      companies: maskCompanySecrets(companies),
       nextPage,
       hasMore,
       count,

@@ -69,7 +69,7 @@ async function main() {
   console.log(`  interest payable   ${clause34c.totals.payable.toLocaleString("en-IN")}`)
   console.log(`  interest paid      ${clause34c.totals.paid.toLocaleString("en-IN")}`)
   console.log(`  computed (ref)     ${clause34c.totals.computed.toLocaleString("en-IN")}`)
-  console.log(`  rows re-verified   ${clause34c.totals.verifiedRows}`)
+  console.log(`  rows re-extracted  ${clause34c.totals.verifiedRows}  (extraction check only)`)
   console.log(`  rows carried fwd   ${clause34c.totals.carriedForwardRows}`)
 
   console.log(`\nwritten: ${outputPath}`)

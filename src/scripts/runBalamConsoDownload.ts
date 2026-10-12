@@ -2,13 +2,12 @@
  * Run Conso download for Balam.
  * CONSO_HEADLESS=1 npx tsx src/scripts/runBalamConsoDownload.ts
  */
-import { PrismaClient } from "@prisma/client"
+import db from "db" // shared client: decrypts stored portal credentials
 import NoticeDownloaderConso from "src/jobs/workers/NoticeDownloader-conso"
 
 const TAN = "MUMC29054E"
 
 async function main() {
-  const db = new PrismaClient()
   const company = await db.company.findFirst({ where: { tan: { equals: TAN } } })
   await db.$disconnect()
   if (!company?.user_id || !company.password) {

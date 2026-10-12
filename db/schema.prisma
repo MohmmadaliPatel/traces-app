@@ -204,7 +204,9 @@ model TldcData {
   tdsRate           String
   validFrom         DateTime
   validTo           DateTime
+  issueDate         DateTime?
   cancelDate        DateTime?
+  pdfPath           String?
   isActive          Boolean   @default(true)
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt

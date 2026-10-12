@@ -1,68 +1,40 @@
-import puppeteer, { Page } from "puppeteer"
 import path from "path"
 import fs from "fs"
-import os from "os"
-import { loginWithTracesApiAndPreauth, traces61DedUrl } from "../jobs/traces"
+import { openTracesSession, traces61DedUrl, type TracesSession } from "../jobs/traces"
 
 // Utility function to wait for a specified time
 const waitForSecs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
-// In-memory cache
-
-let globalPage: Page | null = null
-
 /**
- * Login to the TDSCPC portal
- * @returns {Promise<Page>} The authenticated Puppeteer page
+ * Fresh TRACES session for one call, logged in with exactly these credentials.
+ * Never cached: a shared page would verify one company's certificates under another's login.
  */
-async function loginToTdsPortal(credentials: {
+function openTldcSession(credentials: {
   userId: string
   password: string
   tan: string
-}): Promise<Page> {
-  if (globalPage) {
-    console.log("🔐 Already logged in.")
-    return globalPage
-  }
-
-  const browser = await puppeteer.launch({
-    headless: false,
+}): Promise<TracesSession> {
+  return openTracesSession(credentials, {
     defaultViewport: null,
     args: [
-      "--start-maximized",
-      "--disable-web-security",
-      "--disable-features=IsolateOrigins,site-per-process",
-      "--allow-file-access-from-files",
-    ],
-    // This should be configurable based on environment
-    executablePath:
-      process.platform === "darwin"
-        ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-        : process.platform === "win32"
-        ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
-        : undefined, // Use default for Linux
+    "--start-maximized",
+    "--disable-web-security",
+    "--disable-features=IsolateOrigins,site-per-process",
+    "--allow-file-access-from-files",
+  ],
+    beforeLogin: async (page) => {
+      // Set extra permissions for downloads
+      const downloadPath = path.resolve(`./public/pdf/tldc-downloads`)
+      if (!fs.existsSync(downloadPath)) {
+        fs.mkdirSync(downloadPath, { recursive: true })
+      }
+      const downloadClient = await page.createCDPSession()
+      await downloadClient.send("Page.setDownloadBehavior", {
+        behavior: "allow",
+        downloadPath,
+      })
+    },
   })
-
-  const page = await browser.newPage()
-
-  // Set extra permissions for downloads
-  const downloadPath = path.resolve(`./public/pdf/tldc-downloads`)
-  const downloadClient = await page.createCDPSession()
-  if (!fs.existsSync(downloadPath)) {
-    fs.mkdirSync(downloadPath, { recursive: true })
-  }
-  await downloadClient.send("Page.setDownloadBehavior", {
-    behavior: "allow",
-    downloadPath,
-  })
-
-  await loginWithTracesApiAndPreauth(page, {
-    userId: credentials.userId,
-    password: credentials.password,
-    tan: credentials.tan,
-  })
-  globalPage = page
-  return globalPage
 }
 
 /**
@@ -85,8 +57,10 @@ export async function updateTldcData({
 }): Promise<{ data: any; cached?: boolean }> {
   console.log("⏳ No cache. Launching Puppeteer for:", year)
 
+  let session: TracesSession | undefined
   try {
-    const page = await loginToTdsPortal(credentials)
+    session = await openTldcSession(credentials)
+    const page = session.page
     const processedData: any[] = []
 
     console.log("tldcData to update:", tldcData)
@@ -297,8 +271,9 @@ export async function updateTldcData({
 
     return { data: processedData }
   } catch (error) {
-    globalPage = null // Reset global page on error
     console.error("❌ Error in updateTldcData:", error)
     throw error
+  } finally {
+    await session?.close()
   }
 }

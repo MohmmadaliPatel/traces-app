@@ -340,7 +340,7 @@ function Clause34bPage() {
               <Tag color="green">payable ₹{inr(clause34c.totals.payable)}</Tag>
               <Tag color="green">paid ₹{inr(clause34c.totals.paid)}</Tag>
               <Tag color="orange">computed (ref) ₹{inr(clause34c.totals.computed)}</Tag>
-              <Tag>{clause34c.totals.verifiedRows} rows re-verified</Tag>
+              <Tag>{clause34c.totals.verifiedRows} rows re-extracted &amp; agreed</Tag>
               <Tag color={clause34c.totals.carriedForwardRows ? "warning" : "default"}>
                 {clause34c.totals.carriedForwardRows} carried forward
               </Tag>

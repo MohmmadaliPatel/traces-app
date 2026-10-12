@@ -2,7 +2,7 @@
  * Temporary diagnostic for Conso nsdlconsofile Go click.
  * Run: npx tsx src/scripts/debugConsoGo.ts
  */
-import { PrismaClient } from "@prisma/client"
+import db from "db" // shared client: decrypts stored portal credentials
 import puppeteer, { type Page } from "puppeteer"
 import {
   prepareTraces61FormSubmit,
@@ -54,7 +54,6 @@ async function dump(page: Page, label: string) {
 }
 
 async function main() {
-  const db = new PrismaClient()
   const company = await db.company.findFirst({
     where: { tan: { equals: TAN } },
   })

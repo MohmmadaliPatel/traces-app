@@ -1,7 +1,10 @@
 import { withApiAuth } from "src/shared/http"
+import { unmaskPortalCredentials } from "src/shared/security/portalCredentials"
 import db from "db"
 import { NextApiRequest, NextApiResponse } from "next"
 import { fetchTldcDataNewAct } from "src/scripts/fetchTldcDataNewAct"
+import { sendTldcError, sendTldcException, TldcWarning } from "src/tldc/errors"
+import { serializeTldcRow } from "src/tldc/serialize"
 
 /**
  * New Act TLDC fetch:
@@ -17,13 +20,15 @@ export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ct
     const {
       tan,
       fy,
-      credentials,
+      credentials: rawCredentials,
       companyId,
       companyName,
       initiateIfNoRequest = true,
       forceInitiate = false,
       initiateMissing,
     } = req.body || {}
+    // The UI sends a masked password; use the stored one for this company
+    const credentials = await unmaskPortalCredentials(rawCredentials, { companyId, tan })
 
     if (
       !tan ||
@@ -34,10 +39,11 @@ export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ct
       !credentials.password ||
       !credentials.tan
     ) {
-      return res.status(400).json({
-        success: false,
-        message: "Missing required parameters (tan, fy, companyId, credentials)",
-      })
+      return sendTldcError(
+        res,
+        "LDC_INVALID_INPUT",
+        "Missing required parameters (tan, fy, companyId, credentials)"
+      )
     }
 
     const companyIdNum = parseInt(String(companyId), 10)
@@ -66,9 +72,18 @@ export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ct
 
     let created = 0
     let updated = 0
+    const savedIds: number[] = []
+    const warnings: TldcWarning[] = []
 
     for (const row of result.rows) {
       if (!row.certNumber) continue
+      if (row.source === "searchDeductor") {
+        warnings.push({
+          certNumber: row.certNumber,
+          errorCode: "LDC_CERT_DETAIL_FAILED",
+          message: "Certificate detail unavailable; saved from search results only",
+        })
+      }
       try {
         const existing = await db.tldcData.findFirst({
           where: {
@@ -79,7 +94,7 @@ export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ct
         })
 
         if (!existing) {
-          await db.tldcData.create({
+          const createdRow = await db.tldcData.create({
             data: {
               company: { connect: { id: companyIdNum } },
               certNumber: row.certNumber,
@@ -94,10 +109,13 @@ export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ct
               tdsRate: row.tdsRate || "0",
               validFrom: row.validFrom,
               validTo: row.validTo,
+              issueDate: row.issueDate,
               cancelDate: row.cancelDate,
+              pdfPath: row.pdfPath ?? null,
               isActive: row.isActive,
             },
           })
+          savedIds.push(createdRow.id)
           created++
         } else {
           await db.tldcData.update({
@@ -113,16 +131,24 @@ export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ct
               tdsRate: row.tdsRate || existing.tdsRate,
               validFrom: row.validFrom,
               validTo: row.validTo,
+              issueDate: row.issueDate ?? existing.issueDate,
               cancelDate: row.cancelDate,
+              pdfPath: row.pdfPath ?? existing.pdfPath,
               isActive: row.isActive,
             },
           })
+          savedIds.push(existing.id)
           updated++
         }
       } catch (dbError) {
         console.error(`DB error for ${row.certNumber}:`, dbError)
       }
     }
+
+    const savedRecords = await db.tldcData.findMany({
+      where: { id: { in: savedIds } },
+      orderBy: { certNumber: "asc" },
+    })
 
     return res.status(200).json({
       success: true,
@@ -138,13 +164,12 @@ export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ct
         missingCertNumbers: result.missingCertNumbers,
         initiated: result.initiated,
         pdfDir: result.pdfDir,
+        records: savedRecords.map(serializeTldcRow),
+        warnings,
       },
     })
   } catch (error) {
     console.error("API Error (New Act TLDC fetch):", error)
-    return res.status(500).json({
-      success: false,
-      message: error instanceof Error ? error.message : "Unknown error occurred",
-    })
+    return sendTldcException(res, error)
   }
 })

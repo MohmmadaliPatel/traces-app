@@ -17,6 +17,7 @@ const UpsertTldcDataSchema = z.object({
   tdsRate: z.string(),
   validFrom: z.date(),
   validTo: z.date(),
+  issueDate: z.date().optional().nullable(),
   cancelDate: z.date().optional().nullable(),
   isActive: z.boolean().default(true),
 })

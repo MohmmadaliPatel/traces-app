@@ -324,7 +324,6 @@ export async function createChallan(params: CreateChallanParams) {
   } = params
 
   console.log("USERNAME", username)
-  console.log("PASSWORD", password)
   console.log("ASSESSMENT YEAR", assessmentYear)
   console.log("SECTIONS", sections)
 

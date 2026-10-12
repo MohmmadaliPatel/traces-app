@@ -1113,7 +1113,7 @@ export default class NoticeDownloaderConso {
 
   async getTracesData(company: any) {
     try {
-      this.logger.log(`Getting Traces Data for ${JSON.stringify(company)}`)
+      this.logger.log(`Getting Traces Data for ${company?.name} (${company?.tan})`)
       const isManualCaptcha = process.env.IS_CAPTCHA_MANUAL == "true"
 
       // Function to get captcha image
@@ -2775,7 +2775,7 @@ export default class NoticeDownloaderConso {
 
   async downloadFile() {
     this.logger.log(`Starting Download File for ${this.company.name}`)
-    console.log("Company", this.company)
+    console.log("Company", this.company?.name, this.company?.tan)
 
     const result = await this.getTracesFilepuppeteer(this.company)
     console.log("result", result)

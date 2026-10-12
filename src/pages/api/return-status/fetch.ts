@@ -1,4 +1,5 @@
 import { withApiAuth } from "src/shared/http"
+import { unmaskPortalCredentials } from "src/shared/security/portalCredentials"
 import { NextApiRequest, NextApiResponse } from "next"
 import { fetchReturnStatus } from "src/scripts/fetchReturnStatus"
 import db from "db"
@@ -9,7 +10,9 @@ export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ct
   }
 
   try {
-    const { companyId, credentials, financialYears, quarters, formTypes } = req.body
+    const { companyId, credentials: rawCredentials, financialYears, quarters, formTypes } = req.body
+    // The UI sends a masked password; use the stored one for this company
+    const credentials = await unmaskPortalCredentials(rawCredentials, { companyId })
 
     if (
       !companyId ||

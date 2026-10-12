@@ -789,6 +789,8 @@ export type PaymentHistoryDownloadTarget = {
 }
 
 type EpayGridRow = {
+  /** ag-grid `row-index` — stable across horizontal scroll and pinned/center row containers. */
+  rowKey: string
   taxYear: string
   amount: number
   crn: string
@@ -803,19 +805,70 @@ function parseChlnCreDtMs(raw: string): number {
   return Number.isNaN(parsed) ? 0 : parsed
 }
 
-async function scrapeEpayGridRows(page: Page): Promise<EpayGridRow[]> {
-  return page.evaluate(() => {
-    const rows = Array.from(
-      document.querySelectorAll("ag-grid-angular .ag-row")
+type EpayGridScrollInfo = {
+  scrollLeft: number
+  maxScrollLeft: number
+  viewportWidth: number
+}
+
+/**
+ * ag-grid only keeps columns inside the horizontal viewport in the DOM. CRN / Tax Year /
+ * Amount sit on the left and Actions on the far right, so they are not reliably rendered
+ * together — and the grid can scroll between clicks (e.g. the actions menu refocusing its
+ * button on close), dropping the CRN column. Scroll explicitly before every read or click.
+ */
+async function scrollEpayGridTo(
+  page: Page,
+  target: number | "start" | "end"
+): Promise<EpayGridScrollInfo> {
+  const info = await page.evaluate((to) => {
+    const viewports = Array.from(
+      document.querySelectorAll(
+        "ag-grid-angular .ag-center-cols-viewport, ag-grid-angular .ag-body-horizontal-scroll-viewport"
+      )
     ) as HTMLElement[]
-    return rows.map((row) => {
+    let maxScrollLeft = 0
+    let viewportWidth = 0
+    for (const vp of viewports) {
+      maxScrollLeft = Math.max(maxScrollLeft, vp.scrollWidth - vp.clientWidth)
+      viewportWidth = Math.max(viewportWidth, vp.clientWidth)
+    }
+    const left =
+      to === "start"
+        ? 0
+        : to === "end"
+        ? maxScrollLeft
+        : Math.min(Math.max(to, 0), maxScrollLeft)
+    for (const vp of viewports) vp.scrollLeft = left
+    return { scrollLeft: left, maxScrollLeft, viewportWidth }
+  }, target)
+  // ag-grid renders newly visible columns on the following animation frames
+  await waitForSecs(600)
+  return info
+}
+
+type EpayGridRowFragment = {
+  rowKey: string
+  taxYear: string
+  amountRaw: string
+  crn: string
+  chlnCreDt: string
+}
+
+async function scrapeRenderedEpayGridCells(page: Page): Promise<EpayGridRowFragment[]> {
+  return page.evaluate(() => {
+    const rows = Array.from(document.querySelectorAll("ag-grid-angular .ag-row")) as HTMLElement[]
+    return rows.map((row, i) => {
       const cellText = (colId: string) =>
         row.querySelector(`[col-id="${colId}"]`)?.textContent?.replace(/\s+/g, " ").trim() ?? ""
-      const amountRaw = cellText("amount")
-      const amount = parseInt(amountRaw.replace(/[,₹\s]/g, ""), 10)
       return {
+        rowKey:
+          row.getAttribute("row-index") ??
+          row.getAttribute("aria-rowindex") ??
+          row.getAttribute("row-id") ??
+          `dom-${i}`,
         taxYear: cellText("taxYear"),
-        amount: Number.isNaN(amount) ? 0 : amount,
+        amountRaw: cellText("amount"),
         crn: cellText("crn"),
         chlnCreDt: cellText("chlnCreDt"),
       }
@@ -823,66 +876,287 @@ async function scrapeEpayGridRows(page: Page): Promise<EpayGridRow[]> {
   })
 }
 
-async function downloadEpayGridRowByCrn(page: Page, crn: string): Promise<boolean> {
-  return page.evaluate(async (targetCrn) => {
-    function waitForSecs(timeout = 5000) {
-      return new Promise((resolve) => setTimeout(() => resolve(true), timeout))
+/** Read every row on the current grid page, scrolling across so all needed columns render. */
+async function scrapeEpayGridRows(page: Page): Promise<EpayGridRow[]> {
+  const info = await scrollEpayGridTo(page, "start")
+  const positions = [0]
+  if (info.maxScrollLeft > 0) {
+    const step = Math.max(200, Math.floor(info.viewportWidth * 0.75))
+    for (let x = step; x < info.maxScrollLeft; x += step) positions.push(x)
+    positions.push(info.maxScrollLeft)
+  }
+
+  const merged = new Map<string, EpayGridRowFragment>()
+  for (let i = 0; i < positions.length; i++) {
+    if (i > 0) await scrollEpayGridTo(page, positions[i]!)
+    for (const frag of await scrapeRenderedEpayGridCells(page)) {
+      const existing = merged.get(frag.rowKey)
+      if (!existing) {
+        merged.set(frag.rowKey, { ...frag })
+        continue
+      }
+      if (!existing.taxYear) existing.taxYear = frag.taxYear
+      if (!existing.amountRaw) existing.amountRaw = frag.amountRaw
+      if (!existing.crn) existing.crn = frag.crn
+      if (!existing.chlnCreDt) existing.chlnCreDt = frag.chlnCreDt
+    }
+  }
+  await scrollEpayGridTo(page, "start")
+
+  return Array.from(merged.values()).map((frag) => {
+    const amount = parseInt(frag.amountRaw.replace(/[,₹\s]/g, ""), 10)
+    return {
+      rowKey: frag.rowKey,
+      taxYear: frag.taxYear,
+      amount: Number.isNaN(amount) ? 0 : amount,
+      crn: frag.crn.replace(/\s+/g, ""),
+      chlnCreDt: frag.chlnCreDt,
+    }
+  })
+}
+
+async function getEpayGridPageInfo(page: Page): Promise<{ current: number; total: number } | null> {
+  return page.evaluate(() => {
+    const match = (document.body.innerText || "").match(/(\d+)\s+of\s+(\d+)\s+pages?/i)
+    return match ? { current: parseInt(match[1]!, 10), total: parseInt(match[2]!, 10) } : null
+  })
+}
+
+async function clickPrevEpayGridPage(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const buttons = Array.from(
+      document.querySelectorAll("button.buttonPag.mdc-icon-button.mat-mdc-icon-button")
+    ) as HTMLElement[]
+    const nextIdx = buttons.findIndex((btn) => btn.querySelector('img[alt="right arrow"]'))
+    // Pager is [first, prev, next, last]; fall back to the button just before "next".
+    const prev =
+      buttons.find((btn) => btn.querySelector('img[alt="left arrow"]')) ??
+      (nextIdx > 0 ? buttons[nextIdx - 1] : undefined)
+    if (!prev || prev.hasAttribute("disabled")) return false
+    prev.click()
+    return true
+  })
+}
+
+async function goToEpayGridPage(page: Page, targetPage: number, trackedPage: number): Promise<number> {
+  let current = (await getEpayGridPageInfo(page))?.current ?? trackedPage
+  for (let guard = 0; current !== targetPage && guard < 100; guard++) {
+    const goBack = current > targetPage
+    const moved = goBack
+      ? await clickPrevEpayGridPage(page)
+      : await clickNextPaymentHistoryPage(page)
+    if (!moved) {
+      console.log(
+        `Could not move grid from page ${current} to page ${targetPage} (${
+          goBack ? "previous" : "next"
+        } button unavailable)`
+      )
+      break
+    }
+    await waitForSecs(3000)
+    current = (await getEpayGridPageInfo(page))?.current ?? (goBack ? current - 1 : current + 1)
+  }
+  return current
+}
+
+async function locateEpayGridRowByCrn(
+  page: Page,
+  crn: string
+): Promise<{ rowKey: string | null; gridCrns: string[] }> {
+  await scrollEpayGridTo(page, "start")
+  return page.evaluate((targetCrn) => {
+    const rows = Array.from(document.querySelectorAll("ag-grid-angular .ag-row")) as HTMLElement[]
+    const gridCrns: string[] = []
+    let rowKey: string | null = null
+    rows.forEach((row, i) => {
+      const text = (row.querySelector('[col-id="crn"]')?.textContent || "").replace(/\s+/g, "")
+      if (!text) return
+      gridCrns.push(text)
+      if (rowKey === null && text.includes(targetCrn)) {
+        rowKey =
+          row.getAttribute("row-index") ??
+          row.getAttribute("aria-rowindex") ??
+          row.getAttribute("row-id") ??
+          `dom-${i}`
+      }
+    })
+    return { rowKey, gridCrns }
+  }, crn)
+}
+
+/** Rewind to the first grid page, then walk forward until the CRN shows up. */
+async function findEpayGridPageWithCrn(page: Page, crn: string): Promise<number | null> {
+  for (let guard = 0; guard < 100 && (await clickPrevEpayGridPage(page)); guard++) {
+    await waitForSecs(3000)
+  }
+  for (let pageNum = 1; pageNum <= 100; pageNum++) {
+    const { rowKey } = await locateEpayGridRowByCrn(page, crn)
+    if (rowKey !== null) return (await getEpayGridPageInfo(page))?.current ?? pageNum
+    if (!(await clickNextPaymentHistoryPage(page))) return null
+    await waitForSecs(3000)
+  }
+  return null
+}
+
+async function closeOpenMatMenus(page: Page): Promise<void> {
+  for (let i = 0; i < 3; i++) {
+    const open = await page.evaluate(
+      () => document.querySelectorAll(".cdk-overlay-container .mat-mdc-menu-panel").length
+    )
+    if (open === 0) return
+    await page.keyboard.press("Escape")
+    await waitForSecs(400)
+  }
+}
+
+async function clickEpayRowActionButton(
+  page: Page,
+  rowKey: string
+): Promise<{ clicked: boolean; renderedCols: string[] }> {
+  return page.evaluate((key) => {
+    const rows = (
+      Array.from(document.querySelectorAll("ag-grid-angular .ag-row")) as HTMLElement[]
+    ).filter(
+      (row, i) =>
+        (row.getAttribute("row-index") ??
+          row.getAttribute("aria-rowindex") ??
+          row.getAttribute("row-id") ??
+          `dom-${i}`) === key
+    )
+    // A logical row can be split across pinned/center containers — check each part.
+    for (const row of rows) {
+      const button = row.querySelector(
+        "app-e-pay-tax-actions .mat-mdc-icon-button"
+      ) as HTMLElement | null
+      if (button) {
+        button.click()
+        return { clicked: true, renderedCols: [] }
+      }
+    }
+    const renderedCols = Array.from(
+      new Set(
+        rows.flatMap((row) =>
+          Array.from(row.querySelectorAll("[col-id]")).map((c) => c.getAttribute("col-id") || "")
+        )
+      )
+    )
+    return { clicked: false, renderedCols }
+  }, rowKey)
+}
+
+/** Click the first item of the actions menu that just opened (same item the legacy flow used). */
+async function clickFirstOpenMenuItem(
+  page: Page,
+  timeoutMs = 5000
+): Promise<{ clicked: string | null; labels: string[] }> {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    const result = await page.evaluate(() => {
+      const panels = Array.from(
+        document.querySelectorAll(".cdk-overlay-container .mat-mdc-menu-panel")
+      ) as HTMLElement[]
+      const panel = panels[panels.length - 1]
+      if (!panel) return null
+      const items = Array.from(panel.querySelectorAll(".mat-mdc-menu-item")) as HTMLElement[]
+      if (items.length === 0) return null
+      const labels = items.map((item) => (item.textContent || "").replace(/\s+/g, " ").trim())
+      items[0]!.click()
+      return { clicked: labels[0] ?? "", labels }
+    })
+    if (result) return result
+    await waitForSecs(250)
+  }
+  return { clicked: null, labels: [] }
+}
+
+type EpayRowDownloadResult =
+  | { ok: true; fileName: string }
+  | { ok: false; reason: "row-not-found" | "download-failed"; detail: string }
+
+/**
+ * Download one Generated Challans row (by CRN) on the current grid page and confirm a PDF
+ * actually landed in `downloadDir`. Retries the whole row → menu → file sequence.
+ */
+async function downloadEpayGridRowByCrn(
+  page: Page,
+  crn: string,
+  downloadDir: string,
+  maxAttempts = 3
+): Promise<EpayRowDownloadResult> {
+  let lastDetail = ""
+  let rowSeen = false
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (attempt > 1) await waitForSecs(2000)
+    const tag = `CRN ${crn} (attempt ${attempt}/${maxAttempts})`
+
+    await closeOpenMatMenus(page)
+
+    const { rowKey, gridCrns } = await locateEpayGridRowByCrn(page, crn)
+    if (rowKey === null) {
+      lastDetail = `not on current grid page; rendered CRNs: ${gridCrns.join(", ") || "none"}`
+      console.log(`${tag}: ${lastDetail}`)
+      continue
+    }
+    rowSeen = true
+
+    const beforeMtimes = getPdfMtimes(downloadDir)
+
+    let action = await clickEpayRowActionButton(page, rowKey)
+    if (!action.clicked) {
+      await scrollEpayGridTo(page, "end")
+      action = await clickEpayRowActionButton(page, rowKey)
+    }
+    if (!action.clicked) {
+      lastDetail = `row-index ${rowKey} found but Actions button not rendered (rendered columns: ${
+        action.renderedCols.join(", ") || "none"
+      })`
+      console.log(`${tag}: ${lastDetail}`)
+      continue
     }
 
-    const rows = Array.from(
-      document.querySelectorAll("ag-grid-angular .ag-row")
-    ) as HTMLElement[]
-    const row = rows.find((r) => {
-      const crnCell = r.querySelector('[col-id="crn"]')
-      return (crnCell?.textContent || "").replace(/\s+/g, "").includes(targetCrn)
-    })
-    if (!row) return false
+    const menu = await clickFirstOpenMenuItem(page)
+    if (!menu.clicked) {
+      lastDetail = `row-index ${rowKey}: actions menu did not open`
+      console.log(`${tag}: ${lastDetail}`)
+      continue
+    }
+    console.log(
+      `${tag}: row-index ${rowKey}, clicked "${menu.clicked}" (menu: ${menu.labels.join(" | ")})`
+    )
 
-    const actionButton = row.querySelector(
-      "app-e-pay-tax-actions .mat-mdc-icon-button"
-    ) as HTMLElement | null
-    if (!actionButton) return false
+    const fileName = await waitForNewPdfDownload(downloadDir, beforeMtimes, 30000)
+    if (fileName) {
+      if (!fileName.includes(crn)) {
+        console.log(`${tag}: warning — saved file ${fileName} does not contain the CRN`)
+      }
+      return { ok: true, fileName }
+    }
+    lastDetail = `clicked "${menu.clicked}" but no new PDF appeared in ${downloadDir} within 30s`
+    console.log(`${tag}: ${lastDetail}`)
+  }
 
-    actionButton.click()
-    await waitForSecs(500)
-    ;(
-      document.querySelector(".mat-mdc-menu-item.mat-focus-indicator") as HTMLElement | null
-    )?.click()
-    await waitForSecs(5000)
-    return true
-  }, crn)
+  return {
+    ok: false,
+    reason: rowSeen ? "download-failed" : "row-not-found",
+    detail: lastDetail,
+  }
 }
 
 export type EpayTargetedDownloadStats = PaymentHistoryDownloadStats & {
   matched: number
   notFound: number
+  failed: number
 }
 
-async function findAndDownloadEpayGridRowByCrn(
-  page: Page,
-  crn: string,
-  _assessmentYear?: string,
-  _filterDom?: EpayFilterModalDomIds,
-  _paymentType?: string
-): Promise<boolean> {
-  // Do not open the e-Pay filter modal — AY filter is slow/flaky on Generated Challans.
-  // Match CRN on the already-loaded grid (paginate if needed).
-  while (true) {
-    const found = await downloadEpayGridRowByCrn(page, crn)
-    if (found) return true
-
-    const hasNext = await clickNextPaymentHistoryPage(page)
-    if (!hasNext) return false
-    await waitForSecs(3000)
-  }
-}
-
-/** Download only e-Pay grid rows matching CSV targets (assessment year + amount). */
+/**
+ * Download only e-Pay grid rows matching CSV targets (assessment year + amount).
+ * Each target gets its own CRN; when several portal rows share a year+amount, the newest win.
+ */
 async function runEpayTargetedRowDownload(
   page: Page,
   targets: EpayRowDownloadTarget[],
-  _filterDom: EpayFilterModalDomIds,
-  _paymentType?: string
+  downloadDir: string
 ): Promise<EpayTargetedDownloadStats> {
   const stats: EpayTargetedDownloadStats = {
     totalSeen: 0,
@@ -891,25 +1165,34 @@ async function runEpayTargetedRowDownload(
     pages: 0,
     matched: 0,
     notFound: 0,
+    failed: 0,
   }
 
   if (targets.length === 0) return stats
 
-  type PendingTarget = EpayRowDownloadTarget & { key: string }
-  const pending = new Map<string, PendingTarget>()
+  // Count rather than dedupe: two CSV sections with the same amount are two challans.
+  type TargetGroup = { key: string; assessmentYear: string; amount: number; needed: number }
+  const groups = new Map<string, TargetGroup>()
   for (const target of targets) {
-    pending.set(`${target.assessmentYear}:${target.amount}`, {
-      ...target,
-      key: `${target.assessmentYear}:${target.amount}`,
-    })
+    const assessmentYear = target.assessmentYear.trim()
+    const key = `${assessmentYear}:${target.amount}`
+    const group = groups.get(key) ?? { key, assessmentYear, amount: target.amount, needed: 0 }
+    group.needed += 1
+    groups.set(key, group)
   }
 
   // Skip portal AY filter modal (wastes time / often fails). Match year+amount on grid rows.
   console.log(
-    `CSV-targeted download: no AY filter modal — matching ${pending.size} target(s) on grid`
+    `CSV-targeted download: no AY filter modal — matching ${targets.length} target(s) on grid: ${Array.from(
+      groups.values()
+    )
+      .map((g) => `${g.assessmentYear} / ${g.amount}${g.needed > 1 ? ` ×${g.needed}` : ""}`)
+      .join(", ")}`
   )
 
-  const candidates = new Map<string, EpayGridRow & { chlnCreDtMs: number }>()
+  type Candidate = EpayGridRow & { chlnCreDtMs: number; pageNum: number }
+  const candidates = new Map<string, Candidate[]>()
+  const seenCrns = new Set<string>()
 
   let pageNum = 0
   while (true) {
@@ -917,54 +1200,109 @@ async function runEpayTargetedRowDownload(
     stats.pages = pageNum
     await waitForSecs(2000)
 
+    const pageInfo = await getEpayGridPageInfo(page)
     const rows = await scrapeEpayGridRows(page)
     stats.totalSeen += rows.length
+    console.log(
+      `Grid page ${pageNum}${pageInfo ? ` (${pageInfo.current} of ${pageInfo.total})` : ""}: ${
+        rows.length
+      } row(s)${rows.length ? " — " : ""}${rows
+        .map((r) => `${r.crn || "?"} ${r.taxYear || "?"} ₹${r.amount} [${r.chlnCreDt || "?"}]`)
+        .join("; ")}`
+    )
 
     for (const row of rows) {
+      if (!row.crn || seenCrns.has(row.crn)) continue
       const key = `${row.taxYear}:${row.amount}`
-      if (!pending.has(key)) continue
-      const existing = candidates.get(key)
-      const chlnCreDtMs = parseChlnCreDtMs(row.chlnCreDt)
-      if (!existing || chlnCreDtMs >= existing.chlnCreDtMs) {
-        candidates.set(key, { ...row, chlnCreDtMs })
-      }
+      if (!groups.has(key)) continue
+      seenCrns.add(row.crn)
+      const list = candidates.get(key) ?? []
+      list.push({ ...row, chlnCreDtMs: parseChlnCreDtMs(row.chlnCreDt), pageNum })
+      candidates.set(key, list)
     }
 
-    const allTargetsSeen = Array.from(pending.keys()).every((k) => candidates.has(k))
+    const allTargetsSeen = Array.from(groups.values()).every(
+      (g) => (candidates.get(g.key)?.length ?? 0) >= g.needed
+    )
     if (allTargetsSeen) break
     const hasNext = await clickNextPaymentHistoryPage(page)
     if (!hasNext) break
     await waitForSecs(3000)
   }
 
-  const toDownload = Array.from(pending.values())
-  for (const target of toDownload) {
-    const match = candidates.get(target.key)
-    if (!match?.crn) {
-      stats.notFound += 1
+  type Assignment = { crn: string; assessmentYear: string; amount: number; pageNum: number }
+  const assignments: Assignment[] = []
+  for (const group of groups.values()) {
+    const matches = (candidates.get(group.key) ?? []).sort((a, b) => b.chlnCreDtMs - a.chlnCreDtMs)
+    if (matches.length > group.needed) {
       console.log(
-        `No portal row for CSV target: ${target.assessmentYear} / amount ${target.amount}`
+        `${matches.length} portal rows match ${group.assessmentYear} / ${group.amount}; using newest ${
+          group.needed
+        }: ${matches
+          .slice(0, group.needed)
+          .map((m) => m.crn)
+          .join(", ")}`
       )
-      continue
     }
+    for (const match of matches.slice(0, group.needed)) {
+      assignments.push({
+        crn: match.crn,
+        assessmentYear: group.assessmentYear,
+        amount: group.amount,
+        pageNum: match.pageNum,
+      })
+    }
+    const missing = group.needed - Math.min(matches.length, group.needed)
+    if (missing > 0) {
+      stats.notFound += missing
+      console.log(
+        `No portal row for CSV target: ${group.assessmentYear} / amount ${group.amount}${
+          missing > 1 ? ` (${missing} missing)` : ""
+        }`
+      )
+    }
+  }
 
+  // Scanning stopped on the last page — work backwards so each page is visited once.
+  assignments.sort((a, b) => b.pageNum - a.pageNum)
+  const failedCrns: string[] = []
+  let currentPage = pageNum
+
+  for (const assignment of assignments) {
     stats.matched += 1
     console.log(
-      `Downloading CRN ${match.crn} for ${target.assessmentYear} / amount ${target.amount}`
+      `Downloading CRN ${assignment.crn} for ${assignment.assessmentYear} / amount ${assignment.amount} (grid page ${assignment.pageNum})`
     )
-    const ok = await findAndDownloadEpayGridRowByCrn(page, match.crn)
-    if (ok) {
+    currentPage = await goToEpayGridPage(page, assignment.pageNum, currentPage)
+
+    let result = await downloadEpayGridRowByCrn(page, assignment.crn, downloadDir)
+    if (!result.ok && result.reason === "row-not-found") {
+      console.log(`CRN ${assignment.crn} not on grid page ${currentPage} — searching all pages`)
+      const foundPage = await findEpayGridPageWithCrn(page, assignment.crn)
+      if (foundPage !== null) {
+        currentPage = foundPage
+        result = await downloadEpayGridRowByCrn(page, assignment.crn, downloadDir)
+      } else {
+        currentPage = (await getEpayGridPageInfo(page))?.current ?? currentPage
+      }
+    }
+
+    if (result.ok) {
       stats.downloaded += 1
-      pending.delete(target.key)
+      console.log(`Downloaded CRN ${assignment.crn} → ${result.fileName}`)
     } else {
-      stats.notFound += 1
-      console.log(`Failed to download CRN ${match.crn}`)
+      stats.failed += 1
+      failedCrns.push(assignment.crn)
+      console.log(`Failed to download CRN ${assignment.crn} (${result.reason}): ${result.detail}`)
     }
   }
 
   console.log(
-    `CSV-targeted download summary: ${stats.matched} matched, ${stats.downloaded} downloaded, ${stats.notFound} not found`
+    `CSV-targeted download summary: ${targets.length} target(s), ${stats.matched} matched, ${stats.downloaded} downloaded, ${stats.failed} failed, ${stats.notFound} not found on portal`
   )
+  if (failedCrns.length > 0) {
+    console.log(`CSV-targeted download failed CRNs: ${failedCrns.join(", ")}`)
+  }
   return stats
 }
 
@@ -1619,7 +1957,6 @@ async function runChallanEpayFilterDownload(
     skipNewActRadio
   )
   console.log("Username:", Username)
-  console.log("Password:", Password)
   console.log("From Date:", fromDate)
   console.log("To Date:", toDate)
   console.log("Assessment Year:", assessmentYear)
@@ -1717,7 +2054,7 @@ async function runChallanEpayFilterDownload(
       console.log(
         `CSV-targeted ${kind.flowLabel}: ${csvTargets.length} amount/year target(s) for ${companyName}`
       )
-      paymentHistoryStats = await runEpayTargetedRowDownload(page, csvTargets, dom, paymentType)
+      paymentHistoryStats = await runEpayTargetedRowDownload(page, csvTargets, downloadPath)
     } else if (isPaymentHistory && paymentHistoryCapture) {
       paymentHistoryStats = await runPaymentHistoryDownloadWithIntercept(
         page,

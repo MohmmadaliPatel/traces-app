@@ -1,6 +1,6 @@
 import { NotFoundError } from "blitz"
 import { resolver } from "@blitzjs/rpc"
-import db from "db"
+import db, { maskCompanySecrets } from "db"
 import { z } from "zod"
 
 const GetCompany = z.object({
@@ -14,5 +14,5 @@ export default resolver.pipe(resolver.zod(GetCompany), resolver.authorize(), asy
 
   if (!company) throw new NotFoundError()
 
-  return company
+  return maskCompanySecrets(company)
 })

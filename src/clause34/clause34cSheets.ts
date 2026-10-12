@@ -347,8 +347,10 @@ export function append34cBlock(
       style(sheet.getCell(row, 16), { align: "left" }).value = [
         r.notes,
         r.verifiedAgainstConso
-          ? "Re-verified against the conso file."
-          : "Carried forward from the previous working paper - conso file not available to re-verify.",
+          ? "Re-extracted from the conso file and agreed in every field. This checks the extraction " +
+            "only - the conso file is the same source the figure came from, so it is not independent " +
+            "confirmation that the interest is correct."
+          : "Carried forward from the previous working paper - no conso file held to re-extract from.",
       ]
         .filter(Boolean)
         .join(" ")

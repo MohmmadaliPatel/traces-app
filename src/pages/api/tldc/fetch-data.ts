@@ -1,8 +1,12 @@
 import { withApiAuth } from "src/shared/http"
+import { unmaskPortalCredentials } from "src/shared/security/portalCredentials"
 import db from "db"
 import { NextApiRequest, NextApiResponse } from "next"
 import { fetchTldcData, processPdfFiles } from "src/scripts/fetchTldcData"
 import { updateTldcData } from "src/scripts/updateTldcData"
+import { applyOldActVerificationRows } from "src/tldc/applyOldActVerification"
+import { sendTldcError, sendTldcException, TldcWarning } from "src/tldc/errors"
+import { serializeTldcRow } from "src/tldc/serialize"
 
 /**
  * API endpoint to fetch TLDC data using Puppeteer
@@ -15,20 +19,24 @@ export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ct
   }
 
   try {
-    const { tan, year, credentials, companyId } = req.body
+    const { tan, year, credentials: rawCredentials, companyId } = req.body
+    // The UI sends a masked password; use the stored one for this company
+    const credentials = await unmaskPortalCredentials(rawCredentials, { companyId, tan })
 
     if (
       !tan ||
       !year ||
+      !companyId ||
       !credentials ||
       !credentials.userId ||
       !credentials.password ||
       !credentials.tan
     ) {
-      return res.status(400).json({
-        success: false,
-        message: "Missing required parameters",
-      })
+      return sendTldcError(
+        res,
+        "LDC_INVALID_INPUT",
+        "Missing required parameters (tan, year, companyId, credentials)"
+      )
     }
 
     console.log(`API: Fetching TLDC data for TAN: ${tan}, Year: ${year}`)
@@ -79,6 +87,7 @@ export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ct
                   tdsRate: data.tdsRate || "0",
                   validFrom: new Date(),
                   validTo: new Date(new Date().setFullYear(new Date().getFullYear() + 1)),
+                  pdfPath: data.pdfPath || null,
                 },
               })
               tldcDataArr.push(tldcData)
@@ -93,6 +102,7 @@ export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ct
                   certNumber: data.certNumber,
                   pan: data.pan || existingRecord.pan,
                   panName: data.panName || existingRecord.panName,
+                  pdfPath: data.pdfPath || existingRecord.pdfPath,
                   updatedAt: new Date(),
                 },
               })
@@ -115,54 +125,25 @@ export default withApiAuth(async (req: NextApiRequest, res: NextApiResponse, _ct
     })
 
     // Update the TLDC data in the database with the detailed information from updatedResult
-    if (companyId && updatedResult.data) {
-      for (const data of updatedResult.data) {
-        if (data.certNumber && data.pan) {
-          try {
-            // Find and update the existing TLDC data record
-            await db.tldcData.updateMany({
-              where: {
-                companyId: parseInt(companyId),
-                certNumber: data.certNumber,
-                pan: data.pan,
-              },
-              data: {
-                panName: data.panName || undefined,
-                section: data.section || undefined,
-                NatureOfPayment: data.NatureOfPayment || undefined,
-                tdsAmountLimit: data.tdsAmountLimit || undefined,
-                tdsAmountConsumed: data.tdsAmountConsumed || undefined,
-                tdsRate: data.tdsRate || undefined,
-                validFrom: data.validFrom ? new Date(data.validFrom) : undefined,
-                validTo: data.validTo ? new Date(data.validTo) : undefined,
-                cancelDate: data.cancelDate ? new Date(data.cancelDate) : undefined,
-                updatedAt: new Date(),
-              },
-            })
-            console.log(
-              `✅ Updated TLDC data for certificate: ${data.certNumber}, PAN: ${data.pan}`
-            )
-          } catch (updateError) {
-            console.error(
-              `❌ Error updating TLDC data for certificate: ${data.certNumber}, PAN: ${data.pan}:`,
-              updateError
-            )
-          }
-        }
-      }
-    }
+    const warnings: TldcWarning[] = updatedResult.data
+      ? await applyOldActVerificationRows(parseInt(companyId), updatedResult.data)
+      : []
+
+    const savedRecords = await db.tldcData.findMany({
+      where: { id: { in: tldcDataArr.map((r) => r.id) } },
+      orderBy: { certNumber: "asc" },
+    })
 
     return res.status(200).json({
       success: true,
       data: result.data,
       cached: result.cached || false,
+      records: savedRecords.map(serializeTldcRow),
+      warnings,
       message: "Successfully fetched TLDC data",
     })
   } catch (error) {
     console.error("API Error:", error)
-    return res.status(500).json({
-      success: false,
-      message: error instanceof Error ? error.message : "Unknown error occurred",
-    })
+    return sendTldcException(res, error)
   }
 })

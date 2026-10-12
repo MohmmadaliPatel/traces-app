@@ -1,62 +1,23 @@
-import puppeteer from "puppeteer"
-import path from "path"
-import os from "os"
 import {
-  loginWithTracesApiAndPreauth,
+  openTracesSession,
   rewriteTracesNewPortalUrlToTraces61,
   traces61DedUrl,
+  type TracesSession,
 } from "../jobs/traces"
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
-
-let globalPage: any = null
-
-async function loginToTdsPortal(credentials: {
-  userId: string
-  password: string
-  tan: string
-}): Promise<any> {
-  if (globalPage) {
-    console.log("Reusing existing browser session")
-    return globalPage
-  }
-
-  console.log("Starting new browser session...")
-  const browser = await puppeteer.launch({
-    headless: false,
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-    executablePath:
-      process.platform === "darwin"
-        ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-        : process.platform === "win32"
-        ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
-        : undefined,
-  })
-
-  const page = await browser.newPage()
-
-  await loginWithTracesApiAndPreauth(
-    page,
-    {
-      userId: credentials.userId,
-      password: credentials.password,
-      tan: credentials.tan,
-    },
-    { redirectGuard: false }
-  )
-
-  globalPage = page
-  return globalPage
-}
 
 export async function fetchOutstandingDemand({
   credentials,
 }: {
   credentials: { userId: string; password: string; tan: string }
 }): Promise<{ data: any; priorYearsData?: any }> {
+  // Fresh browser per call, logged in with this request's credentials (never reused).
+  let session: TracesSession | undefined
   try {
     console.log("🚀 Starting Outstanding Demand fetch...")
-    const page = await loginToTdsPortal(credentials)
+    session = await openTracesSession(credentials, { login: { redirectGuard: false } })
+    const page: any = session.page
 
     let demandData: any = null
     let priorYearsData: any = null
@@ -158,5 +119,7 @@ export async function fetchOutstandingDemand({
   } catch (error) {
     console.error("❌ Error in fetchOutstandingDemand:", error)
     throw error
+  } finally {
+    await session?.close()
   }
 }

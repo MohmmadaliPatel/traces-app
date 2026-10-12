@@ -20,6 +20,8 @@ import {
   loginTraces,
   resolveCaptchaFromImageBase64,
 } from "../jobs/traces"
+import { parseTracesDate } from "../tldc/dates"
+import { toPublicPath } from "../tldc/pdfPath"
 
 const MAX_LOGIN_ATTEMPTS = 5
 const CAPTCHA_RETRY_ERROR_CODES = new Set(["CPT403", "CPT401", "CPT400"])
@@ -87,9 +89,12 @@ export type NewActTldcRow = {
   tdsRate: string
   validFrom: Date
   validTo: Date
+  issueDate: Date | null
   cancelDate: Date | null
   isActive: boolean
   detailJsonPath?: string
+  /** Certificate PDF, relative to public/ (null when TRACES has not prepared it yet). */
+  pdfPath?: string | null
   source: "searchDeductor" | "childCertificate"
 }
 
@@ -108,7 +113,7 @@ function log(msg: string, extra?: unknown) {
   else console.log(`[TLDC:NewAct] ${msg}`)
 }
 
-function safeFolderName(name: string): string {
+export function safeFolderName(name: string): string {
   return name.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").trim() || "unknown"
 }
 
@@ -472,9 +477,7 @@ async function fetchChildCertificateDetailWithRetry(
 }
 
 function parsePortalDate(value?: string | null): Date | null {
-  if (!value) return null
-  const d = new Date(value)
-  return Number.isNaN(d.getTime()) ? null : d
+  return parseTracesDate(value)
 }
 
 function taxYearToFy(taxYear: number | string | undefined, fallbackFy: string): string {
@@ -515,11 +518,21 @@ export function mapChildCertificateToRow(
     tdsRate: String(detail.certificateRate ?? "0"),
     validFrom,
     validTo,
+    issueDate: parsePortalDate(detail.issueDate),
+    // The child-certificate API has no cancellation date; activeFlag "N" marks a cancelled certificate.
     cancelDate: null,
     isActive: (detail.activeFlag ?? "A").toUpperCase() !== "N",
     detailJsonPath,
     source: "childCertificate",
   }
+}
+
+/** PDFs are saved as {reqId}.pdf, so the certificate number parsed from each PDF is the only link. */
+function lookupPdfPath(parsedPdfs: ParsedPdfCert[], certNumber?: string | null): string | null {
+  const cert = (certNumber || "").toUpperCase()
+  if (!cert) return null
+  const hit = parsedPdfs.find((p) => p.certNumber?.toUpperCase() === cert)
+  return hit ? toPublicPath(hit.pdfPath) : null
 }
 
 function lookupPanName(
@@ -732,13 +745,10 @@ export async function fetchTldcDataNewAct({
       const panName =
         panNameFromPdf ||
         lookupPanName(parsedPdfs, detail.childCertNum, detail.appPan)
-      rows.push(
-        mapChildCertificateToRow(
-          detail,
-          { ...cert, fy: targetFy, panName },
-          detailJsonPath
-        )
-      )
+      rows.push({
+        ...mapChildCertificateToRow(detail, { ...cert, fy: targetFy, panName }, detailJsonPath),
+        pdfPath: lookupPdfPath(parsedPdfs, detail.childCertNum || cert.childCertNum),
+      })
       log(`detail OK ${cert.childCertNum}${panName ? ` panName=${panName}` : ""}`)
     } catch (err: any) {
       log(`detail FAIL ${cert.childCertNum}: ${err?.message || err}`)
@@ -756,8 +766,10 @@ export async function fetchTldcDataNewAct({
         tdsRate: "0",
         validFrom: parsePortalDate(cert.validFrom) || new Date(),
         validTo: parsePortalDate(cert.validTo) || new Date(),
+        issueDate: null,
         cancelDate: null,
         isActive: true,
+        pdfPath: lookupPdfPath(parsedPdfs, cert.childCertNum),
         source: "searchDeductor",
       })
     }
@@ -829,14 +841,15 @@ export async function updateTldcDataNewAct({
         rec.pan || ""
       )
       const panName = lookupPanName(parsedPdfs, rec.certNumber, detail.appPan || rec.pan)
-      rows.push(
-        mapChildCertificateToRow(detail, {
+      rows.push({
+        ...mapChildCertificateToRow(detail, {
           childCertNum: rec.certNumber,
           deducteePan: rec.pan,
           fy: normalizeTaxYear(rec.fy),
           panName,
-        })
-      )
+        }),
+        pdfPath: lookupPdfPath(parsedPdfs, rec.certNumber),
+      })
     } catch (err: any) {
       log(`update FAIL ${rec.certNumber}: ${err?.message || err}`)
     }

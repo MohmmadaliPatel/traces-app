@@ -1,5 +1,5 @@
 import { resolver } from "@blitzjs/rpc"
-import db from "db"
+import db, { maskCompanySecrets } from "db"
 import { z } from "zod"
 
 const UpdateCompanySchema = z.object({
@@ -41,7 +41,7 @@ export default resolver.pipe(
     return {
       success: true,
       message: "Company updated successfully",
-      company: updatedCompany,
+      company: maskCompanySecrets(updatedCompany),
     }
   }
 )

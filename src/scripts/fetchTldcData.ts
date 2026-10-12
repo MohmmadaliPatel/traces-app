@@ -1,67 +1,64 @@
-import puppeteer, { Page } from "puppeteer"
 import path from "path"
 import fs from "fs"
 import os from "os"
 import db from "db" // Import database to check for existing records
-import { loginWithTracesApiAndPreauth, traces61DedUrl } from "../jobs/traces"
+import { openTracesSession, traces61DedUrl, type TracesSession } from "../jobs/traces"
 import pdfParse from "pdf-parse"
+import { toPublicPath } from "../tldc/pdfPath"
 
 // Utility function to wait for a specified time
 const waitForSecs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
-// In-memory cache
-
-let globalPage: Page | null = null
-
 /**
- * Login to the TDSCPC portal
- * @returns {Promise<Page>} The authenticated Puppeteer page
+ * Fresh TRACES session for one call, logged in with exactly these credentials.
+ * Never cached: concurrent calls must not share a page or another company's login.
  */
-async function loginToTdsPortal(credentials: {
+function openTldcSession(credentials: {
   userId: string
   password: string
   tan: string
-}): Promise<Page> {
-  if (globalPage) {
-    console.log("🔐 Already logged in.")
-    return globalPage
-  }
-
-  const browser = await puppeteer.launch({
-    headless: false,
+}): Promise<TracesSession> {
+  return openTracesSession(credentials, {
     defaultViewport: null,
     args: [
-      "--start-maximized",
-      "--disable-web-security",
-      "--disable-features=IsolateOrigins,site-per-process",
-      "--allow-file-access-from-files",
-    ],
-    // This should be configurable based on environment
-    executablePath:
-      process.platform === "darwin"
-        ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-        : process.platform === "win32"
-        ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
-        : undefined, // Use default for Linux
+    "--start-maximized",
+    "--disable-web-security",
+    "--disable-features=IsolateOrigins,site-per-process",
+    "--allow-file-access-from-files",
+  ],
+    beforeLogin: async (page) => {
+      // Set extra permissions for downloads
+      const downloadClient = await page.target().createCDPSession()
+      await downloadClient.send("Browser.setDownloadBehavior", {
+        behavior: "allow",
+        downloadPath: path.join(os.tmpdir(), "tldc-downloads"),
+        eventsEnabled: true,
+      })
+    },
   })
+}
 
-  const page = await browser.newPage()
-
-  // Set extra permissions for downloads
-  const downloadClient = await page.target().createCDPSession()
-  await downloadClient.send("Browser.setDownloadBehavior", {
-    behavior: "allow",
-    downloadPath: path.join(os.tmpdir(), "tldc-downloads"),
-    eventsEnabled: true,
-  })
-
-  await loginWithTracesApiAndPreauth(page, {
-    userId: credentials.userId,
-    password: credentials.password,
-    tan: credentials.tan,
-  })
-  globalPage = page
-  return globalPage
+/**
+ * Keep a parsed certificate PDF as tldc-downloads/certificates/{certNumber}.pdf.
+ * It must leave the download folder itself: new downloads are detected as "new .pdf
+ * files in tldc-downloads", so a PDF left there would be mistaken for the next row's.
+ */
+function keepCertificatePdf(filePath: string, certNumber?: string): string | null {
+  const safeCert = (certNumber || "").replace(/[^A-Za-z0-9]/g, "")
+  try {
+    if (!safeCert) {
+      fs.unlinkSync(filePath)
+      return null
+    }
+    const keepDir = path.join(path.dirname(filePath), "certificates")
+    fs.mkdirSync(keepDir, { recursive: true })
+    const target = path.join(keepDir, `${safeCert.toUpperCase()}.pdf`)
+    fs.renameSync(filePath, target)
+    return toPublicPath(target)
+  } catch (error) {
+    console.error(`⚠️ Failed to keep PDF ${filePath}:`, error)
+    return null
+  }
 }
 
 interface CertificateRow {
@@ -103,11 +100,13 @@ export async function processPdfFiles(downloadedFiles: any[]): Promise<any[]> {
         text.match(/Permanent\s*Account\s*Number:?\s*([A-Z]{5}[0-9]{4}[A-Z])/i)
 
       // Create a copy of the file object with the extracted data
+      const certNumber = file.certNumber || (certNumberMatch ? certNumberMatch[1] : undefined)
       const processedFile = {
-        certNumber: file.certNumber || (certNumberMatch ? certNumberMatch[1] : undefined),
+        certNumber,
         pan: panNumberMatch ? panNumberMatch[1] : undefined,
         din: file.din,
         fy: file.fy,
+        pdfPath: keepCertificatePdf(file.filePath, certNumber),
       }
       console.log("PROCESSED FILE", processedFile)
       console.log("CERT NUMBER", processedFile.certNumber)
@@ -116,28 +115,15 @@ export async function processPdfFiles(downloadedFiles: any[]): Promise<any[]> {
       console.log("FY", processedFile.fy)
 
       processedFiles.push(processedFile)
-
-      // Delete the file after extracting data
-      try {
-        fs.unlinkSync(file.filePath)
-      } catch (deleteError) {
-        console.error(`⚠️ Failed to delete file ${file.filePath}:`, deleteError)
-      }
     } catch (error) {
       console.error(`❌ Error processing PDF file ${file.fileName}:`, error)
-      // Keep the original file data if processing fails
+      // Keep the original file data if processing fails; the inbox row still gives the cert number
       processedFiles.push({
         certNumber: file.certNumber,
         din: file.din,
         fy: file.fy,
+        pdfPath: file.filePath ? keepCertificatePdf(file.filePath, file.certNumber) : null,
       })
-
-      // Try to delete the file even if processing failed
-      try {
-        fs.unlinkSync(file.filePath)
-      } catch (deleteError) {
-        console.error(`⚠️ Failed to delete file ${file.filePath}:`, deleteError)
-      }
     }
   }
 
@@ -210,8 +196,10 @@ export async function fetchTldcData({
   let emptyPagesCount = 0
   const MAX_EMPTY_PAGES = 3
 
+  let session: TracesSession | undefined
   try {
-    const page = await loginToTdsPortal(credentials)
+    session = await openTldcSession(credentials)
+    const page = session.page
 
     // Configure download behavior
     const client = await page.target().createCDPSession()
@@ -447,8 +435,6 @@ export async function fetchTldcData({
     // Process downloaded PDFs to extract certificate numbers and PAN numbers
     const processedDownloads = await processPdfFiles(allDownloads)
 
-    await page.close()
-    globalPage = null
 
     // Return information about the downloaded certificates with extracted data
     return {
@@ -460,7 +446,6 @@ export async function fetchTldcData({
       },
     }
   } catch (error) {
-    globalPage = null // Reset global page on error
     console.error("❌ Error fetching TLDC data:", error)
 
     // Try to process any PDFs that were downloaded before the error
@@ -504,6 +489,8 @@ export async function fetchTldcData({
     }
 
     throw error
+  } finally {
+    await session?.close()
   }
 }
 

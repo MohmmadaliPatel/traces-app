@@ -116,7 +116,12 @@ const securityMiddleware: any = async (req: NextApiRequest, res: NextApiResponse
         {
           ip: (req.headers["x-forwarded-for"] as string) || req.socket.remoteAddress,
           method: req.method,
-          body: req.body ? JSON.stringify(req.body).slice(0, 500) : "(empty)",
+          // Never log secrets from the blocked body
+          body: req.body
+            ? JSON.stringify(req.body, (key, value) =>
+                /password|passwd|pin|token|secret|captcha/i.test(key) ? "[redacted]" : value
+              ).slice(0, 500)
+            : "(empty)",
         }
       )
       res.status(403).json({

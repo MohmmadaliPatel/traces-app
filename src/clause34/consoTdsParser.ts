@@ -42,7 +42,12 @@ export const CD = {
   INTEREST_ON_CHALLAN: 24,
   FEE: 25,
   TOTAL_DEPOSITED: 26,
+  CLAIMED: 32,
+  BOOK_ENTRY: 36,
+  /** Unconsumed / balance. Emphatically not interest. */
+  BALANCE: 37,
   INTEREST_IN_RETURN: 33,
+  MINOR_HEAD: 40,
 } as const
 
 /**
@@ -52,24 +57,48 @@ export const CD = {
  */
 export const DD = {
   RECORD_TYPE: 1,
+  CHALLAN_REC: 2,
+  SERIAL_IN_CHALLAN: 3,
+  DEDUCTEE_SL: 4,
+  DEDUCTEE_TYPE: 7,
   PAN: 9,
   NAME: 12,
   TDS: 13,
+  SURCHARGE: 14,
+  CESS: 15,
+  TOTAL_DEDUCTED: 16,
+  TOTAL_DEPOSITED: 18,
   AMOUNT_PAID: 21,
   DATE_PAID: 22,
   DATE_DEDUCTED: 23,
   DATE_DEPOSITED: 24,
+  RATE: 25,
+  REASON_CODE: 29,
   SECTION: 33,
+  CERT_197: 34,
 } as const
 
 export type ConsoDeductee = {
   /** Serial of the challan this entry sits under. */
   challanSerial: string
+  /** 1-based position of this entry within its challan. */
+  recordNo: number
+  /** Deductee / employee serial as the statement numbers it (can skip). */
+  deducteeSl: string
+  /** "Company" / "Non-Company", from the 1 / 2 code. */
+  deducteeType: string
   pan: string
   name: string
   sectionCode: string
   amountPaid: number
   tds: number
+  surcharge: number
+  cess: number
+  totalDeducted: number
+  totalDeposited: number
+  rate: string
+  reasonCode: string
+  cert197: string
   datePaid: Date | null
   dateDeducted: Date | null
   dateDeposited: Date | null
@@ -90,6 +119,12 @@ export type ConsoChallan = {
   totalDeposited: number
   /** Interest allocated against this challan in the TDS return — what clause 34(c) reports. */
   interestInReturn: number
+  /** Amount of the challan claimed against deductees in this statement. */
+  claimed: number
+  /** Balance field [37]. NOT interest — a tool mistaking it for interest is the bug this guards. */
+  balance: number
+  minorHead: string
+  bookEntry: string
 }
 
 /** Conso amounts are zero-padded fixed-width decimals, e.g. `000000000234.00`. */
@@ -134,6 +169,10 @@ export function parseConsoChallans(filePath: string): ConsoChallan[] {
       fee: amount(f[CD.FEE]),
       totalDeposited: amount(f[CD.TOTAL_DEPOSITED]),
       interestInReturn: amount(f[CD.INTEREST_IN_RETURN]),
+      claimed: amount(f[CD.CLAIMED]),
+      balance: amount(f[CD.BALANCE]),
+      minorHead: String(f[CD.MINOR_HEAD] ?? "").trim(),
+      bookEntry: String(f[CD.BOOK_ENTRY] ?? "").trim(),
     })
   }
 
@@ -145,23 +184,37 @@ export function parseConsoDeductees(filePath: string): ConsoDeductee[] {
   const text = fs.readFileSync(filePath, "latin1")
   const out: ConsoDeductee[] = []
   let challanSerial = ""
+  let recordNo = 0
 
   for (const line of text.split(/\r?\n/)) {
     if (!line) continue
     const f = line.split("^")
     if (f[CD.RECORD_TYPE] === "CD") {
       challanSerial = String(f[CD.SERIAL] ?? "").trim()
+      recordNo = 0
       continue
     }
     if (f[DD.RECORD_TYPE] !== "DD") continue
 
+    recordNo++
+    const typeCode = String(f[DD.DEDUCTEE_TYPE] ?? "").trim()
     out.push({
       challanSerial,
+      recordNo,
+      deducteeSl: String(f[DD.DEDUCTEE_SL] ?? "").trim(),
+      deducteeType: typeCode === "1" ? "Company" : typeCode === "2" ? "Non-Company" : "",
       pan: String(f[DD.PAN] ?? "").trim(),
       name: String(f[DD.NAME] ?? "").trim(),
       sectionCode: String(f[DD.SECTION] ?? "").trim(),
       amountPaid: amount(f[DD.AMOUNT_PAID]),
       tds: amount(f[DD.TDS]),
+      surcharge: amount(f[DD.SURCHARGE]),
+      cess: amount(f[DD.CESS]),
+      totalDeducted: amount(f[DD.TOTAL_DEDUCTED]),
+      totalDeposited: amount(f[DD.TOTAL_DEPOSITED]),
+      rate: String(f[DD.RATE] ?? "").trim(),
+      reasonCode: String(f[DD.REASON_CODE] ?? "").trim(),
+      cert197: String(f[DD.CERT_197] ?? "").trim(),
       datePaid: parseConsoDate(f[DD.DATE_PAID]),
       dateDeducted: parseConsoDate(f[DD.DATE_DEDUCTED]),
       dateDeposited: parseConsoDate(f[DD.DATE_DEPOSITED]),
@@ -195,4 +248,48 @@ export function indexConsoFiles(root: string): Map<string, string> {
   }
   walk(root)
   return found
+}
+
+/** Batch header (`BH`) — the statement's own identity block. */
+export const BH = {
+  RECORD_TYPE: 1,
+  FORM_TYPE: 4,
+  ORIGINAL_TOKEN: 7,
+  LATEST_TOKEN: 8,
+  TAN: 12,
+  PAN: 14,
+  ASSESSMENT_YEAR: 15,
+  FINANCIAL_YEAR: 16,
+  QUARTER: 17,
+  DEDUCTOR_NAME: 18,
+} as const
+
+export type ConsoBatch = {
+  formType: string
+  originalToken: string
+  latestToken: string
+  tan: string
+  pan: string
+  financialYear: string
+  quarter: string
+  deductorName: string
+}
+
+export function parseConsoBatch(filePath: string): ConsoBatch | null {
+  for (const line of fs.readFileSync(filePath, "latin1").split(/\r?\n/)) {
+    if (!line) continue
+    const f = line.split("^")
+    if (f[BH.RECORD_TYPE] !== "BH") continue
+    return {
+      formType: String(f[BH.FORM_TYPE] ?? "").trim(),
+      originalToken: String(f[BH.ORIGINAL_TOKEN] ?? "").trim(),
+      latestToken: String(f[BH.LATEST_TOKEN] ?? "").trim(),
+      tan: String(f[BH.TAN] ?? "").trim(),
+      pan: String(f[BH.PAN] ?? "").trim(),
+      financialYear: String(f[BH.FINANCIAL_YEAR] ?? "").trim(),
+      quarter: String(f[BH.QUARTER] ?? "").trim(),
+      deductorName: String(f[BH.DEDUCTOR_NAME] ?? "").trim(),
+    }
+  }
+  return null
 }

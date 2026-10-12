@@ -923,7 +923,7 @@ export default class NoticeDownloaderJustification {
 
   async getTracesData(company: any) {
     try {
-      this.logger.log(`Getting Traces Data for ${JSON.stringify(company)}`)
+      this.logger.log(`Getting Traces Data for ${company?.name} (${company?.tan})`)
       const isManualCaptcha = process.env.IS_CAPTCHA_MANUAL == "true"
 
       // Function to get captcha image

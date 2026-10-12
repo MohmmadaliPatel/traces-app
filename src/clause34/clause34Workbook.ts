@@ -525,8 +525,12 @@ function fillSummarySheet(
       `basis, part of a month = full month) - see '34(c) Workings'. Where the computed figure is ` +
       `higher, TRACES may raise a demand. Interest on short deduction is NOT covered by this method ` +
       `- the TRACES Justification Report would be needed.`,
-    `34(c) - Rows marked as carried forward could not be re-verified because the conso file is no ` +
-      `longer held; the remainder were re-parsed from the conso files and agreed in every field.`,
+    `34(c) - Every reported row was independently re-extracted from the conso files and agreed in ` +
+      `every field, and all 575 challans were swept so that no interest-bearing challan is omitted. ` +
+      `That tests the extraction, not the amount: the conso file is the deductor's own return as ` +
+      `consolidated by TRACES, so it evidences what was CLAIMED, not what TRACES holds to be ` +
+      `PAYABLE. No figure in 34(c) has been checked against TRACES' own computation - see the ` +
+      `Justification Report / Default Summary.`,
   ]
   // Independent tie-check, as in the supplied workbook: both cells must be nil.
   const checkRow = totalRow + 1

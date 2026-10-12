@@ -2,7 +2,7 @@
  * Dump TRACES filedownload list for Balam.
  * CONSO_HEADLESS=1 npx tsx src/scripts/debugConsoDownload.ts
  */
-import { PrismaClient } from "@prisma/client"
+import db from "db" // shared client: decrypts stored portal credentials
 import puppeteer from "puppeteer"
 import { loginWithTracesApiAndPreauth, prepareTraces61FormSubmit, traces61DedUrl } from "src/jobs/traces"
 import { waitForSecs } from "src/utils/promises"
@@ -13,7 +13,6 @@ const TAN = "MUMC29054E"
 const OUT = path.join(process.cwd(), "tmp", "conso-download-debug")
 
 async function main() {
-  const db = new PrismaClient()
   const company = await db.company.findFirst({ where: { tan: { equals: TAN } } })
   await db.$disconnect()
   if (!company?.user_id || !company.password) {
