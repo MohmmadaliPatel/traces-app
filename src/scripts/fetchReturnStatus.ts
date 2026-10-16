@@ -1,12 +1,20 @@
 import {
-  openTracesSession,
-  rewriteTracesNewPortalUrlToTraces61,
-  traces61DedUrl,
-  type TracesSession,
+  openTraces61ApiSession,
+  postLegacyServletJson,
+  type Traces61ApiSession,
 } from "../jobs/traces"
 
-const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
-
+/**
+ * Return Status — API-only (no Puppeteer).
+ *
+ * The legacy stmtstatus.xhtml page feeds its grid from DedStmtStatusServlet:
+ *   POST /app/ded/srv/DedStmtStatusServlet?financialYear=<startYear>&quarter=<3..6>&formType=<24Q|…>&reqType=1
+ *   → { totalpages, page, rowCount, rows: [{ finyear, quarter, formtype, tokenno, dtoffiling,
+ *                                            status, dtofprcng, stmnttype, remarks, reason }] }
+ * Rejected rows expose the failure text via:
+ *   POST /app/ded/srv/DedStmtStatusServlet?reqType=5  body: errIds=<row.remarks>
+ *   → [{ failMsg }]
+ */
 export async function fetchReturnStatus({
   credentials,
   financialYears,
@@ -18,279 +26,82 @@ export async function fetchReturnStatus({
   quarters: string[]
   formTypes: string[]
 }): Promise<{ data: any[] }> {
-  // Fresh browser per call, logged in with this request's credentials (never reused).
-  let session: TracesSession | undefined
+  let session: Traces61ApiSession | undefined
   try {
-    console.log("🚀 Starting Return Status fetch...")
-    session = await openTracesSession(credentials, { login: { redirectGuard: false } })
-    const page: any = session.page
+    console.log("🚀 Starting Return Status fetch (API)...")
+    session = await openTraces61ApiSession(credentials)
 
     const allResults: any[] = []
 
-    // Set up request interception ONCE before processing
-    await page.setRequestInterception(true)
-
-    let currentReturnStatusData: any = null
-    const currentRejectionMessages: Record<string, string> = {}
-
-    // Listen for ALL API responses
-    page.on("response", async (response: any) => {
-      const url = response.url()
-
-      // Main return status data (reqType=1)
-      if (url.includes("DedStmtStatusServlet") && url.includes("reqType=1")) {
-        try {
-          const data = await response.json()
-          console.log(`✅ Received return status data:`, data)
-          currentReturnStatusData = data
-        } catch (error) {
-          console.error("Error parsing return status data:", error)
-        }
+    /** Fetch one combination with server-side pagination (rows=100 per page). */
+    const fetchCombination = async (financialYear: string, quarter: string, formType: string) => {
+      const rows: any[] = []
+      let pageNo = 1
+      let totalpages = 1
+      for (;;) {
+        const data = await postLegacyServletJson(
+          session!,
+          `app/ded/srv/DedStmtStatusServlet?financialYear=${encodeURIComponent(
+            financialYear
+          )}&quarter=${encodeURIComponent(quarter)}&formType=${encodeURIComponent(
+            formType
+          )}&reqType=1`,
+          { body: `_search=false&nd=${Date.now()}&rows=100&page=${pageNo}&sidx=&sord=asc` }
+        )
+        if (Array.isArray(data.rows)) rows.push(...data.rows)
+        totalpages = Number(data.totalpages) || 1
+        if (pageNo >= totalpages || !Array.isArray(data.rows) || data.rows.length === 0) break
+        pageNo++
       }
-      // Rejection reason data (reqType=5)
-      else if (url.includes("DedStmtStatusServlet") && url.includes("reqType=5")) {
-        try {
-          const data = await response.json()
-          console.log(`✅ Received rejection reason:`, data)
-          if (data && data.length > 0 && data[0].failMsg) {
-            currentRejectionMessages.latest = data[0].failMsg
-          }
-        } catch (error) {
-          console.error("Error parsing rejection reason:", error)
-        }
-      }
-    })
+      return { rows, totalpages }
+    }
 
-    // Allow all requests to continue
-    page.on("request", (request: any) => {
-      const url = rewriteTracesNewPortalUrlToTraces61(request.url())
-      if (url !== request.url()) {
-        request.continue({ url })
-      } else {
-        request.continue()
-      }
-    })
-
-    // Navigate to return status page
-    console.log("📄 Navigating to Return Status page...")
-    await page.goto(traces61DedUrl("stmtstatus.xhtml"), {
-      waitUntil: "networkidle2",
-      timeout: 60000,
-    })
-
-    await delay(3000)
-
-    // Process each combination of financial year, quarter, and form type
     for (const financialYear of financialYears) {
       for (const quarter of quarters) {
         for (const formType of formTypes) {
           console.log(
-            `🔍 Fetching data for FY: ${financialYear},type: ${typeof financialYear}, Quarter: ${quarter}, type: ${typeof quarter}, Form: ${formType}, type: ${typeof formType}`
+            `🔍 Fetching data for FY: ${financialYear}, Quarter: ${quarter}, Form: ${formType}`
           )
-
           try {
-            // Reset data for this iteration
-            currentReturnStatusData = null
-            currentRejectionMessages.latest = ""
+            const { rows, totalpages } = await fetchCombination(financialYear, quarter, formType)
 
-            // Select financial year with multiple attempts
-            await page.waitForSelector("#financialYear", { visible: true, timeout: 10000 })
-            
-            // Use evaluate to set value directly
-            await page.evaluate((fy) => {
-              const select = document.querySelector("#financialYear") as HTMLSelectElement
-              if (select) {
-                console.log("🔍 Setting financial year:", fy)
-                select.value = fy
-                // Trigger change event
-                const event = new Event("change", { bubbles: true })
-                select.dispatchEvent(event)
-              }
-            }, financialYear)
-            
-            console.log(`✅ Selected Financial Year: ${financialYear}`)
-            await delay(2000)
-
-            // Select quarter
-            await page.waitForSelector("#quarter", { visible: true, timeout: 10000 })
-            
-            await page.evaluate((q) => {
-              const select = document.querySelector("#quarter") as HTMLSelectElement
-              if (select) {
-                select.value = q
-                const event = new Event("change", { bubbles: true })
-                select.dispatchEvent(event)
-              }
-            }, quarter)
-            
-            console.log(`✅ Selected Quarter: ${quarter}`)
-            await delay(2000)
-
-            // Select form type
-            await page.waitForSelector("#formType", { visible: true, timeout: 10000 })
-            
-            await page.evaluate((ft) => {
-              const select = document.querySelector("#formType") as HTMLSelectElement
-              if (select) {
-                select.value = ft
-                const event = new Event("change", { bubbles: true })
-                select.dispatchEvent(event)
-              }
-            }, formType)
-            
-            console.log(`✅ Selected Form Type: ${formType}`)
-            await delay(2000)
-
-            // Verify selections
-            const selectedValues = await page.evaluate(() => {
-              const fySelect = document.querySelector("#financialYear") as HTMLSelectElement
-              const qSelect = document.querySelector("#quarter") as HTMLSelectElement
-              const ftSelect = document.querySelector("#formType") as HTMLSelectElement
-              return {
-                financialYear: fySelect?.value || "NOT SELECTED",
-                quarter: qSelect?.value || "NOT SELECTED",
-                formType: ftSelect?.value || "NOT SELECTED",
-              }
-            })
-            console.log(`🔍 Verification - Selected values:`, selectedValues)
-
-            // Click Go button
-            await page.waitForSelector("#clickGo", { visible: true, timeout: 10000 })
-            await page.click("#clickGo")
-            console.log("✅ Clicked Go button")
-
-            // Wait for API response
-            await delay(6000)
-
-            // Collect all pages of data
-            const allPagesData: any[] = []
-            let currentPageNumber = 1
-            let hasMorePages = true
-
-            while (hasMorePages) {
-              console.log(`📄 Processing page ${currentPageNumber}...`)
-
-              // Collect current page data
-              if (currentReturnStatusData && currentReturnStatusData.rows) {
-                // Check for rejected returns and fetch rejection reasons
-                for (const row of currentReturnStatusData.rows) {
-                  if (
-                    row.status &&
-                    row.status.toLowerCase().includes("reject") &&
-                    row.reason &&
-                    row.reason.toLowerCase().includes("view rejection reason")
-                  ) {
-                    console.log(`🔍 Found rejected return: ${row.tokenno}, fetching rejection reason...`)
-                    
-                    try {
-                      // Find and click the rejection reason link in the table
-                      const clicked = await page.evaluate((tokenno) => {
-                        const rows = Array.from(document.querySelectorAll('#stmtFiledStatusTab tr[role="row"]'))
-                        for (const tableRow of rows) {
-                          const cells = Array.from(tableRow.querySelectorAll('td'))
-                          // Check if this row contains the token number
-                          const tokenCell = cells.find(cell => cell.textContent?.trim() === tokenno)
-                          if (tokenCell) {
-                            // Find the "View Rejection Reason" cell
-                            const reasonCell = cells.find(cell => 
-                              cell.textContent?.toLowerCase().includes('view rejection reason')
-                            )
-                            if (reasonCell) {
-                              (reasonCell as HTMLElement).click()
-                              return true
-                            }
-                          }
-                        }
-                        return false
-                      }, row.tokenno)
-
-                      if (clicked) {
-                        console.log(`✅ Clicked rejection reason for ${row.tokenno}`)
-                        await delay(3000) // Wait for API call
-                        
-                        // Store the rejection message with the token number
-                        if (currentRejectionMessages.latest) {
-                          row.rejectionMsg = currentRejectionMessages.latest
-                          currentRejectionMessages.latest = "" // Clear for next iteration
-                        }
-                      } else {
-                        console.log(`⚠️ Could not find rejection reason link for ${row.tokenno}`)
-                      }
-                    } catch (error) {
-                      console.error(`Error fetching rejection reason for ${row.tokenno}:`, error)
-                    }
-                  }
+            // Rejection reasons for rejected rows (reqType=5, errIds = row.remarks).
+            for (const row of rows) {
+              if (
+                row.status &&
+                row.status.toLowerCase().includes("reject") &&
+                row.reason &&
+                row.reason.toLowerCase().includes("view rejection reason") &&
+                row.remarks
+              ) {
+                try {
+                  const rejection = await postLegacyServletJson(
+                    session!,
+                    "app/ded/srv/DedStmtStatusServlet?reqType=5",
+                    { body: `errIds=${encodeURIComponent(String(row.remarks))}` }
+                  )
+                  const failMsg = Array.isArray(rejection) ? rejection[0]?.failMsg : rejection?.failMsg
+                  if (failMsg) row.rejectionMsg = failMsg
+                } catch (error) {
+                  console.error(`Error fetching rejection reason for ${row.tokenno}:`, error)
                 }
-
-                // Add current page data
-                allPagesData.push(...currentReturnStatusData.rows)
-                console.log(`✅ Added ${currentReturnStatusData.rows.length} records from page ${currentPageNumber}`)
-              } else {
-                console.log(`⚠️ No data received for page ${currentPageNumber}`)
-              }
-
-              // Check if next page button is available and not disabled
-              const nextPageAvailable = await page.evaluate(() => {
-                const nextButton = document.querySelector('#next_pagernav')
-                if (!nextButton) return false
-                
-                // Check if button has ui-state-disabled class
-                const isDisabled = nextButton.classList.contains('ui-state-disabled')
-                return !isDisabled
-              })
-
-              if (nextPageAvailable) {
-                console.log(`➡️ Next page available, clicking...`)
-                
-                // Reset data for next page
-                currentReturnStatusData = null
-                
-                // Click next page button
-                await page.evaluate(() => {
-                  const nextButton = document.querySelector('#next_pagernav') as HTMLElement
-                  if (nextButton) {
-                    nextButton.click()
-                  }
-                })
-                
-                // Wait for next page to load
-                await delay(5000)
-                currentPageNumber++
-              } else {
-                console.log(`✅ No more pages available`)
-                hasMorePages = false
               }
             }
 
-            // Add all collected results for this combination
-            if (allPagesData.length > 0) {
+            if (rows.length > 0) {
               allResults.push({
                 financialYear,
                 quarter,
                 formType,
                 data: {
-                  rows: allPagesData,
-                  totalPages: currentPageNumber,
-                  totalRecords: allPagesData.length,
+                  rows,
+                  totalPages: totalpages,
+                  totalRecords: rows.length,
                 },
               })
-              console.log(`✅ Total records collected: ${allPagesData.length} from ${currentPageNumber} page(s)`)
+              console.log(`✅ Total records collected: ${rows.length}`)
             } else {
               console.log(`⚠️ No data received for this combination`)
-            }
-
-            // Reload page for next combination to ensure clean state
-            if (
-              financialYear !== financialYears[financialYears.length - 1] ||
-              quarter !== quarters[quarters.length - 1] ||
-              formType !== formTypes[formTypes.length - 1]
-            ) {
-              console.log("🔄 Reloading page for next combination...")
-              await page.goto(traces61DedUrl("stmtstatus.xhtml"), {
-                waitUntil: "networkidle2",
-                timeout: 60000,
-              })
-              await delay(3000)
             }
           } catch (error) {
             console.error(
@@ -303,10 +114,7 @@ export async function fetchReturnStatus({
     }
 
     console.log(`✅ Completed fetching. Total combinations: ${allResults.length}`)
-
-    return {
-      data: allResults,
-    }
+    return { data: allResults }
   } catch (error) {
     console.error("❌ Error in fetchReturnStatus:", error)
     throw error

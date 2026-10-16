@@ -26,17 +26,18 @@ import {
   PlusOutlined,
   DownloadOutlined,
 } from "@ant-design/icons"
-import { useMutation, useQuery } from "@blitzjs/rpc"
+import { invoke, useMutation, useQuery } from "@blitzjs/rpc"
 import Layout from "src/core/layouts/Layout"
 import getCompanies from "src/companies/queries/getCompanies"
+import exportCompanyCredentials from "src/companies/queries/exportCompanyCredentials"
 import saveCompaniesFromExcel from "src/companies/mutations/saveCompaniesFromExcel"
 import deleteCompany from "src/companies/mutations/deleteCompany"
 import updateCompany from "src/companies/mutations/updateCompany"
 import { ConfigProvider } from "antd"
 import enGB from "antd/lib/locale/en_GB"
 import {
-  downloadCompanyCredentialsTemplateCsv,
-  downloadCompanyCredentialsTemplateExcel,
+  downloadCompanyCredentialsCsv,
+  downloadCompanyCredentialsExcel,
   readCompanyCredentialsFromFile,
   type CompanyCredentials,
 } from "src/shared/ui/readCompanyCredentialsFile"
@@ -71,6 +72,7 @@ function CompaniesPage() {
   })
 
   const [loading, setLoading] = useState(false)
+  const [downloading, setDownloading] = useState(false)
   const [fileList, setFileList] = useState<any[]>([])
   const [searchText, setSearchText] = useState("")
   const [isEditModalVisible, setIsEditModalVisible] = useState(false)
@@ -101,14 +103,19 @@ function CompaniesPage() {
     return false // Prevent automatic upload
   }
 
-  const downloadTemplateCSV = () => {
-    downloadCompanyCredentialsTemplateCsv()
-    messageApi.success("CSV template downloaded")
-  }
-
-  const downloadTemplateExcel = () => {
-    downloadCompanyCredentialsTemplateExcel()
-    messageApi.success("Excel template downloaded")
+  // Real passwords are fetched only when the user downloads (never held in the page's query data).
+  const downloadCompanies = async (format: "csv" | "excel") => {
+    setDownloading(true)
+    try {
+      const rows = await invoke(exportCompanyCredentials, {})
+      if (format === "csv") downloadCompanyCredentialsCsv(rows)
+      else downloadCompanyCredentialsExcel(rows)
+      messageApi.success(`Downloaded ${rows.length} companies with passwords`)
+    } catch (error: any) {
+      messageApi.error(error.message || "Failed to download companies")
+    } finally {
+      setDownloading(false)
+    }
   }
 
   const handleSaveCompanies = async (companies: CompanyData[]) => {
@@ -331,19 +338,19 @@ function CompaniesPage() {
                         items: [
                           {
                             key: "csv",
-                            label: "Download CSV template",
-                            onClick: downloadTemplateCSV,
+                            label: "Download as CSV",
+                            onClick: () => void downloadCompanies("csv"),
                           },
                           {
                             key: "excel",
-                            label: "Download Excel template",
-                            onClick: downloadTemplateExcel,
+                            label: "Download as Excel",
+                            onClick: () => void downloadCompanies("excel"),
                           },
                         ],
                       }}
                     >
-                      <Button icon={<DownloadOutlined />}>
-                        Download template
+                      <Button icon={<DownloadOutlined />} loading={downloading}>
+                        Download companies
                       </Button>
                     </Dropdown>
                   </Space>
@@ -351,7 +358,8 @@ function CompaniesPage() {
               </Row>
               <div style={{ fontSize: "12px", color: "#666" }}>
                 <FileExcelOutlined /> Upload Excel (.xlsx, .xls) or CSV. Columns: Company Name, Tan,
-                IT Password, User ID, Password
+                IT Password, User ID, Password. &quot;Download companies&quot; gives every saved company in
+                this format, including its IT and TRACES passwords.
               </div>
             </Space>
           </Card>

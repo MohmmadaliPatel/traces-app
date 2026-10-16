@@ -24,7 +24,33 @@ type Daemon = {
     resolve: (result: SignerJobResult) => void
     reject: (error: Error) => void
     timer: NodeJS.Timeout
+    /** The logger of the job in flight — not of whichever caller happened to start the process. */
+    log: (msg: string) => void
   } | null
+}
+
+/**
+ * Exit codes of the .NET host itself, raised before the signer runs a line of its own code.
+ * The current build bundles the runtime and cannot hit them, but an older, framework-dependent
+ * pdf-signer/ left on a client machine still can — and its bare exit code explains nothing.
+ */
+const MISSING_RUNTIME_EXIT_CODES: Record<number, string> = {
+  0x80008083: "hostfxr not found — no x64 .NET is installed",
+  0x80008096: "no .NET 10 framework found — only other versions are installed",
+}
+
+/** A readable reason when the signer could not start because .NET is missing, else null. */
+export function missingDotnetRuntimeMessage(code: number | null): string | null {
+  if (code === null) return null
+  const unsigned = code >>> 0
+  const detail = MISSING_RUNTIME_EXIT_CODES[unsigned]
+  if (!detail) return null
+  return (
+    `pdf-signer.exe could not start: the .NET 10 x64 runtime is missing on this machine ` +
+    `(exit code ${unsigned} / 0x${unsigned.toString(16).toUpperCase()}, ${detail}). Install it ` +
+    `with "winget install Microsoft.DotNet.DesktopRuntime.10", or ship the current pdf-signer/ ` +
+    `build, which bundles the runtime.`
+  )
 }
 
 // Next bundles each entry point separately, so a module-level singleton would give the unlock
@@ -74,7 +100,7 @@ export function stopSignerDaemon(): void {
   discard("signer stopped")
 }
 
-function start(exePath: string, log: (msg: string) => void): Daemon {
+function start(exePath: string): Daemon {
   const child = spawn(exePath, ["--serve"], {
     cwd: process.cwd(),
     // Must stay false: if a PIN dialog does appear, hiding the window makes it look like a hang.
@@ -106,10 +132,30 @@ function start(exePath: string, log: (msg: string) => void): Daemon {
     }
   })
 
-  child.stderr?.on("data", (data) => log(String(data).trimEnd()))
+  // stderr is the signer's diagnostics: certificate, key handle type, PIN status, FAILED
+  // reasons. The process outlives every caller, so it always goes to the server console, and the
+  // job in flight gets it too. Per-PDF "signed" lines stay console-only: the caller already
+  // reports the count, and every job logger echoes to the console anyway.
+  const diagnostics = readline.createInterface({ input: child.stderr! })
+  diagnostics.on("line", (line) => {
+    const text = line.trimEnd()
+    if (!text) return
+    console.log(text)
+
+    const jobLog = daemon.pending?.log
+    if (jobLog && jobLog !== console.log && !text.startsWith("pdf-signer: signed ")) {
+      jobLog(text)
+    }
+  })
+
+  // A signer that dies at startup (no .NET runtime, blocked binary) can close its stdin before
+  // the job is written. The EPIPE must not crash the app; "close" below reports the real cause.
+  child.stdin?.on("error", () => {})
 
   child.on("error", (err) => discard(`signer process error: ${err.message}`))
-  child.on("close", (code) => discard(`signer process exited with code ${code}`))
+  child.on("close", (code) =>
+    discard(missingDotnetRuntimeMessage(code) || `signer process exited with code ${code}`)
+  )
 
   return daemon
 }
@@ -136,7 +182,7 @@ export function signViaDaemon(
 
     if (!daemon) {
       try {
-        daemon = start(exePath, log)
+        daemon = start(exePath)
       } catch (err: any) {
         reject(err)
         return
@@ -155,7 +201,7 @@ export function signViaDaemon(
       )
     }, timeoutMs)
 
-    daemon.pending = { resolve, reject, timer }
+    daemon.pending = { resolve, reject, timer, log }
 
     try {
       daemon.child.stdin!.write(JSON.stringify(job) + "\n")

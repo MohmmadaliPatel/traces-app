@@ -1,115 +1,42 @@
 import {
-  openTracesSession,
-  rewriteTracesNewPortalUrlToTraces61,
-  traces61DedUrl,
-  type TracesSession,
+  openTraces61ApiSession,
+  postLegacyServletJson,
+  type Traces61ApiSession,
 } from "../jobs/traces"
 
-const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
-
+/**
+ * Outstanding Demand — API-only (no Puppeteer).
+ *
+ * The legacy page feeds its two grids from TagChallanServlet:
+ *   POST /app/ded/srv/TagChallanServlet?reqtype=0   → current years (rows: finYr, aodmnd, cpcdmd, fin)
+ *   POST /app/ded/srv/TagChallanServlet?reqtype=11  → "Prior Years" rows (same shape)
+ * A "Prior Years" row has `fin === 1` (see outstandingdemand.xhtml grid JS).
+ */
 export async function fetchOutstandingDemand({
   credentials,
 }: {
   credentials: { userId: string; password: string; tan: string }
 }): Promise<{ data: any; priorYearsData?: any }> {
-  // Fresh browser per call, logged in with this request's credentials (never reused).
-  let session: TracesSession | undefined
+  let session: Traces61ApiSession | undefined
   try {
-    console.log("🚀 Starting Outstanding Demand fetch...")
-    session = await openTracesSession(credentials, { login: { redirectGuard: false } })
-    const page: any = session.page
+    console.log("🚀 Starting Outstanding Demand fetch (API)...")
+    session = await openTraces61ApiSession(credentials)
 
-    let demandData: any = null
+    const demandData = await postLegacyServletJson(session, "app/ded/srv/TagChallanServlet?reqtype=0")
+    console.log("✅ Received demand data:", demandData)
+
     let priorYearsData: any = null
-    let hasPriorYears = false
+    const hasPriorYears = Array.isArray(demandData?.rows)
+      ? demandData.rows.some((row: any) => row.fin === 1)
+      : false
 
-    // Set up request interception BEFORE navigating to the page
-    console.log("🔍 Setting up request interception...")
-    await page.setRequestInterception(true)
-
-    // Listen for ALL API responses (including initial page load and prior years)
-    page.on("response", async (response: any) => {
-      const url = response.url()
-      
-      // Capture initial demand data (reqtype=0)
-      if (url.includes("TagChallanServlet?reqtype=0")) {
-        try {
-          const data = await response.json()
-          console.log("✅ Received demand data:", data)
-          demandData = data
-          
-          // Check if there's a "Prior Years" entry (fin: 1)
-          if (data.rows && data.rows.some((row: any) => row.fin === 1)) {
-            hasPriorYears = true
-            console.log("📋 Prior Years detected in response")
-          }
-        } catch (error) {
-          console.error("Error parsing demand data:", error)
-        }
-      }
-      
-      // Capture prior years data (TagChallanServlet without reqtype=0)
-      else if (url.includes("TagChallanServlet") && !url.includes("reqtype=0")) {
-        try {
-          const data = await response.json()
-          console.log("✅ Received prior years data:", data)
-          priorYearsData = data
-        } catch (error) {
-          console.error("Error parsing prior years data:", error)
-        }
-      }
-    })
-
-    // Allow all requests to continue
-    page.on("request", (request: any) => {
-      const url = rewriteTracesNewPortalUrlToTraces61(request.url())
-      if (url !== request.url()) {
-        request.continue({ url })
-      } else {
-        request.continue()
-      }
-    })
-
-    // Navigate to outstanding demand page (API will be called on page load)
-    console.log("📄 Navigating to Outstanding Demand page...")
-    await page.goto(traces61DedUrl("outstandingdemand.xhtml"), {
-      waitUntil: "networkidle2",
-      timeout: 60000,
-    })
-
-    // Wait for initial API call to complete
-    await delay(3000)
-
-    // If there are prior years, click on it to expand
-    if (hasPriorYears && demandData) {
-      console.log("📋 Clicking on Prior Years to expand...")
-      
-      try {
-        // Click on "Prior Years" row
-        const priorYearsClicked = await page.evaluate(() => {
-          const rows = Array.from(document.querySelectorAll('tr[role="row"]'))
-          for (const row of rows) {
-            const cells = Array.from(row.querySelectorAll('td'))
-            for (const cell of cells) {
-              if (cell.textContent?.includes("Prior Years")) {
-                ;(cell as HTMLElement).click()
-                return true
-              }
-            }
-          }
-          return false
-        })
-
-        if (priorYearsClicked) {
-          console.log("✅ Clicked on Prior Years, waiting for API response...")
-          // Wait for prior years API call to complete
-          await delay(5000)
-        } else {
-          console.log("⚠️ Could not find Prior Years row to click")
-        }
-      } catch (error) {
-        console.error("Error expanding prior years:", error)
-      }
+    if (hasPriorYears) {
+      console.log("📋 Prior Years detected — fetching prior years feed...")
+      priorYearsData = await postLegacyServletJson(
+        session,
+        "app/ded/srv/TagChallanServlet?reqtype=11"
+      )
+      console.log("✅ Received prior years data:", priorYearsData)
     }
 
     return {

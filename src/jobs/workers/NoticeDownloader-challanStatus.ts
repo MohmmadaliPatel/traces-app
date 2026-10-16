@@ -8,7 +8,14 @@ import StealthPlugin from "puppeteer-extra-plugin-stealth"
 import * as fs from "fs"
 import * as path from "path"
 import pdfParse from "pdf-parse"
-import { loginWithTracesApiAndPreauth, traces61DedUrl } from "../traces"
+import {
+  loginWithTracesApiAndPreauth,
+  htmlToText,
+  openTraces61ApiSession,
+  postLegacyServletJson,
+  traces61DedUrl,
+  type Traces61ApiSession,
+} from "../traces"
 import {
   auditPaymentPdfChallanStatusCoverage,
   financialYearFromDepositDate,
@@ -38,6 +45,16 @@ export type ChallanStatusJobOptions = {
    * full — reveal amounts + write status/unmatched Excels
    */
   mode?: "list" | "full"
+}
+
+/** One unconsumed-challan portal row (GetUnconChlnDetailServlet). */
+type UnconsumedRow = {
+  receiptNo: string
+  bsr: string
+  dateOfDeposit: string
+  challanSerialNo: string
+  challanAmount: string
+  unconsumedAmount: string
 }
 
 export default class NoticeDownloaderChallanStatus {
@@ -315,8 +332,13 @@ export default class NoticeDownloaderChallanStatus {
   }
 
   /** True when the unconsumed cell still needs a View Amount click. */
+  /**
+   * True when the unconsumed amount is not shown yet: the portal's "View Amount" link, or —
+   * reading the grid JSON rather than the rendered cell — no amount at all.
+   */
   private needsViewAmountClick(unconsumedText: string): boolean {
-    return /view\s*amount/i.test((unconsumedText || "").trim())
+    const text = (unconsumedText || "").trim()
+    return /view\s*amount/i.test(text) || !/\d/.test(text)
   }
 
   /**
@@ -673,27 +695,15 @@ export default class NoticeDownloaderChallanStatus {
       let skippedAlreadyInExcel = 0
       let unmatchedCount = 0
 
-      let browser: Awaited<ReturnType<typeof puppeteer.launch>> | null = null
+      let session: Traces61ApiSession | null = null
       try {
-        browser = await puppeteer.launch({
-          headless: false,
-          args: ["--start-maximized"],
-          // TRACES grid renders can exceed the 180s CDP default on slow evenings.
-          protocolTimeout: 300000,
-        })
-
-        const page = await browser.newPage()
-        await page.setViewport({ width: 1920, height: 1080 })
-
         this.logger.log("TRACES API login + preauth (traces61)…")
-        await loginWithTracesApiAndPreauth(page, {
+        session = await openTraces61ApiSession({
           userId: this.company.user_id,
           password: this.company.password,
           tan: this.company.tan,
         })
         this.logger.log("Login successful")
-
-        await this.navigateToUnconsumedChallanPage(page)
 
         let hasNextPage = true
         let currentPage = 1
@@ -703,23 +713,28 @@ export default class NoticeDownloaderChallanStatus {
         try {
           while (hasNextPage) {
             this.logger.log(`\n=== Unconsumed table page ${currentPage} ===`)
-            if (!(await this.waitForUnconsumedRows(page))) {
+            let pageData: { rows: UnconsumedRow[]; totalpages: number; records: number }
+            try {
+              pageData = await this.fetchUnconsumedPageApi(session, currentPage)
+            } catch (err: any) {
+              // Page 1 failing means we read nothing — fail the job instead of reporting 0 rows.
+              if (currentPage === 1) throw err
+              this.logger.log(`  fetch page failed: ${err?.message || err} — stopping pagination`)
+              break
+            }
+            if (pageData.rows.length === 0) {
               this.logger.log("No data rows found in unconsumed challan table")
               break
             }
             await waitForSecs(1000)
 
             if (currentPage === 1) {
-              const { total, pagerText } = await this.readUnconsumedGridTotal(page)
-              this.logger.log(
-                `Portal reports ${total ?? "unknown"} total unconsumed row(s)${pagerText ? ` ("${pagerText}")` : ""}`
-              )
+              this.logger.log(`Portal reports ${pageData.records} total unconsumed row(s)`)
             }
 
-            const tableRows = await this.readUnconsumedTableRows(page)
-            this.logger.log(`Found ${tableRows.length} row(s) on page ${currentPage}`)
+            this.logger.log(`Found ${pageData.rows.length} row(s) on page ${currentPage}`)
 
-            for (const row of tableRows) {
+            for (const row of pageData.rows) {
               rowsProcessed++
               const csnKey = this.normalizeCsn(row.challanSerialNo)
               const matched = amountByCsn.get(csnKey)
@@ -754,9 +769,9 @@ export default class NoticeDownloaderChallanStatus {
                     this.logger.log(
                       `  Unmatched CSN — trying portal amount ${portalAmount} for View Amount...`
                     )
-                    unconsumedAmount = await this.revealUnconsumedAmount(
-                      page,
-                      row.rowId,
+                    unconsumedAmount = await this.revealUnconsumedAmountApi(
+                      session!,
+                      row,
                       portalAmount
                     )
                     viewAmountClicks++
@@ -803,10 +818,10 @@ export default class NoticeDownloaderChallanStatus {
                   this.logger.log(
                     `  Clicking View Amount and entering challan amount ${challanAmount}...`
                   )
-                  unconsumedAmount = await this.revealUnconsumedAmount(
-                    page,
-                    row.rowId,
-                    challanAmount
+                  unconsumedAmount = await this.revealUnconsumedAmountApi(
+                    session!,
+                    row,
+                    String(challanAmount)
                   )
                   viewAmountClicks++
                   this.logger.log(`  ✓ Unconsumed amount: ${unconsumedAmount}`)
@@ -833,30 +848,19 @@ export default class NoticeDownloaderChallanStatus {
               })
             }
 
-            const nextPageInfo = await page.evaluate(() => {
-              const nextButton = document.querySelector("#next_pager")
-              if (!nextButton) return { exists: false, disabled: true }
-              const classList = nextButton.className || ""
-              return {
-                exists: true,
-                disabled: classList.includes("ui-state-disabled"),
-              }
-            })
+            const nextPageInfo = {
+              exists: currentPage < pageData.totalpages,
+              disabled: currentPage >= pageData.totalpages,
+            }
 
             this.logger.log(
-              `Next button — exists: ${nextPageInfo.exists}, disabled: ${nextPageInfo.disabled}`
+              `Next page — exists: ${nextPageInfo.exists}, disabled: ${nextPageInfo.disabled}`
             )
 
             if (nextPageInfo.exists && !nextPageInfo.disabled) {
-              try {
-                await page.click("#next_pager")
-                this.logger.log("Clicked next page")
-                await waitForSecs(2500)
-                currentPage++
-              } catch (error: any) {
-                this.logger.log(`Failed to click next page: ${error.message}`)
-                hasNextPage = false
-              }
+              this.logger.log("Fetching next page")
+              await waitForSecs(2500)
+              currentPage++
             } else {
               hasNextPage = false
             }
@@ -869,19 +873,7 @@ export default class NoticeDownloaderChallanStatus {
 
         this.logger.log(`\nProcessed ${currentPage} page(s) in total`)
       } finally {
-        if (browser) {
-          try {
-            await browser.close()
-            this.logger.log("Browser closed")
-          } catch (closeErr: any) {
-            this.logger.log(`Browser close warning: ${closeErr?.message || closeErr}`)
-            try {
-              browser.process()?.kill("SIGKILL")
-            } catch {
-              /* ignore */
-            }
-          }
-        }
+        await session?.close().catch(() => undefined)
       }
 
       // Replace existing Excel rows for CSNs we just scraped; keep the rest
@@ -991,50 +983,45 @@ export default class NoticeDownloaderChallanStatus {
     let rowsProcessed = 0
     let skippedOutsideFy = 0
     let portalTotal: number | null = null
-    let browser: Awaited<ReturnType<typeof puppeteer.launch>> | null = null
+    let session: Traces61ApiSession | null = null
 
     try {
-      browser = await puppeteer.launch({
-        headless: false,
-        args: ["--start-maximized"],
-        protocolTimeout: 300000,
-      })
-      const page = await browser.newPage()
-      await page.setViewport({ width: 1920, height: 1080 })
-
       this.logger.log("TRACES API login + preauth (traces61)…")
-      await loginWithTracesApiAndPreauth(page, {
+      session = await openTraces61ApiSession({
         userId: this.company.user_id,
         password: this.company.password,
         tan: this.company.tan,
       })
       this.logger.log("Login successful")
 
-      await this.navigateToUnconsumedChallanPage(page)
-
       let hasNextPage = true
       let currentPage = 1
 
       while (hasNextPage) {
         this.logger.log(`\n=== Unconsumed list page ${currentPage} ===`)
-        if (!(await this.waitForUnconsumedRows(page))) {
+        let pageData: { rows: UnconsumedRow[]; totalpages: number; records: number }
+        try {
+          pageData = await this.fetchUnconsumedPageApi(session, currentPage)
+        } catch (err: any) {
+          // Page 1 failing means we read nothing — fail the job instead of reporting 0 rows.
+          if (currentPage === 1) throw err
+          this.logger.log(`  fetch page failed: ${err?.message || err} — stopping pagination`)
+          break
+        }
+        if (pageData.rows.length === 0) {
           this.logger.log("No data rows found in unconsumed challan table")
           break
         }
         await waitForSecs(1000)
 
         if (currentPage === 1) {
-          const { total, pagerText } = await this.readUnconsumedGridTotal(page)
-          portalTotal = total
-          this.logger.log(
-            `Portal reports ${total ?? "unknown"} total unconsumed row(s)${pagerText ? ` ("${pagerText}")` : ""}`
-          )
+          portalTotal = pageData.records
+          this.logger.log(`Portal reports ${portalTotal} total unconsumed row(s)`)
         }
 
-        const tableRows = await this.readUnconsumedTableRows(page)
-        this.logger.log(`Found ${tableRows.length} row(s) on page ${currentPage}`)
+        this.logger.log(`Found ${pageData.rows.length} row(s) on page ${currentPage}`)
 
-        for (const row of tableRows) {
+        for (const row of pageData.rows) {
           rowsProcessed++
           if (!isTargetFinancialYear(row.dateOfDeposit, targetFinancialYears)) {
             skippedOutsideFy++
@@ -1055,25 +1042,14 @@ export default class NoticeDownloaderChallanStatus {
           })
         }
 
-        const nextPageInfo = await page.evaluate(() => {
-          const nextButton = document.querySelector("#next_pager")
-          if (!nextButton) return { exists: false, disabled: true }
-          const classList = nextButton.className || ""
-          return {
-            exists: true,
-            disabled: classList.includes("ui-state-disabled"),
-          }
-        })
+        const nextPageInfo = {
+          exists: currentPage < pageData.totalpages,
+          disabled: currentPage >= pageData.totalpages,
+        }
 
         if (nextPageInfo.exists && !nextPageInfo.disabled) {
-          try {
-            await page.click("#next_pager")
-            await waitForSecs(2500)
-            currentPage++
-          } catch (error: any) {
-            this.logger.log(`Failed to click next page: ${error.message}`)
-            hasNextPage = false
-          }
+          await waitForSecs(2500)
+          currentPage++
         } else {
           hasNextPage = false
         }
@@ -1081,17 +1057,7 @@ export default class NoticeDownloaderChallanStatus {
 
       this.logger.log(`Processed ${currentPage} page(s); kept ${results.length} row(s)`)
     } finally {
-      if (browser) {
-        try {
-          await browser.close()
-        } catch {
-          try {
-            browser.process()?.kill("SIGKILL")
-          } catch {
-            /* ignore */
-          }
-        }
-      }
+      await session?.close().catch(() => undefined)
     }
 
     let excelPath: string | null = null
@@ -1115,6 +1081,75 @@ export default class NoticeDownloaderChallanStatus {
       complete: portalTotal == null ? null : rowsProcessed >= portalTotal,
       excelPath,
     }
+  }
+
+  /**
+   * API-only unconsumed challan feed (no Puppeteer).
+   *   POST /app/ded/srv/GetUnconChlnDetailServlet?reqtype=0 (+ jqGrid body)
+   * → { totalpages, page, records/rowCount, rows: [{ recptNo, chlnbsrcode, dateofdep,
+   *                                                    chlnsrno, hidchlnamt, chlnamt,
+   *                                                    hidunconschlnamt, unconschlnamt }] }
+   */
+  private async fetchUnconsumedPageApi(
+    session: Traces61ApiSession,
+    pageNo: number
+  ): Promise<{ rows: UnconsumedRow[]; totalpages: number; records: number }> {
+    const data = await postLegacyServletJson(
+      session,
+      "app/ded/srv/GetUnconChlnDetailServlet?reqtype=0",
+      { body: `_search=false&nd=${Date.now()}&rows=100&page=${pageNo}&sidx=&sord=asc` }
+    )
+    // Grid JSON cells can carry the formatter's HTML (e.g. a "View Amount" link); keep the
+    // text the Puppeteer version read from the rendered cell.
+    const cell = (value: unknown) => htmlToText(String(value ?? ""))
+    const rows: UnconsumedRow[] = (Array.isArray(data?.rows) ? data.rows : []).map((r: any) => ({
+      receiptNo: cell(r.recptNo),
+      bsr: cell(r.chlnbsrcode),
+      dateOfDeposit: cell(r.dateofdep),
+      challanSerialNo: cell(r.chlnsrno),
+      challanAmount: cell(r.chlnamt),
+      unconsumedAmount: cell(r.unconschlnamt),
+    }))
+    return {
+      rows,
+      totalpages: Number(data?.totalpages) || 1,
+      records: Number(data?.records ?? data?.rowCount) || rows.length,
+    }
+  }
+
+  /**
+   * API-only "View Amount" reveal (read-only validation, mirrors the portal dialog):
+   *   POST /app/ded/srv/GetUnconChlnDetailServlet?reqtype=1
+   *   body: recptNum=..&chlnSNo=..&enteredAmt=..&dateOfDep=..&bsrCode=..
+   *   → [{ success: 2, unConsChlnAmt }]
+   */
+  private async revealUnconsumedAmountApi(
+    session: Traces61ApiSession,
+    row: UnconsumedRow,
+    amountStr: string
+  ): Promise<string> {
+    // The portal dialog sends toFixed(2); TRACES answers success=5 ("incorrect") for "1987"
+    // and success=4 for other decimal shapes, but accepts "1987.00".
+    const amount = parseFloat(String(amountStr).replace(/[₹,\s]/g, ""))
+    if (!Number.isFinite(amount)) throw new Error(`Invalid challan amount "${amountStr}"`)
+    const body = new URLSearchParams()
+    body.append("recptNum", row.receiptNo)
+    body.append("chlnSNo", row.challanSerialNo)
+    body.append("enteredAmt", amount.toFixed(2))
+    body.append("dateOfDep", row.dateOfDeposit)
+    body.append("bsrCode", row.bsr)
+    const data = await postLegacyServletJson(
+      session,
+      "app/ded/srv/GetUnconChlnDetailServlet?reqtype=1",
+      { body }
+    )
+    const first = Array.isArray(data) ? data[0] : data
+    if (first?.success === 2 && first?.unConsChlnAmt) {
+      return String(first.unConsChlnAmt)
+    }
+    throw new Error(
+      `Amount validation failed: ${JSON.stringify(first ?? data).slice(0, 160)}`
+    )
   }
 
   async process() {

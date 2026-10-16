@@ -8,7 +8,11 @@ import db from "db"
 import { inspectPdfSignature } from "./pdfSignatureInfo"
 import { readSignatureBox } from "src/form16/utils/dscSignatureBox"
 import { getRememberedDscPin } from "src/form16/utils/dscPinVault"
-import { signViaDaemon, signerDaemonEnabled } from "src/form16/utils/dscSignerDaemon"
+import {
+  missingDotnetRuntimeMessage,
+  signViaDaemon,
+  signerDaemonEnabled,
+} from "src/form16/utils/dscSignerDaemon"
 import { isTokenLikelyWarm, markSignSucceeded, withSignerLock } from "./dscSession"
 
 export type SignForm16PdfsResult = {
@@ -156,6 +160,10 @@ export function runPdfSigner(job: SignerJob, opts: { pdfCount?: number } = {}): 
       return
     }
 
+    // A signer that dies at startup (no .NET runtime) may close stdin before reading the job;
+    // the EPIPE must not crash the app — "close" below reports the real cause.
+    child.stdin?.on("error", () => {})
+
     try {
       child.stdin?.end(JSON.stringify(job), "utf8")
     } catch (err: any) {
@@ -218,7 +226,14 @@ export function runPdfSigner(job: SignerJob, opts: { pdfCount?: number } = {}): 
         if (code === 0) {
           resolve(stdout || "PDF signer completed")
         } else {
-          reject(new Error(stderr || stdout || `PDF signer exited with code ${code}`))
+          reject(
+            new Error(
+              missingDotnetRuntimeMessage(code) ||
+                stderr ||
+                stdout ||
+                `PDF signer exited with code ${code}`
+            )
+          )
         }
       })
     })

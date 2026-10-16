@@ -452,7 +452,9 @@ async function checkSignerBinary(): Promise<SignerCheck> {
   result.peMachine = peMachineType(exePath)
   kv("exe architecture", result.peMachine)
   if (IS_WINDOWS && result.peMachine === "x64" && process.arch === "arm64") {
-    info("x64 binary on ARM64 Windows — runs under emulation; the x64 .NET runtime must be installed")
+    info(
+      "x64 binary on ARM64 Windows — runs under emulation; a framework-dependent build also needs the x64 .NET runtime"
+    )
   }
 
   // Mark of the Web: files extracted from a downloaded zip are often blocked by Windows.
@@ -478,28 +480,40 @@ async function checkSignerBinary(): Promise<SignerCheck> {
       const frameworks = [cfg?.runtimeOptions?.framework, ...(cfg?.runtimeOptions?.frameworks || [])].filter(
         Boolean
       )
+      const bundled = (cfg?.runtimeOptions?.includedFrameworks || []) as any[]
       result.tfm = cfg?.runtimeOptions?.tfm
       result.requiredFrameworks = frameworks.map((f: any) => `${f.name} ${f.version}`)
+      result.selfContained = bundled.length > 0
       kv("target framework", result.tfm)
       for (const f of result.requiredFrameworks as string[]) kv("requires runtime", f)
+      if (result.selfContained) {
+        const names = bundled.map((f) => `${f.name} ${f.version}`).join(", ")
+        ok(`self-contained build — bundles ${names}, no .NET install needed`)
+      }
     } catch (err: any) {
       warn(`could not parse pdf-signer.runtimeconfig.json: ${err?.message || err}`)
     }
   }
 
+  // A win-x64 publish puts the SkiaSharp/HarfBuzz natives next to the exe; older builds kept
+  // them under runtimes/<rid>/native.
   const runtimesDir = path.join(signerDir, "runtimes")
-  if (fs.existsSync(runtimesDir)) {
+  if (fs.existsSync(path.join(signerDir, "libSkiaSharp.dll"))) {
+    ok("native SkiaSharp/HarfBuzz assets present")
+  } else if (fs.existsSync(runtimesDir)) {
     result.nativeRuntimes = fs
       .readdirSync(runtimesDir, { withFileTypes: true })
       .filter((d) => d.isDirectory())
       .map((d) => d.name)
     kv("native runtimes", (result.nativeRuntimes as string[]).join(", "))
   } else {
-    warn("runtimes/ missing — native SkiaSharp/HarfBuzz assets may fail to load")
+    warn("libSkiaSharp.dll missing — native SkiaSharp/HarfBuzz assets may fail to load")
   }
 
-  const dotnet = await run("dotnet", ["--list-runtimes"], 30000)
-  if (dotnet.ok) {
+  const dotnet = result.selfContained ? null : await run("dotnet", ["--list-runtimes"], 30000)
+  if (!dotnet) {
+    result.dotnetRuntimes = null
+  } else if (dotnet.ok) {
     const lines = dotnet.stdout.split(/\r?\n/).filter((l) => l.trim())
     result.dotnetRuntimes = lines
     kv("dotnet runtimes", `${lines.length} found`)
@@ -1217,7 +1231,7 @@ function explainSignerFailure(res: SignerRun, certificateName: string, certs: St
         "the signer cannot start at all. Install the .NET 10 Desktop Runtime (x64) on this machine:\n" +
         "        winget install Microsoft.DotNet.DesktopRuntime.10\n" +
         "        or download it from https://dotnet.microsoft.com/download/dotnet/10.0 (Run desktop apps, x64)\n" +
-        "        then re-run this test."
+        "        then re-run this test. (Or replace pdf-signer/ with the current build, which bundles the runtime.)"
     )
     return
   }

@@ -1,57 +1,76 @@
+using System.Drawing;
 using System.Security.Cryptography.X509Certificates;
 using Spire.Pdf.Graphics;
-using Spire.Pdf.Security;
+using Spire.Pdf.Interactive.DigitalSignatures;
 
 namespace PdfSigner;
 
 /// <summary>
 /// What the visible stamp looks like inside the signature cell.
 ///
-/// Spire draws nothing at all unless the appearance is configured — a signature with default
-/// settings produces an empty appearance stream, which is a valid signature that simply cannot
-/// be seen. The certificate has to *look* signed to whoever opens it, so the stamp carries the
-/// signer's name and the signing time in the form's own typeface.
+/// The stamp is drawn here rather than by Spire's stock appearance, because that one has no
+/// font size: the signature cell in Form 16A / 131 is short — around 26pt — and the text has to
+/// fit inside whatever box the generator measured instead of spilling into the ruled lines
+/// around it. It carries the same lines the old stamp did: signer, signing time, and the reason
+/// and location when the job sets them.
 /// </summary>
-public static class Appearance
+public sealed class StampAppearance : IPdfSignatureAppearance
 {
-    /// <summary>
-    /// Fit the stamp to the cell. The signature cell in Form 16A / 131 is short — around 26pt —
-    /// so the text is sized to fit two lines inside whatever box the generator measured, rather
-    /// than a fixed size that would overflow into the ruled lines around it.
-    /// </summary>
-    public static void Apply(PdfSignature signature, X509Certificate2 certificate, PdfJob job, float boxHeight)
+    private const float MaxFontSize = 8f;
+    private const float MinFontSize = 4f;
+
+    private readonly string[] lines;
+    private readonly SizeF box;
+
+    public StampAppearance(X509Certificate2 certificate, PdfJob job, SizeF box, DateTime signedAt)
     {
-        var signer = SignerName(certificate);
+        this.box = box;
 
-        signature.GraphicsMode = GraphicMode.SignDetail;
-        signature.SignTextAlignment = SignTextAlignment.Center;
-        signature.DigitalSigner = signer;
-        signature.Date = DateTime.Now;
-
-        // Two lines of text with a little breathing room, clamped to a legible range.
-        var fontSize = Math.Clamp((boxHeight - 6f) / 2f, 5f, 8f);
-        signature.SignDetailsFont = new PdfFont(PdfFontFamily.TimesRoman, fontSize);
-
-        // Spire concatenates label and value with no separator of its own.
-        signature.NameLabel = "Digitally signed by ";
-        signature.DateLabel = "Date: ";
-
-        // Spire renders exactly the details that are set — nothing else is needed to make the
-        // stamp appear, and the older ShowConfiguerText flags are deprecated.
-        if (!string.IsNullOrWhiteSpace(job.Reason))
+        var details = new List<string>
         {
-            signature.Reason = job.Reason;
-            signature.ReasonLabel = "Reason: ";
-        }
+            "Digitally signed by " + SignerName(certificate),
+            // Day-first whatever the machine's locale: these are Indian tax certificates, and the
+            // old stamp read the same way (en-IN short date).
+            "Date: " + signedAt.ToString("dd-MM-yyyy HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture),
+        };
+        if (!string.IsNullOrWhiteSpace(job.Reason)) details.Add("Reason: " + job.Reason);
+        if (!string.IsNullOrWhiteSpace(job.Location)) details.Add("Location: " + job.Location);
+        lines = details.ToArray();
+    }
 
-        if (!string.IsNullOrWhiteSpace(job.Location))
+    public void Generate(PdfCanvas g)
+    {
+        var font = FittingFont();
+        var lineHeight = font.Height;
+        var top = Math.Max(0f, (box.Height - lineHeight * lines.Length) / 2f);
+        var centered = new PdfStringFormat(PdfTextAlignment.Center, PdfVerticalAlignment.Top);
+
+        for (var i = 0; i < lines.Length; i++)
         {
-            signature.LocationInfo = job.Location;
-            signature.LocationInfoLabel = "Location: ";
+            var row = new RectangleF(0f, top + i * lineHeight, box.Width, lineHeight);
+            g.DrawString(lines[i], font, PdfBrushes.Black, row, centered);
         }
     }
 
-    private static string SignerName(X509Certificate2 certificate)
+    /// <summary>
+    /// The largest font, within a legible range, at which every line fits the cell: two lines in
+    /// a 26pt cell come out at 8pt, as before, and longer names or extra lines shrink it.
+    /// </summary>
+    private PdfFont FittingFont()
+    {
+        var size = Math.Clamp((box.Height - 6f) / lines.Length, MinFontSize, MaxFontSize);
+
+        while (true)
+        {
+            var font = new PdfFont(PdfFontFamily.TimesRoman, size);
+            var widest = lines.Max(line => font.MeasureString(line).Width);
+            if (size <= MinFontSize || (widest <= box.Width - 2f && font.Height * lines.Length <= box.Height))
+                return font;
+            size = Math.Max(MinFontSize, size - 0.25f);
+        }
+    }
+
+    public static string SignerName(X509Certificate2 certificate)
     {
         var cn = certificate.GetNameInfo(X509NameType.SimpleName, false);
         return string.IsNullOrWhiteSpace(cn) ? certificate.Subject : cn;

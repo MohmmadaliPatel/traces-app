@@ -3,7 +3,8 @@ import { vi, describe, it, expect, beforeEach } from "vitest"
 /**
  * Regression test: TRACES sync APIs used to keep one logged-in browser page at module level,
  * so a second call for another company ran on the first company's login. Every call must now
- * launch its own browser, log in with its own credentials and close the browser afterwards.
+ * open its own session (a browser for openTracesSession, an API session for the migrated
+ * scripts), log in with its own credentials and close it afterwards.
  */
 
 type FakeResponse = { url: () => string; json: () => Promise<unknown> }
@@ -51,9 +52,47 @@ vi.mock("./puppeteerSession", async () => {
   }
 })
 
+const apiSessions: Array<{ credentials: { tan: string }; closed: boolean; close: () => Promise<void> }> = []
+const servletPaths: string[] = []
+let priorYearsRow = false
+let servletShouldFail = false
+
+vi.mock("./apiSession", async () => {
+  const actual = await vi.importActual<Record<string, unknown>>("./apiSession")
+  return {
+    ...actual,
+    openTraces61ApiSession: vi.fn(async (credentials: { tan: string }) => {
+      const session = {
+        credentials,
+        closed: false,
+        close: async () => {
+          session.closed = true
+        },
+      }
+      apiSessions.push(session)
+      return session
+    }),
+    // TRACES answers the demand servlet with data for whoever owns the session.
+    postLegacyServletJson: vi.fn(async (session: { credentials: { tan: string } }, path: string) => {
+      servletPaths.push(path)
+      if (servletShouldFail) throw new Error("session expired: redirected to the new portal")
+      if (path.endsWith("reqtype=11")) return { rows: [{ finYr: "2015-16", aodmnd: "10.00", fin: 1 }] }
+      const rows: Array<Record<string, unknown>> = [
+        { finYr: "2025-26", fin: 2025, aodmnd: "0.00", cpcdmd: session.credentials.tan },
+      ]
+      if (priorYearsRow) rows.push({ finYr: "Prior Years", fin: 1, aodmnd: "10.00", cpcdmd: "0.00" })
+      return { rows }
+    }),
+  }
+})
+
 beforeEach(() => {
   launched.length = 0
   loginShouldFail = false
+  apiSessions.length = 0
+  servletPaths.length = 0
+  priorYearsRow = false
+  servletShouldFail = false
 })
 
 const credsA = { userId: "USERA", password: "pa", tan: "TANA00001A" }
@@ -82,35 +121,32 @@ describe("openTracesSession", () => {
 })
 
 describe("fetchOutstandingDemand", () => {
-  it("returns each company's own data and closes the browser after each call", async () => {
+  it("returns each company's own data and closes its session after each call", async () => {
     const { fetchOutstandingDemand } = await import("src/scripts/fetchOutstandingDemand")
     const first = await fetchOutstandingDemand({ credentials: credsA })
     const second = await fetchOutstandingDemand({ credentials: credsB })
 
-    expect(launched).toHaveLength(2)
+    expect(apiSessions.map((s) => s.credentials.tan)).toEqual([credsA.tan, credsB.tan])
     expect(first.data.rows[0].cpcdmd).toBe(credsA.tan)
     expect(second.data.rows[0].cpcdmd).toBe(credsB.tan)
-    expect(launched.every((l) => l.closed)).toBe(true)
-  }, 20000) // the script waits 3 s per call for TRACES to answer
+    expect(apiSessions.every((s) => s.closed)).toBe(true)
+  })
 
-  it("closes the browser when the portal step throws", async () => {
+  it("fetches the Prior Years feed only when the demand grid has a Prior Years row", async () => {
     const { fetchOutstandingDemand } = await import("src/scripts/fetchOutstandingDemand")
-    const puppeteer = (await import("puppeteer")).default as unknown as { launch: ReturnType<typeof vi.fn> }
-    puppeteer.launch.mockImplementationOnce(async () => {
-      const record = { closed: false, loginTan: undefined as string | undefined }
-      launched.push(record)
-      const page = {
-        __record: record,
-        setRequestInterception: vi.fn(async () => {}),
-        on: vi.fn(),
-        goto: vi.fn(async () => {
-          throw new Error("Navigation timeout of 60000 ms exceeded")
-        }),
-        evaluate: vi.fn(),
-      }
-      return { newPage: async () => page, close: vi.fn(async () => { record.closed = true }) }
-    })
-    await expect(fetchOutstandingDemand({ credentials: credsA })).rejects.toThrow(/timeout/)
-    expect(launched[0]!.closed).toBe(true)
+    const without = await fetchOutstandingDemand({ credentials: credsA })
+    expect(without.priorYearsData).toBeNull()
+
+    priorYearsRow = true
+    const withPrior = await fetchOutstandingDemand({ credentials: credsA })
+    expect(servletPaths.filter((p) => p.endsWith("reqtype=11"))).toHaveLength(1)
+    expect(withPrior.priorYearsData.rows[0].finYr).toBe("2015-16")
+  })
+
+  it("closes the session when the servlet call throws", async () => {
+    const { fetchOutstandingDemand } = await import("src/scripts/fetchOutstandingDemand")
+    servletShouldFail = true
+    await expect(fetchOutstandingDemand({ credentials: credsA })).rejects.toThrow(/session expired/)
+    expect(apiSessions[0]!.closed).toBe(true)
   })
 })

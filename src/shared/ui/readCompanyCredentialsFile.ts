@@ -1,7 +1,6 @@
 import * as XLSX from "xlsx"
 import {
   COMPANY_CREDENTIAL_COLUMN_MAP,
-  COMPANY_TEMPLATE_CSV,
   COMPANY_CREDENTIAL_HEADERS,
   parseCompanyCredentialRows,
   type CompanyCredentials,
@@ -46,23 +45,41 @@ export async function readCompanyCredentialsFromFile(
   return parseCompanyCredentialRows(jsonData, { ...COMPANY_CREDENTIAL_COLUMN_MAP })
 }
 
-export function downloadCompanyCredentialsTemplateCsv() {
-  const blob = new Blob([COMPANY_TEMPLATE_CSV], { type: "text/csv;charset=utf-8;" })
+/** A saved company as downloaded from the Companies page. */
+export type CompanyCredentialsExportRow = CompanyCredentials & {
+  dscCertificateName?: string | null
+  emails?: string | null
+}
+
+/** Upload columns first (so the file can be uploaded back as-is), then the extra company fields. */
+function companyCredentialsSheet(rows: CompanyCredentialsExportRow[]) {
+  return XLSX.utils.aoa_to_sheet([
+    [...COMPANY_CREDENTIAL_HEADERS, "DSC Certificate Name", "Emails"],
+    ...rows.map((c) => [
+      c.name,
+      c.tan,
+      c.it_password,
+      c.user_id,
+      c.password,
+      c.dscCertificateName ?? "",
+      c.emails ?? "",
+    ]),
+  ])
+}
+
+export function downloadCompanyCredentialsCsv(rows: CompanyCredentialsExportRow[]) {
+  const csv = XLSX.utils.sheet_to_csv(companyCredentialsSheet(rows))
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" })
   const url = URL.createObjectURL(blob)
   const a = document.createElement("a")
   a.href = url
-  a.download = "companies-template.csv"
+  a.download = "companies.csv"
   a.click()
   URL.revokeObjectURL(url)
 }
 
-export function downloadCompanyCredentialsTemplateExcel() {
-  const wsData = [
-    [...COMPANY_CREDENTIAL_HEADERS],
-    ["ABC Corporation Ltd", "ABCD12345E", "ITPass123", "ABCD12345E", "UserPass456"],
-  ]
-  const ws = XLSX.utils.aoa_to_sheet(wsData)
+export function downloadCompanyCredentialsExcel(rows: CompanyCredentialsExportRow[]) {
   const wb = XLSX.utils.book_new()
-  XLSX.utils.book_append_sheet(wb, ws, "Companies")
-  XLSX.writeFile(wb, "companies-template.xlsx")
+  XLSX.utils.book_append_sheet(wb, companyCredentialsSheet(rows), "Companies")
+  XLSX.writeFile(wb, "companies.xlsx")
 }

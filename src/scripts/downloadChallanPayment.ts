@@ -124,9 +124,20 @@ async function navigateToEpayTaxViaMenu(page: Page) {
   })
 
   await page.waitForSelector("#e-File", { visible: true, timeout: 60000 })
-  await page.click("#e-File")
-
-  await page.waitForSelector('.mat-mdc-menu-panel[role="menu"]', { visible: true, timeout: 15000 })
+  // Right after login the header can ignore the first click (still hydrating, or a
+  // post-login popup on top), so retry opening the menu a few times.
+  for (let attempt = 1; ; attempt++) {
+    await page.keyboard.press("Escape").catch(() => undefined)
+    await page.click("#e-File")
+    try {
+      await page.waitForSelector('.mat-mdc-menu-panel[role="menu"]', { visible: true, timeout: 15000 })
+      break
+    } catch (err) {
+      if (attempt >= 4) throw err
+      console.log(`[navigateToEpayTaxViaMenu] e-File menu did not open (attempt ${attempt}) — retrying`)
+      await waitForSecs(5000)
+    }
+  }
   await waitForSecs(400)
 
   const clicked = await page.evaluate(() => {
@@ -1502,14 +1513,17 @@ async function clickNextPaymentHistoryPage(page: Page): Promise<boolean> {
 type PaymentHistoryCapture = ReturnType<typeof createPaymentHistoryResponseCapture>
 
 function createPaymentHistoryResponseCapture(page: Page) {
-  let pending: { url: string; json: unknown } | null = null
-  let lastConsumedUrl = ""
+  // Every page POSTs the same URL (page number is in the body), so responses are told apart
+  // by arrival order, not URL — deduping on URL silently dropped page 2 onwards.
+  let pending: { seq: number; json: unknown } | null = null
+  let seq = 0
+  let lastConsumedSeq = 0
 
   const onResponse = async (response: { url: () => string; json: () => Promise<unknown> }) => {
     const url = response.url()
     if (!isPaymentHistoryApiUrl(url)) return
     try {
-      pending = { url, json: await response.json() }
+      pending = { seq: ++seq, json: await response.json() }
     } catch {
       /* ignore parse errors */
     }
@@ -1520,8 +1534,8 @@ function createPaymentHistoryResponseCapture(page: Page) {
   const take = async (timeoutMs = 60000): Promise<PaymentHistoryPageCapture | null> => {
     const start = Date.now()
     while (Date.now() - start < timeoutMs) {
-      if (pending && pending.url !== lastConsumedUrl) {
-        lastConsumedUrl = pending.url
+      if (pending && pending.seq > lastConsumedSeq) {
+        lastConsumedSeq = pending.seq
         const json = pending.json
         pending = null
         return parsePaymentHistoryPage(json)
@@ -1533,7 +1547,7 @@ function createPaymentHistoryResponseCapture(page: Page) {
 
   const reset = () => {
     pending = null
-    lastConsumedUrl = ""
+    lastConsumedSeq = seq
   }
 
   const dispose = () => page.off("response", onResponse)
@@ -2089,6 +2103,10 @@ export type MissingPaymentPdfDownloadResult = PaymentHistoryDownloadStats & {
   stillMissing: number
   dayGroups: Array<{ dayKey: string; count: number }>
   downloadedCins: string[]
+  /** Set when `csiAfter` was requested and the CSI tab download succeeded. */
+  csi?: { downloadPath: string; files: string[]; startedAt: number }
+  /** Set when `csiAfter` was requested and the CSI tab download failed (PDFs are unaffected). */
+  csiError?: string
 }
 
 /**
@@ -2106,6 +2124,11 @@ export async function downloadMissingPaymentHistoryPdfs(
     missing?: Array<{ cin: string; paymentTime?: string; assessmentYear?: string; paymentType?: string }>
     /** When true (New Act): do not apply date filter; download all available missing PDFs. */
     skipDateFilter?: boolean
+    /**
+     * After the PDFs, switch to the CSI File tab in the same session and download the CSI
+     * file for this range (saves a separate login). Uses the session's Act selection.
+     */
+    csiAfter?: { fromDate: string; toDate: string }
   }
 ): Promise<MissingPaymentPdfDownloadResult> {
   const skipNewActRadio = options?.skipNewActRadio === true
@@ -2204,6 +2227,8 @@ export async function downloadMissingPaymentHistoryPdfs(
     downloaded: 0,
     pages: 0,
   }
+  let csiResult: MissingPaymentPdfDownloadResult["csi"]
+  let csiError: string | undefined
   const pdfsBefore = new Set(
     fs.existsSync(downloadPath)
       ? fs
@@ -2237,9 +2262,10 @@ export async function downloadMissingPaymentHistoryPdfs(
     }
     await waitForSecs(5000)
 
-    capture.reset()
-
     if (!skipDateFilter && dateRange) {
+      // The filter triggers a fresh paymenthistory response; drop the tab's initial one.
+      // Unfiltered runs must keep it — it is page 1, and nothing re-fetches it.
+      capture.reset()
       // Old Act: date range only — do not set assessmentYear/paymentType.
       console.log(
         `\n[downloadMissingPaymentHistoryPdfs] Filtering ${dateRange.fromDate} → ${dateRange.toDate} then matching ${targetCins!.size} CIN(s)`
@@ -2287,6 +2313,67 @@ export async function downloadMissingPaymentHistoryPdfs(
     aggregate.pages += rangeStats.pages
 
     await waitForSecs(10000)
+
+    if (options?.csiAfter) {
+      const csiPath = csiDownloadDir(companyName)
+      const startedAt = Date.now()
+      try {
+        console.log(`[downloadMissingPaymentHistoryPdfs] CSI File tab in same session → ${csiPath}`)
+        await closeOpenMatMenus(page)
+        fs.mkdirSync(csiPath, { recursive: true })
+        await client.send("Page.setDownloadBehavior", { behavior: "allow", downloadPath: csiPath })
+        try {
+          await client.send("Browser.setDownloadBehavior", {
+            behavior: "allow",
+            downloadPath: csiPath,
+            eventsEnabled: true,
+          })
+        } catch {
+          /* Page-level behaviour above is enough; events only speed up completion detection. */
+        }
+        await page.evaluate(() => window.scrollTo(0, 0))
+        const { fromDate, toDate } = options.csiAfter
+        let files: string[]
+        try {
+          files = await downloadCsiFromEpayTabs(page, client, csiPath, fromDate, toDate)
+        } catch (err: any) {
+          // After a long Payment History pass the tab strip sometimes re-renders without
+          // the CSI tab. Re-open e-Pay from the menu (same login) and try once more.
+          if (page.url().includes("sessionExpire")) throw err
+          console.log(
+            `[downloadMissingPaymentHistoryPdfs] CSI tab missing (${err?.message || err}) — re-opening e-Pay in same session`
+          )
+          await navigateToEpayTaxViaMenu(page)
+          // The portal may remember the Act choice and open straight on the tab strip.
+          const landing = await Promise.any([
+            page
+              .waitForSelector('button.large-button-primary.iconsAfter.nextIcon[type="button"]', {
+                visible: true,
+                timeout: 120000,
+              })
+              .then(() => "choice" as const),
+            page
+              .waitForSelector(".mdc-tab__text-label", { visible: true, timeout: 120000 })
+              .then(() => "tabs" as const),
+          ])
+          if (landing === "choice") {
+            if (!skipNewActRadio) {
+              await page.waitForSelector("#mat-radio-0", { visible: true, timeout: 30000 })
+              await page.click("#mat-radio-0")
+            }
+            await clickContinueAfterEpayLanding(page)
+          }
+          await page.waitForSelector(".mdc-tab__text-label", { visible: true, timeout: 60000 })
+          await waitForSecs(6000)
+          files = await downloadCsiFromEpayTabs(page, client, csiPath, fromDate, toDate)
+        }
+        csiResult = { downloadPath: csiPath, files, startedAt }
+      } catch (err: any) {
+        csiError = err?.message || String(err)
+        console.log(`[downloadMissingPaymentHistoryPdfs] CSI tab download failed: ${csiError}`)
+      }
+    }
+
     await convertPdfsToExcel(downloadPath, companyName)
   } finally {
     capture.dispose()
@@ -2323,6 +2410,8 @@ export async function downloadMissingPaymentHistoryPdfs(
           },
         ],
     downloadedCins,
+    ...(csiResult ? { csi: csiResult } : {}),
+    ...(csiError ? { csiError } : {}),
   }
 }
 
@@ -2414,8 +2503,28 @@ async function openMatDatepickerForSelector(page: Page, inputSelector: string) {
   }
 }
 
-async function clickEpayTabByLabel(page: Page, tabLabel: string) {
-  const clicked = await page.evaluate((want) => {
+async function clickEpayTabByLabel(page: Page, tabLabel: string, timeoutMs = 45000) {
+  // The tab strip can render before all tabs are populated (slow portal), so poll.
+  const start = Date.now()
+  let seen: string[] = []
+  while (Date.now() - start < timeoutMs) {
+    if (await clickEpayTabByLabelOnce(page, tabLabel)) return
+    seen = await page
+      .evaluate(() =>
+        Array.from(document.querySelectorAll(".mdc-tab__text-label")).map((el) =>
+          (el.textContent || "").replace(/\s+/g, " ").trim()
+        )
+      )
+      .catch(() => [])
+    await waitForSecs(2000)
+  }
+  throw new Error(
+    `Could not find e-Pay tab: "${tabLabel}" (tabs on page: ${seen.join(" | ") || "none"}; url ${page.url()})`
+  )
+}
+
+async function clickEpayTabByLabelOnce(page: Page, tabLabel: string): Promise<boolean> {
+  return page.evaluate((want) => {
     const norm = (s: string) => s.replace(/\s+/g, " ").trim()
     const wantNorm = norm(want)
     const tabs = Array.from(document.querySelectorAll(".mdc-tab__text-label")) as HTMLElement[]
@@ -2439,9 +2548,6 @@ async function clickEpayTabByLabel(page: Page, tabLabel: string) {
     }
     return false
   }, tabLabel)
-  if (!clicked) {
-    throw new Error(`Could not find e-Pay tab: "${tabLabel}"`)
-  }
 }
 
 /** Set From/To dates on the CSI File tab (page-level datepickers, not the filter modal). */
@@ -2587,6 +2693,36 @@ async function waitForCsiDownloadComplete(
   throw new Error(`CSI file download did not complete within ${timeoutMs / 1000}s in ${dir}`)
 }
 
+/** Folder the CSI flows save into: `public/pdf/challans/{company}/CSI`. */
+export function csiDownloadDir(companyName: string): string {
+  return path.resolve(`./public/pdf/challans/${companyName}/CSI`)
+}
+
+/**
+ * On an already-open e-Pay page (Act chosen, tab strip visible): select the CSI File tab,
+ * set the dates and download into `downloadPath`. Returns the downloaded file names.
+ */
+async function downloadCsiFromEpayTabs(
+  page: Page,
+  client: Awaited<ReturnType<Page["createCDPSession"]>>,
+  downloadPath: string,
+  fromDate: string,
+  toDate: string
+): Promise<string[]> {
+  if (!fs.existsSync(downloadPath)) fs.mkdirSync(downloadPath, { recursive: true })
+  await clickEpayTabByLabel(page, CSI_TAB_LABEL)
+  await waitForSecs(3000)
+
+  await setCsiFileDates(page, fromDate, toDate)
+
+  const beforeMtimes = getDownloadFileMtimes(downloadPath)
+  await clickDownloadCsiChallanFileButton(page)
+  console.log("Clicked Download Challan File — waiting for file to finish downloading...")
+  const files = await waitForCsiDownloadComplete(downloadPath, beforeMtimes, client)
+  console.log(`CSI file downloaded: ${files.join(", ")}`)
+  return files
+}
+
 /**
  * Open e-Pay → **Challan Status Inquiry (CSI) File** tab, set from/to dates, and click
  * "Download Challan File". Saves under `public/pdf/challans/{company}/CSI`.
@@ -2621,7 +2757,7 @@ export async function downloadCsiFiles(
     args: ["--start-maximized"],
   })
 
-  const downloadPath = path.resolve(`./public/pdf/challans/${companyName}/CSI`)
+  const downloadPath = csiDownloadDir(companyName)
   if (!fs.existsSync(downloadPath)) {
     fs.mkdirSync(downloadPath, { recursive: true })
   }
@@ -2660,17 +2796,7 @@ export async function downloadCsiFiles(
 
     await page.waitForSelector(".mdc-tab__text-label", { visible: true, timeout: 60000 })
     await waitForSecs(6000)
-    await clickEpayTabByLabel(page, CSI_TAB_LABEL)
-    await waitForSecs(3000)
-
-    await setCsiFileDates(page, fromDate, toDate)
-
-    const beforeMtimes = getDownloadFileMtimes(downloadPath)
-    await clickDownloadCsiChallanFileButton(page)
-    console.log("Clicked Download Challan File — waiting for file to finish downloading...")
-    const files = await waitForCsiDownloadComplete(downloadPath, beforeMtimes, client)
-    console.log(`CSI file downloaded: ${files.join(", ")}`)
-
+    const files = await downloadCsiFromEpayTabs(page, client, downloadPath, fromDate, toDate)
     return { downloadPath, files }
   } finally {
     console.log("Closing browser after CSI download...")

@@ -25,7 +25,7 @@
     "dsc:test": "node scripts/dsc-test.js",
     "dsc:unlock": "node scripts/run-ts.js src/scripts/dscUnlock.ts",
     "dsc:sign": "node scripts/run-ts.js src/scripts/dscSignPending.ts",
-    "dsc:build-signer": "dotnet publish pdf-signer-src/pdf-signer.csproj -c Release -r win-x64 --self-contained false -o pdf-signer"
+    "dsc:build-signer": "dotnet publish pdf-signer-src/pdf-signer.csproj -c Release -r win-x64 --self-contained true -o pdf-signer"
   },
   "prisma": {
     "schema": "db/schema.prisma"

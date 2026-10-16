@@ -29,6 +29,16 @@ import {
   TRACES_MAX_LOGIN_ATTEMPTS,
   traces61DedUrl,
   traces61Host,
+  openTraces61ApiSession,
+  postLegacyServletJson,
+  fetchLegacyDownloadUrl,
+  loadLegacyPage,
+  assertLegacyStep,
+  ensureLegacySelectOption,
+  submitLegacyControl,
+  submitNormalKycChain,
+  runLegacyRequestFlow,
+  type Traces61ApiSession,
 } from "../traces"
 import {
   buildViewFiledFormsPayload,
@@ -1649,6 +1659,275 @@ export default class NoticeDownloaderConso {
     }
   }
 
+  /**
+   * API-only NSDL conso file download (no Puppeteer) — same result shape as the legacy
+   * `getTracesFilepuppeteer`. Lists via GetReqListServlet, downloads via DownloadServlet.
+   */
+  async getTracesFileApi(record: any) {
+    const fsMod = require("fs")
+    const pathMod = require("path")
+    const axios = require("axios")
+
+    try {
+      if (!record) throw new Error("No company record provided for TRACES file download")
+      const companyLabel = record.companyName || record.name || "Unknown"
+      this.logger.log(`Starting TRACES API automation for ${companyLabel}`)
+
+      const session: Traces61ApiSession = await openTraces61ApiSession(
+        {
+          userId: record.user_id,
+          password: record.password,
+          tan: record.tan,
+        },
+        { log: (msg) => this.logger.log(msg) }
+      )
+      try {
+        const listRows: any[] = []
+        let pageNo = 1
+        let totalPages = 1
+        while (pageNo <= totalPages && pageNo <= 20) {
+          const json = await postLegacyServletJson(
+            session,
+            `app/srv/GetReqListServlet?reqtype=0&_search=false&nd=${Date.now()}&rows=100&page=${pageNo}&sidx=reqNo&sord=desc`
+          )
+          totalPages = Number(json.total || json.totalpages || 1)
+          const rows = Array.isArray(json.rows) ? json.rows : []
+          listRows.push(...rows)
+          if (!rows.length) break
+          pageNo++
+        }
+
+        const availableFiles = listRows.filter((row: any) => {
+          const status = String(row.status || "").toLowerCase()
+          const kind = String(row.dntype || row.fileProcessed || "").toLowerCase()
+          return status === "available" && kind === "nsdl conso file"
+        })
+        this.logger.log(
+          `Request list: ${listRows.length} rows, ${availableFiles.length} available NSDL Conso files`
+        )
+
+        const parseDate = (dateStr: string) => {
+          if (!dateStr) return new Date(0)
+          try {
+            const parts = dateStr.split("-")
+            if (parts.length !== 3) return new Date(0)
+            const monthMap: Record<string, number> = {
+              Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5,
+              Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11,
+            }
+            if (parts[1]?.length === 3) {
+              return new Date(parseInt(parts[2]!), monthMap[parts[1]!] || 0, parseInt(parts[0]!))
+            }
+            return new Date(parseInt(parts[0]!), parseInt(parts[1]!) - 1, parseInt(parts[2]!))
+          } catch {
+            return new Date(0)
+          }
+        }
+
+        const groupedFiles = new Map<string, any>()
+        for (const file of availableFiles) {
+          const finYr = String(file.finYr || file.financialYear || file.fin || "")
+          const quarter = String(file.qrtr || file.quarter || "")
+          const formType = String(file.frmType || file.formType || "")
+          const key = `${String(finYr).split("-")[0]}_${quarter}_${formType}`
+          const existing = groupedFiles.get(key)
+          if (!existing || parseDate(file.reqDate || file.requestDate) > parseDate(existing.reqDate)) {
+            groupedFiles.set(key, {
+              ...file,
+              financialYear: finYr,
+              quarter,
+              formType,
+              requestNumber: String(file.reqNo || file.requestNumber || ""),
+              requestDate: file.reqDate || file.requestDate || "",
+            })
+          }
+        }
+        const filesToDownload = Array.from(groupedFiles.values())
+        this.logger.log(`After filtering duplicates: ${filesToDownload.length} files to download`)
+
+        const safeCompany = (record.name || "UNKNOWN_COMPANY").replace(/[/\\?%*:|"<>]/g, "_")
+        const downloadResults: any[] = []
+
+        for (const fileToDownload of filesToDownload) {
+          const reqNo = String(fileToDownload.requestNumber || "")
+          try {
+            this.logger.log(
+              `\nDownloading: FY ${fileToDownload.financialYear}, ${fileToDownload.quarter}, ${fileToDownload.formType}, Req: ${reqNo}`
+            )
+            const { url: downloadUrl, reply } = await fetchLegacyDownloadUrl(session, reqNo)
+            if (!downloadUrl) {
+              this.logger.log(`Could not find download URL for reqNo: ${reqNo} (${reply.slice(0, 180)})`)
+              downloadResults.push({
+                success: false,
+                reason: "Could not find download URL",
+                finYr: fileToDownload.financialYear,
+                qrtr: fileToDownload.quarter,
+                frmType: fileToDownload.formType,
+                reqNo,
+              })
+              continue
+            }
+
+            const formTypeDir = String(fileToDownload.formType).replace(/[/\\?%*:|"<>]/g, "_")
+            const finYrDir = String(fileToDownload.financialYear).replace(/[/\\?%*:|"<>]/g, "_")
+            const qrtrDir = String(fileToDownload.quarter)
+            const targetDir = pathMod.join(
+              process.cwd(), "public", "pdf", "traces", safeCompany, finYrDir, qrtrDir, formTypeDir
+            )
+            fsMod.mkdirSync(targetDir, { recursive: true })
+            let fileName = `${reqNo}.zip`
+            try {
+              const urlParts = downloadUrl.split("/")
+              fileName = urlParts.reverse().find((part: string) => part.includes(".")) || fileName
+            } catch {
+              /* keep default */
+            }
+            const targetFilePath = pathMod.join(targetDir, fileName)
+
+            const downloadResponse = await axios.get(downloadUrl, { responseType: "arraybuffer" })
+            fsMod.writeFileSync(targetFilePath, Buffer.from(downloadResponse.data))
+            this.logger.log(`✓ File downloaded: ${targetFilePath}`)
+
+            downloadResults.push({
+              success: true,
+              tanReqNo: `${(record.tan || "").toUpperCase()}_${reqNo}`,
+              company: record.name,
+              filePath: targetFilePath,
+              finYr: fileToDownload.financialYear,
+              qrtr: fileToDownload.quarter,
+              frmType: fileToDownload.formType,
+              reqNo,
+              reqDate: fileToDownload.requestDate,
+            })
+            await waitForSecs(1000)
+          } catch (err: any) {
+            this.logger.log(`✗ Failed to download file for reqNo ${reqNo}: ${err.message}`)
+            downloadResults.push({
+              success: false,
+              reason: `Failed to download: ${err.message}`,
+              finYr: fileToDownload.financialYear,
+              qrtr: fileToDownload.quarter,
+              frmType: fileToDownload.formType,
+              reqNo,
+            })
+          }
+        }
+
+        const successCount = downloadResults.filter((r) => r.success).length
+        const failCount = downloadResults.filter((r) => !r.success).length
+        this.logger.log(
+          `\n=== Download Summary === Total tracked: ${filesToDownload.length}, attempted: ${downloadResults.length}, success: ${successCount}, failed: ${failCount}`
+        )
+
+        if (downloadResults.length === 0) {
+          return {
+            success: false,
+            reason: "No NSDL Conso files available",
+            company: record.name,
+            tan: record.tan,
+          }
+        }
+        if (successCount > 0) {
+          return {
+            success: true,
+            company: record.name,
+            tan: (record.tan || "").toUpperCase(),
+            downloadResults,
+            summary: { total: downloadResults.length, success: successCount, failed: failCount },
+          }
+        }
+        return {
+          success: false,
+          reason: "All downloads failed",
+          company: record.name,
+          tan: record.tan,
+          downloadResults,
+        }
+      } finally {
+        await session.close()
+      }
+    } catch (error: any) {
+      this.logger.log(`Error in TRACES API automation: ${error.message}`)
+      throw error
+    }
+  }
+
+  /**
+   * API-only Conso File request submission (no Puppeteer).
+   *
+   * Flow (recorded from the Puppeteer flow, see docs/TRACES-OLD-PORTAL-API-MIGRATION.md §5):
+   * nsdlconsofile.xhtml — FY, quarter, form type + Go (#download_conso) → Normal KYC
+   * (#search2, #normalkyc → #nxtSrcn) → challan details (#token … #amt3, #clickKYC) →
+   * Proceed with Transaction (#redirect) → CreateDwnldReqServlet, which files the request.
+   * Each step posts the form the previous response rendered, to that form's own action.
+   *
+   * NOTE: this files a real request on the portal (state-changing). Returns the request number.
+   */
+  async sendConsoRequestApi(record: any) {
+    try {
+      if (!record) throw new Error("No challan record provided for TRACES automation")
+      record = this.enrichChallanRecord(record)
+      this.logger.log(`Starting TRACES API conso request for ${record.companyName}`)
+
+      const fyValue =
+        String(record.financialYear ?? this.financialYear ?? "").split("-")[0]?.trim() || ""
+      const quarterValue = this.tracesQuarterOptionValue(record.quarter || this.quarter)
+      const formTypeValue = String(record.formType || this.formType || "").trim()
+      this.logger.log(
+        `Selecting filters FY=${fyValue} quarter=${record.quarter || this.quarter} (${quarterValue}) form=${formTypeValue}`
+      )
+      if (!quarterValue) {
+        throw new Error(`Could not map quarter "${record.quarter || this.quarter}" to a TRACES option`)
+      }
+
+      // Failures before the final submit are retried from a fresh login; never after it.
+      const result = await runLegacyRequestFlow(
+        { label: "Conso request", maxAttempts: 3, log: (msg) => this.logger.log(msg) },
+        async () => {
+          const session: Traces61ApiSession = await openTraces61ApiSession(
+            {
+              userId: record.userId,
+              password: record.password,
+              tan: record.tan,
+            },
+            { log: (msg) => this.logger.log(msg) }
+          )
+          try {
+            // Step 1: nsdlconsofile.xhtml — filters + Go.
+            let page = await loadLegacyPage(session, "app/ded/nsdlconsofile.xhtml")
+            assertLegacyStep(page, "opening nsdlconsofile.xhtml", ["download_conso"])
+            const finYr = await ensureLegacySelectOption(session, page, "finYr", fyValue)
+            // JSF rebuilds #qrtr after the FY changes; the FY is posted back first when needed.
+            const qrtr = await ensureLegacySelectOption(session, finYr.page, "qrtr", quarterValue, {
+              finYr: finYr.value,
+            })
+            const frmType = await ensureLegacySelectOption(session, qrtr.page, "frmType", formTypeValue, {
+              finYr: finYr.value,
+              qrtr: qrtr.value,
+            })
+            page = await submitLegacyControl(session, frmType.page, "download_conso", {
+              fields: { finYr: finYr.value, qrtr: qrtr.value, frmType: frmType.value },
+            })
+            this.logger.log(`Go submitted (${page.url})`)
+
+            // Steps 2-4: Normal KYC → challan details → Proceed with Transaction.
+            return await submitNormalKycChain(session, page, record, (msg) => this.logger.log(msg))
+          } finally {
+            await session.close()
+          }
+        }
+      )
+
+      this.logger.log(
+        `TRACES API automation completed successfully for ${record.companyName || this.company.name}`
+      )
+      return { success: true, requestNumber: result.requestNumber }
+    } catch (error: any) {
+      this.logger.log(`Error in TRACES API automation: ${error.message}`)
+      throw error
+    }
+  }
+
   async getTracesFilepuppeteer(record: any) {
     const puppeteer = require("puppeteer")
     const fs = require("fs")
@@ -2777,7 +3056,7 @@ export default class NoticeDownloaderConso {
     this.logger.log(`Starting Download File for ${this.company.name}`)
     console.log("Company", this.company?.name, this.company?.tan)
 
-    const result = await this.getTracesFilepuppeteer(this.company)
+    const result = await this.getTracesFileApi(this.company)
     console.log("result", result)
     // Extract successful downloads from the result
     if (result && result.success && result.downloadResults) {
@@ -2872,7 +3151,7 @@ export default class NoticeDownloaderConso {
         )
       }
 
-      await this.getTracesDatapuppeteer(companyData)
+      await this.sendConsoRequestApi(companyData)
     }
 
     if (this.jobTypes.includes("DownloadFile")) {

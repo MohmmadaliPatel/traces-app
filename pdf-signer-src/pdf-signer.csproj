@@ -10,7 +10,10 @@
     <!-- The Windows certificate store and the CNG/CSP PIN APIs are Windows-only. -->
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <SelfContained>false</SelfContained>
+    <!-- Bundles the .NET runtime, so client machines need no separate .NET install. Never turn
+         on trimming: Spire resolves much of itself through reflection. -->
+    <SelfContained>true</SelfContained>
+    <PublishTrimmed>false</PublishTrimmed>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
     <NoWarn>$(NoWarn);CA1416</NoWarn>
@@ -20,6 +23,13 @@
     <!-- Same package the shipped signer was built against, so the dependency graph (Spire plus
          its SkiaSharp/HarfBuzz native assets) is reproduced exactly. -->
     <PackageReference Include="FreeSpire.PDF" Version="11.11.0" />
+    <!-- SignedCms: the signature container is built here, so Spire never holds the key. -->
+    <PackageReference Include="System.Security.Cryptography.Pkcs" Version="10.0.13" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The one-command self-test, shipped next to the exe. -->
+    <None Include="diagnose.cmd" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

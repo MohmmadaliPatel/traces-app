@@ -1,42 +1,15 @@
 import path from "path"
 import fs from "fs"
-import os from "os"
 import db from "db" // Import database to check for existing records
-import { openTracesSession, traces61DedUrl, type TracesSession } from "../jobs/traces"
+import {
+  isRedirectToNewPortal,
+  legacyGet,
+  openTraces61ApiSession,
+  postLegacyServletJson,
+  type Traces61ApiSession,
+} from "../jobs/traces"
 import pdfParse from "pdf-parse"
 import { toPublicPath } from "../tldc/pdfPath"
-
-// Utility function to wait for a specified time
-const waitForSecs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
-
-/**
- * Fresh TRACES session for one call, logged in with exactly these credentials.
- * Never cached: concurrent calls must not share a page or another company's login.
- */
-function openTldcSession(credentials: {
-  userId: string
-  password: string
-  tan: string
-}): Promise<TracesSession> {
-  return openTracesSession(credentials, {
-    defaultViewport: null,
-    args: [
-    "--start-maximized",
-    "--disable-web-security",
-    "--disable-features=IsolateOrigins,site-per-process",
-    "--allow-file-access-from-files",
-  ],
-    beforeLogin: async (page) => {
-      // Set extra permissions for downloads
-      const downloadClient = await page.target().createCDPSession()
-      await downloadClient.send("Browser.setDownloadBehavior", {
-        behavior: "allow",
-        downloadPath: path.join(os.tmpdir(), "tldc-downloads"),
-        eventsEnabled: true,
-      })
-    },
-  })
-}
 
 /**
  * Keep a parsed certificate PDF as tldc-downloads/certificates/{certNumber}.pdf.
@@ -61,15 +34,6 @@ function keepCertificatePdf(filePath: string, certNumber?: string): string | nul
   }
 }
 
-interface CertificateRow {
-  index: number
-  text: (string | undefined)[]
-  din?: string
-  date?: string
-  certNumber?: string
-  fy?: string
-}
-
 /**
  * Process downloaded PDF files to extract certificate numbers and PAN numbers
  * @param downloadedFiles Array of downloaded PDF files
@@ -80,6 +44,15 @@ export async function processPdfFiles(downloadedFiles: any[]): Promise<any[]> {
 
   for (const file of downloadedFiles) {
     try {
+      if (!file.filePath || !fs.existsSync(file.filePath)) {
+        processedFiles.push({
+          certNumber: file.certNumber,
+          din: file.din,
+          fy: file.fy,
+          pdfPath: null,
+        })
+        continue
+      }
       // Read the PDF file
       const dataBuffer = fs.readFileSync(file.filePath)
       const pdfData = await pdfParse(dataBuffer)
@@ -88,10 +61,7 @@ export async function processPdfFiles(downloadedFiles: any[]): Promise<any[]> {
       const text = pdfData.text
 
       // Extract certificate number - match patterns like "Certificate No: XYZABC123"
-      const certNumberMatch =
-        // text.match(/Certificate\s*No\.?:?\s*([A-Za-z0-9]+)/i) ||
-        // text.match(/Certificate\s*Number:?\s*([A-Za-z0-9]+)/i) ||
-        text.match(/Certificate\s*No\.\s*:\s*([A-Za-z0-9]+)/i)
+      const certNumberMatch = text.match(/Certificate\s*No\.\s*:\s*([A-Za-z0-9]+)/i)
 
       // Extract PAN number - standard 10-character alphanumeric PAN format
       const panNumberMatch =
@@ -99,7 +69,6 @@ export async function processPdfFiles(downloadedFiles: any[]): Promise<any[]> {
         text.match(/PAN\s*:\s*([A-Z]{5}[0-9]{4}[A-Z])/i) ||
         text.match(/Permanent\s*Account\s*Number:?\s*([A-Z]{5}[0-9]{4}[A-Z])/i)
 
-      // Create a copy of the file object with the extracted data
       const certNumber = file.certNumber || (certNumberMatch ? certNumberMatch[1] : undefined)
       const processedFile = {
         certNumber,
@@ -132,10 +101,6 @@ export async function processPdfFiles(downloadedFiles: any[]): Promise<any[]> {
 
 /**
  * Check if a TLDC record with the given DIN and FY already exists in the database
- * @param rowCertNumber The Cert Number to check
- * @param fy The financial year
- * @param companyId The company ID
- * @returns Promise<boolean> True if record exists, false otherwise
  */
 async function checkRecordExists(
   rowCertNumber: string,
@@ -143,22 +108,16 @@ async function checkRecordExists(
   companyId?: number
 ): Promise<boolean> {
   try {
-    // Define where clause for database query
     const where: any = {
       certNumber: rowCertNumber,
       fy: fy,
     }
-
-    // Add companyId to where clause if provided
     if (companyId) {
       where.companyId = companyId
     }
-
-    // Check if record exists
     const existingRecord = await db.tldcData.findFirst({
       where: where,
     })
-
     return !!existingRecord
   } catch (error) {
     console.error(`❌ Error checking database for Cert Number ${rowCertNumber}:`, error)
@@ -167,7 +126,32 @@ async function checkRecordExists(
 }
 
 /**
- * Fetch TLDC Data for a specific TAN and year
+ * TLDC inbox row from CommInboxServlet (category 42 = Certificate U/S 197,206C).
+ */
+type InboxRow = {
+  commRefNo?: string
+  date?: string
+  commcat?: string
+  description?: string
+  finYear?: string
+  quarter?: string
+  formType?: string
+  commInbId?: string
+  commMstrId?: string
+  category?: string
+  comcatid?: string
+  hidFY?: string
+  hidQT?: string
+  certNum?: string
+}
+
+/**
+ * Fetch TLDC Data for a specific TAN and year — API-only (no Puppeteer).
+ *
+ *   POST CommInboxServlet?reqtype=1&sdate=&edate=&category=42&finYear=&quarter=&commClassify=1
+ *   → certificate inbox rows; each row's PDF is a plain GET:
+ *   GET CommInboxServlet?commId=<commRefNo>&finYear=<hidFY>&formType=<formType>&reqtype=5
+ *       &certNum=<certNum>&description=<description>
  */
 export async function fetchTldcData({
   tan,
@@ -180,263 +164,125 @@ export async function fetchTldcData({
   credentials: { userId: string; password: string; tan: string }
   companyId?: number
 }): Promise<{ data: any; cached?: boolean }> {
-  console.log("⏳ Launching Puppeteer for:", tan, year)
+  console.log("⏳ Fetching TLDC data via API for:", tan, year)
 
-  // Create a download directory - use absolute path in temp directory
   const downloadDir = path.resolve(`./public/pdf/tldc-downloads`)
   fs.mkdirSync(downloadDir, { recursive: true })
 
-  // Track all downloaded files
   const allDownloads: any[] = []
   let currentPage = 1
-  let hasMorePages = true
-  let certificateTableData = null
 
-  // Counter for consecutive empty pages
-  let emptyPagesCount = 0
-  const MAX_EMPTY_PAGES = 3
-
-  let session: TracesSession | undefined
+  let session: Traces61ApiSession | undefined
   try {
-    session = await openTldcSession(credentials)
-    const page = session.page
+    session = await openTraces61ApiSession(credentials)
 
-    // Configure download behavior
-    const client = await page.target().createCDPSession()
-    await client.send("Page.setDownloadBehavior", {
-      behavior: "allow",
-      downloadPath: downloadDir,
+    // --- list the certificate inbox (category 42 = Certificate U/S 197,206C) ---
+    const inboxRows: InboxRow[] = []
+    let totalpages = 1
+    for (;;) {
+      const data = await postLegacyServletJson(
+        session,
+        `app/ded/srv/CommInboxServlet?reqtype=1&sdate=&edate=&category=42&finYear=&quarter=&commClassify=1`,
+        { body: `_search=false&nd=${Date.now()}&rows=100&page=${currentPage}&sidx=&sord=asc` }
+      )
+      const rows: InboxRow[] = Array.isArray(data?.rows) ? data.rows : []
+      inboxRows.push(...rows)
+      totalpages = Number(data?.totalpages) || 1
+      if (currentPage >= totalpages || rows.length === 0) break
+      currentPage++
+    }
+
+    console.log(`📥 Inbox: ${inboxRows.length} certificate communication row(s)`)
+
+    // --- filter to certificate rows for the requested year ---
+    const yearStart = String(year).split("-")[0]
+    const matchesYear = (fy?: string) =>
+      Boolean(fy) && (fy === year || (yearStart ? String(fy).startsWith(yearStart) : false))
+    const certificateRows = inboxRows.filter((row) => {
+      const desc = `${row.description ?? ""} ${row.category ?? ""} ${row.commcat ?? ""}`
+      const isCert =
+        desc.toLowerCase().includes("certificate") &&
+        (desc.includes("197") || desc.includes("206C"))
+      return Boolean(row.certNum) && isCert && (matchesYear(row.finYear) || matchesYear(row.hidFY))
     })
 
-    // Process each page of results
-    while (hasMorePages) {
-      // Navigate to the DED inbox page (only needed for the first page)
-      if (currentPage === 1) {
-        await page.goto(traces61DedUrl("dedinbox.xhtml"), {
-          waitUntil: "networkidle2",
+    console.log(`📄 ${certificateRows.length} certificate row(s) match FY ${year}`)
+
+    for (const row of certificateRows) {
+      const rowDin = row.commRefNo ?? ""
+      const rowCertNumber = row.certNum ?? ""
+      // Stored as TldcData.fy and used for de-duplication. The Puppeteer version kept only
+      // rows whose FY text equalled `year`, so every stored row carried `year` itself —
+      // keep that, whatever format the grid JSON uses (hidFY may be "2025" vs "2025-26").
+      const rowFy = year
+      // The certificate download link uses the portal's own FY value.
+      const portalFy = row.hidFY ?? row.finYear ?? year
+
+      if (!rowDin || !rowCertNumber) {
+        console.log(`⚠️ Missing required data for inbox row, skipping...`)
+        continue
+      }
+
+      const recordExists = await checkRecordExists(rowCertNumber, rowFy, companyId)
+      console.log("Record Exists", rowDin, recordExists)
+
+      if (recordExists) {
+        allDownloads.push({
+          fileName: `skipped_${rowDin}_${rowCertNumber}.pdf`,
+          filePath: "",
+          din: rowDin,
+          certNumber: rowCertNumber,
+          fy: rowFy,
         })
-
-        // Wait for category dropdown and select Certificate
-        await page.waitForSelector("#commCategory", { visible: true, timeout: 10000 })
-        await page.select("#commCategory", "42") // 42 is Certificate
-
-        // Click on go button
-        await page.waitForSelector("#go", { visible: true, timeout: 10000 })
-        await page.click("#go")
+        continue
       }
 
-      // Wait for the table to load
-      await page.waitForSelector("table#viewcorrdettab", { visible: true, timeout: 30000 })
-      await page.waitForSelector("table#viewcorrdettab tbody tr", { visible: true, timeout: 30000 })
-
-      // Find all certificate rows using a robust selector
-      // Wait for the table to fully load and ensure rows are present
-      await waitForSecs(3000) // Add extra wait time to ensure DOM is fully loaded
-
-      // Get the year value to pass into the evaluate function
-      const certificateRows: CertificateRow[] = await page.evaluate((yearValue) => {
-        const rows: any = Array.from(document.querySelectorAll("table#viewcorrdettab tbody tr"))
-        const results: Array<{
-          index: number
-          text: (string | undefined)[]
-          din?: string
-          date?: string
-          certNumber?: string
-          fy?: string
-        }> = []
-
-        console.log("ROWS", rows)
-
-        for (let i = 0; i < rows.length; i++) {
-          const cells = Array.from(rows[i].querySelectorAll("td"))
-          const cellText = cells.map((cell: any) => cell.textContent?.trim())
-          console.log("Cell Text", cellText, "Year Value", yearValue)
-
-          // Look for certificate text in any column (usually the 3rd)
-          const hasCertificate = cellText.some(
-            (text) =>
-              text &&
-              text.includes("Certificate") &&
-              (text.includes("197") || text.includes("206C"))
+      try {
+        // Certificate PDF — plain GET (the page opens this URL in a new tab).
+        const pdfUrl =
+          `app/ded/srv/CommInboxServlet?commId=${encodeURIComponent(
+            rowDin
+          )}&finYear=${encodeURIComponent(portalFy)}&formType=${encodeURIComponent(
+            row.formType ?? ""
+          )}&reqtype=5&certNum=${encodeURIComponent(rowCertNumber)}&description=${encodeURIComponent(
+            row.description ?? ""
+          )}`
+        // legacyGet does not follow a redirect to the new portal, so an expired session
+        // shows up as a 302 here instead of an HTML page saved as the certificate.
+        const res = await legacyGet(session, pdfUrl, { responseType: "arraybuffer", timeout: 120000 })
+        if (res.status !== 200) {
+          throw new Error(
+            isRedirectToNewPortal(res.headers["location"])
+              ? `TRACES session expired while downloading certificate PDF for ${rowCertNumber}`
+              : `HTTP ${res.status} downloading certificate PDF for ${rowCertNumber}`
           )
-
-          // Check if the row contains the specified year
-          const checkFy = cellText.some((text) => {
-            return text && text.includes(yearValue)
-          })
-
-          console.log("Has Certificate", hasCertificate)
-          console.log("Check FY", checkFy)
-
-          if (hasCertificate && checkFy) {
-            // Extract DIN (first element) and certificate number (last element)
-            const din = cellText[0]
-            const date = cellText[1]
-            const certNumber = cellText[cellText.length - 1]
-            // Extract FY (4th from the end, or -4 index)
-            const fy = cellText[cellText.length - 3]
-            console.log("fy", fy)
-            console.log("yearValue", yearValue)
-            if (fy == yearValue) {
-              results.push({
-                index: i,
-                text: cellText,
-                din,
-                date,
-                certNumber,
-                fy,
-              })
-            }
-          }
         }
-        return results
-      }, year) // Pass the year variable to the evaluate function
-
-      console.log(`📄 Page ${currentPage}: Found ${certificateRows.length} certificate rows`)
-
-      // Check if the current page has any certificate rows
-      if (certificateRows.length === 0) {
-        // Increment empty pages counter if no rows found
-        emptyPagesCount++
-        console.log(`⚠️ Empty page detected (${emptyPagesCount}/${MAX_EMPTY_PAGES})`)
-
-        // Stop pagination if we've hit our limit of consecutive empty pages
-        if (emptyPagesCount >= MAX_EMPTY_PAGES) {
-          console.log(`🛑 Stopping pagination after ${MAX_EMPTY_PAGES} consecutive empty pages`)
-          hasMorePages = false
-          continue
-        }
-      } else {
-        // Reset empty pages counter if rows found
-        emptyPagesCount = 0
-      }
-
-      // Process each certificate row in this page
-      for (let idx = 0; idx < certificateRows.length; idx++) {
-        const rowIndex = certificateRows[idx]?.index
-        const rowDin = certificateRows[idx]?.din
-        const rowCertNumber = certificateRows[idx]?.certNumber
-        const rowFy = certificateRows[idx]?.fy
-        const rowDate = certificateRows[idx]?.date
-
-        console.log("ROW INDEX", rowIndex)
-        console.log("ROW DIN", rowDin)
-        console.log("ROW CERT NUMBER", rowCertNumber)
-        console.log("ROW FY", rowFy)
-        console.log("ROW DATE", rowDate)
-
-        if (rowIndex === undefined || !rowDin || !rowCertNumber) {
-          console.log(`⚠️ Missing required data for row ${idx}, skipping...`)
-          continue
-        }
-        // Check if record with this DIN already exists in the database for the given financial year
-        const recordExists = await checkRecordExists(rowCertNumber, rowFy || year, companyId)
-        console.log("Record Exists", rowDin)
-
-        if (recordExists) {
-          // Add to downloads without actually downloading (for tracking)
-          allDownloads.push({
-            fileName: `skipped_${rowDin}_${rowCertNumber}.pdf`,
-            filePath: "",
-            din: rowDin,
-            certNumber: rowCertNumber,
-            fy: rowFy,
-          })
-
-          continue
-        }
-
-        try {
-          // Click on the row to select it
-          await page.evaluate((idx: number) => {
-            const rows = document.querySelectorAll("table#viewcorrdettab tbody tr")
-            const row = rows[idx]
-            if (row) {
-              const cell = row.querySelector("td")
-              if (cell) cell.click()
-            }
-          }, rowIndex)
-
-          // Wait for the row to be selected
-          await waitForSecs(2000)
-
-          // Get detailed info about this certificate
-          const certInfo = await page.evaluate(() => {
-            const detailsElements = document.querySelectorAll(".datacell")
-            const details: Record<string, string> = {}
-
-            detailsElements.forEach((elem) => {
-              const label = elem.querySelector(".dataLabel")?.textContent?.trim()
-              const value = elem.querySelector(".dataValue")?.textContent?.trim()
-              if (label && value) {
-                details[label.replace(":", "")] = value
-              }
-            })
-
-            return details
-          })
-
-          // Wait for the download button to be available and click it
-          await page.waitForSelector("#dwnldBtn", { visible: true, timeout: 10000 })
-          await page.click("#dwnldBtn")
-
-          // Wait for download to start and finish - increase timeout
-          await waitForSecs(10000) // Increase from 5000 to 10000 ms
-
-          // Check for new PDF files
-          const beforeFiles = new Set(allDownloads.map((d) => d.fileName))
-          const files = fs.readdirSync(downloadDir)
-          const pdfFiles = files.filter(
-            (file) => file.toLowerCase().endsWith(".pdf") && !beforeFiles.has(file)
+        const pdfBuffer = Buffer.from(res.data ?? [])
+        if (!pdfBuffer.subarray(0, 1024).includes("%PDF-")) {
+          throw new Error(
+            `Certificate download for ${rowCertNumber} is not a PDF (${String(
+              res.headers["content-type"] ?? "unknown type"
+            )}, ${pdfBuffer.length} bytes): ${pdfBuffer.subarray(0, 120).toString("utf8")}`
           )
-
-          if (pdfFiles.length === 0) {
-            console.log("⚠️ No new PDF file was downloaded for this row")
-          } else {
-            // Process each newly downloaded PDF
-            for (const pdfFile of pdfFiles) {
-              const pdfPath = path.join(downloadDir, pdfFile)
-
-              allDownloads.push({
-                fileName: pdfFile,
-                filePath: pdfPath,
-                din: rowDin,
-                certNumber: rowCertNumber,
-                fy: rowFy,
-              })
-            }
-          }
-        } catch (error) {
-          console.error(`❌ Error processing row ${rowIndex}:`, error)
-          // Continue with next row even if this one fails
         }
-      }
-
-      // Check if there's a next page
-      const hasNextPage = await page.evaluate(() => {
-        const nextButton = document.querySelector("#next_pagernav1")
-        return nextButton !== null && !nextButton.classList.contains("ui-state-disabled")
-      })
-
-      if (hasNextPage) {
-        console.log(`✅ Moving to page ${currentPage + 1}`)
-        await page.click("#next_pagernav1")
-        // Wait for the new page to load
-        await waitForSecs(3000)
-        currentPage++
-      } else {
-        console.log("🏁 Reached the last page")
-        hasMorePages = false
+        const pdfPath = path.join(downloadDir, `${rowCertNumber}.pdf`)
+        fs.writeFileSync(pdfPath, pdfBuffer)
+        allDownloads.push({
+          fileName: `${rowCertNumber}.pdf`,
+          filePath: pdfPath,
+          din: rowDin,
+          certNumber: rowCertNumber,
+          fy: rowFy,
+        })
+      } catch (error) {
+        console.error(`❌ Error downloading certificate ${rowCertNumber}:`, error)
       }
     }
 
     console.log(`🎉 Total certificates downloaded: ${allDownloads.length}`)
 
-    // Process downloaded PDFs to extract certificate numbers and PAN numbers
     const processedDownloads = await processPdfFiles(allDownloads)
 
-
-    // Return information about the downloaded certificates with extracted data
     return {
       data: {
         success: true,
@@ -448,11 +294,9 @@ export async function fetchTldcData({
   } catch (error) {
     console.error("❌ Error fetching TLDC data:", error)
 
-    // Try to process any PDFs that were downloaded before the error
     if (allDownloads.length > 0) {
       try {
         const processedDownloads = await processPdfFiles(allDownloads)
-
         return {
           data: {
             success: true,
@@ -465,8 +309,6 @@ export async function fetchTldcData({
         }
       } catch (processingError) {
         console.error("❌ Error processing PDFs:", processingError)
-
-        // Fall back to returning unprocessed downloads
         return {
           data: {
             success: true,
@@ -492,10 +334,4 @@ export async function fetchTldcData({
   } finally {
     await session?.close()
   }
-}
-
-function delay(time) {
-  return new Promise(function (resolve) {
-    setTimeout(resolve, time)
-  })
 }

@@ -69,6 +69,8 @@ dist
 # .NET build output for the DSC signer (the built binary lives in pdf-signer/)
 pdf-signer-src/bin/
 pdf-signer-src/obj/
+# The signer's own logs, written next to the exe on whatever machine runs it
+pdf-signer/logs/
 
 # Large build/data archives - keep out of git (files stay on disk)
 .next.zip

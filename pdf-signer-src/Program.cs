@@ -1,8 +1,5 @@
-using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using Spire.Pdf;
-using Spire.Pdf.Security;
 
 namespace PdfSigner;
 
@@ -12,22 +9,36 @@ namespace PdfSigner;
 /// Reads one JSON job from a file argument (or stdin) and signs every PDF in it with a single
 /// certificate, so a hardware token asks for at most one PIN per run.
 ///
-/// Two things this adds over a fixed-position signer:
+/// Three things this adds over a fixed-position signer:
 ///   * Bounds  — each PDF may carry its own page + rectangle, so the visible stamp lands in the
 ///               form's signature cell instead of a hardcoded corner.
 ///   * Pin     — when supplied, it is pushed into the private key handle before signing, so an
 ///               unattended batch does not stop on the driver's PIN dialog.
+///   * Token   — the key is driven the way the TRACES PDF Utility drives it (see TokenKey), not
+///               through Spire, whose key handling some token drivers reject.
 /// </summary>
 public static class Program
 {
+    // The utility signs from a GUI thread. Token drivers raise their PIN dialog on the calling
+    // thread, and some of them expect a single-threaded apartment to do it from.
+    [STAThread]
     public static int Main(string[] args)
     {
-        // Spire formats the stamp's date with the current culture. These are Indian tax
-        // certificates, so force day-first formatting rather than inheriting the machine's
-        // locale and stamping an ambiguous 9/9/2026 on a form that reads 09/Sep/2026.
+        // The stamp formats its own date, but Spire still formats numbers and dates with the
+        // current culture while writing the PDF. Pin it rather than inherit whatever locale the
+        // machine happens to have.
         var culture = new System.Globalization.CultureInfo("en-IN");
         System.Globalization.CultureInfo.DefaultThreadCurrentCulture = culture;
         System.Threading.Thread.CurrentThread.CurrentCulture = culture;
+
+        if (args.Any(a => a == "--diagnose"))
+        {
+            return Diagnose.Run(args.Where(a => a != "--diagnose").ToArray());
+        }
+
+        // One file per day: the app keeps one signer alive for the whole session, and a client
+        // machine that fails sends back today's file.
+        Log.Open($"pdf-signer-{DateTime.Now:yyyy-MM-dd}.log");
 
         if (args.Any(a => a == "--serve"))
         {
@@ -39,39 +50,41 @@ public static class Program
             var job = ReadJob(args);
             if (job is null)
             {
-                Console.Error.WriteLine("pdf-signer: no job supplied (pass a JSON file path or pipe JSON to stdin)");
+                Log.Info("no job supplied (pass a JSON file path or pipe JSON to stdin)");
                 return 2;
             }
 
             if (string.IsNullOrWhiteSpace(job.CertificateName))
             {
-                Console.Error.WriteLine("pdf-signer: CertificateName is required");
+                Log.Info("CertificateName is required");
                 return 2;
             }
 
             if (job.Pdfs is null || job.Pdfs.Count == 0)
             {
-                Console.Error.WriteLine("pdf-signer: Pdfs is empty");
+                Log.Info("Pdfs is empty");
                 return 2;
             }
+
+            Log.Info($"job: {job.Pdfs.Count} PDF(s) for \"{job.CertificateName}\", PIN {(string.IsNullOrEmpty(job.Pin) ? "not supplied" : "supplied")}");
 
             var certificate = CertificateStore.Find(job.CertificateName!);
             if (certificate is null)
             {
-                Console.Error.WriteLine($"pdf-signer: no certificate matching \"{job.CertificateName}\" in CurrentUser\\My or LocalMachine\\My");
+                Log.Info($"no certificate matching \"{job.CertificateName}\" in CurrentUser\\My or LocalMachine\\My");
                 return 3;
             }
 
-            Console.WriteLine($"pdf-signer: using {certificate.Subject}");
+            Log.Info($"using {certificate.Subject} (thumbprint {certificate.Thumbprint})");
 
-            // Unlock once for the whole batch. A failure here is not fatal: the driver will fall
-            // back to its own dialog, which is exactly the old behaviour.
+            using var key = TokenKey.Open(certificate);
+            Log.Info($"key {key.Describe()}");
+
+            // Unlock once for the whole batch. A driver that will not take the PIN this way is not
+            // fatal: it falls back to its own dialog, which is all the TRACES utility ever does.
             if (!string.IsNullOrEmpty(job.Pin))
             {
-                // Apply returns the certificate to sign with: one bound to the unlocked key
-                // handle, so Spire does not open a fresh locked one and prompt.
-                certificate = TokenPin.Apply(certificate, job.Pin!, out var pinStatus);
-                Console.WriteLine($"pdf-signer: pin {pinStatus}");
+                Log.Info($"pin {key.ApplyPin(job.Pin!)}");
             }
 
             var failures = 0;
@@ -79,13 +92,13 @@ public static class Program
             {
                 try
                 {
-                    SignOne(item, certificate, job);
-                    Console.WriteLine($"pdf-signer: signed {item.InputPath}");
+                    SignatureWriter.Sign(item, key, job);
+                    Log.Info($"signed {item.InputPath}");
                 }
                 catch (Exception ex)
                 {
                     failures++;
-                    Console.Error.WriteLine($"pdf-signer: FAILED {item.InputPath}: {ex.Message}");
+                    Log.Error(item.InputPath ?? "(no path)", ex);
                 }
             }
 
@@ -93,7 +106,8 @@ public static class Program
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"pdf-signer: {ex.Message}");
+            Log.Error("job", ex);
+            Log.Info($"log: {Log.FilePath}");
             return 1;
         }
     }
@@ -126,9 +140,9 @@ public static class Program
     /// </summary>
     private static int Serve()
     {
-        Console.Error.WriteLine("pdf-signer: serve mode ready");
+        Log.Info("serve mode ready");
 
-        X509Certificate2? certificate = null;
+        TokenKey? key = null;
         var certificateKey = "";
 
         string? line;
@@ -147,38 +161,47 @@ public static class Program
                 if (string.IsNullOrWhiteSpace(job.CertificateName))
                     throw new InvalidOperationException("CertificateName is required");
 
+                Log.Info($"job: {job.Pdfs?.Count ?? 0} PDF(s) for \"{job.CertificateName}\", PIN {(string.IsNullOrEmpty(job.Pin) ? "not supplied" : "supplied")}");
+
                 // Resolve and unlock once per certificate, then reuse it for every later job —
                 // that reuse is the whole point of this mode.
-                if (certificate is null || certificateKey != job.CertificateName)
+                if (key is null || certificateKey != job.CertificateName)
                 {
-                    certificate = CertificateStore.Find(job.CertificateName!)
+                    key?.Dispose();
+                    key = null;
+
+                    var certificate = CertificateStore.Find(job.CertificateName!)
                         ?? throw new InvalidOperationException(
                             $"no certificate matching \"{job.CertificateName}\" in CurrentUser\\My or LocalMachine\\My");
+                    Log.Info($"using {certificate.Subject} (thumbprint {certificate.Thumbprint})");
+
+                    key = TokenKey.Open(certificate);
                     certificateKey = job.CertificateName!;
-                    Console.Error.WriteLine($"pdf-signer: using {certificate.Subject}");
+                    Log.Info($"key {key.Describe()}");
 
                     if (!string.IsNullOrEmpty(job.Pin))
                     {
-                        certificate = TokenPin.Apply(certificate, job.Pin!, out var pinStatus);
-                        Console.Error.WriteLine($"pdf-signer: pin {pinStatus}");
+                        Log.Info($"pin {key.ApplyPin(job.Pin!)}");
                     }
                 }
 
                 foreach (var item in job.Pdfs ?? new List<PdfJobItem>())
                 {
-                    SignOne(item, certificate, job);
+                    SignatureWriter.Sign(item, key, job);
                     signed++;
-                    Console.Error.WriteLine($"pdf-signer: signed {item.InputPath}");
+                    Log.Info($"signed {item.InputPath}");
                 }
             }
             catch (Exception ex)
             {
-                error = ex.Message.Trim();
-                Console.Error.WriteLine($"pdf-signer: FAILED {error}");
+                Log.Error("job", ex);
+                // The app shows this string to the operator; point them at the file to send.
+                error = ex.Message.Trim() + (Log.FilePath is null ? "" : $" (signer log: {Log.FilePath})");
 
-                // A certificate that failed mid-run may have a dead token behind it; resolve
-                // again next time rather than reusing a handle that is no longer usable.
-                certificate = null;
+                // A key that failed mid-run may have a dead token behind it; open it again next
+                // time rather than reusing a handle that is no longer usable.
+                key?.Dispose();
+                key = null;
                 certificateKey = "";
             }
 
@@ -186,7 +209,7 @@ public static class Program
             Console.Out.Flush();
         }
 
-        Console.Error.WriteLine("pdf-signer: serve mode ending");
+        Log.Info("serve mode ending");
         return 0;
     }
 
@@ -197,38 +220,6 @@ public static class Program
             ReadCommentHandling = JsonCommentHandling.Skip,
             AllowTrailingCommas = true
         };
-
-    private static void SignOne(PdfJobItem item, X509Certificate2 certificate, PdfJob job)
-    {
-        if (string.IsNullOrWhiteSpace(item.InputPath) || !File.Exists(item.InputPath))
-        {
-            throw new FileNotFoundException($"input not found: {item.InputPath}");
-        }
-
-        var outputPath = string.IsNullOrWhiteSpace(item.OutputPath) ? item.InputPath! : item.OutputPath!;
-
-        using var doc = new PdfDocument();
-        doc.LoadFromFile(item.InputPath);
-
-        if (doc.Pages.Count == 0)
-        {
-            throw new InvalidOperationException("document has no pages");
-        }
-
-        var placement = Placement.For(item, doc);
-        var page = doc.Pages[placement.PageIndex];
-
-        var signature = new PdfSignature(doc, page, new PdfCertificate(certificate), $"sig-{Guid.NewGuid():N}")
-        {
-            Bounds = placement.Bounds,
-            DocumentPermissions = PdfCertificationFlags.ForbidChanges
-        };
-
-        Appearance.Apply(signature, certificate, job, placement.Bounds.Height);
-
-        doc.SaveToFile(outputPath);
-        doc.Close();
-    }
 }
 
 public sealed class PdfJob

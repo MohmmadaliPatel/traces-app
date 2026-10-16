@@ -154,7 +154,3 @@ function normalizeQuarter(raw: string): string {
   if (/^[1-4]$/.test(v)) return `Q${v}`
   return v
 }
-
-export const COMPANY_TEMPLATE_CSV =
-  COMPANY_CREDENTIAL_HEADERS.join(",") +
-  "\nABC Corporation Ltd,ABCD12345E,ITPass123,ABCD12345E,UserPass456"

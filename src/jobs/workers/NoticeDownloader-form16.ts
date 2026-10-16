@@ -59,6 +59,18 @@ import {
   isGeneratedStatus,
   matchesPeriod,
   type Form16aRequestItem,
+  openTraces61ApiSession,
+  postLegacyServletJson,
+  fetchLegacyDownloadUrl,
+  loadLegacyPage,
+  assertLegacyStep,
+  ensureLegacySelectOption,
+  extractLegacyFormInputs,
+  formIdContainingInput,
+  submitLegacyControl,
+  submitNormalKycChain,
+  runLegacyRequestFlow,
+  type Traces61ApiSession,
 } from "../traces"
 puppeteer.use(StealthPlugin())
 
@@ -1493,6 +1505,308 @@ export default class NoticeDownloaderForm16 {
         formType: company?.formType || "Unknown",
         tan: company?.tan || "Unknown",
       }
+    }
+  }
+
+  /**
+   * API-only Form 16/16A file download (no Puppeteer) — same result shape as the legacy
+   * `getTracesFilepuppeteer`. Lists via GetReqListServlet, downloads via DownloadServlet.
+   */
+  async getTracesFileApi(record: any) {
+    const fsMod = require("fs")
+    const pathMod = require("path")
+    const axios = require("axios")
+
+    try {
+      if (!record) throw new Error("No company record provided for TRACES file download")
+      const companyLabel = record.companyName || record.name || "Unknown"
+      this.logger.log(`Starting TRACES API file download for ${companyLabel}`)
+
+      const session: Traces61ApiSession = await openTraces61ApiSession(
+        {
+          userId: record.user_id,
+          password: record.password,
+          tan: record.tan,
+        },
+        { log: (msg) => this.logger.log(msg) }
+      )
+      try {
+        const listRows: any[] = []
+        let pageNo = 1
+        let totalPages = 1
+        while (pageNo <= totalPages && pageNo <= 20) {
+          const json = await postLegacyServletJson(
+            session,
+            `app/srv/GetReqListServlet?reqtype=0&_search=false&nd=${Date.now()}&rows=100&page=${pageNo}&sidx=reqNo&sord=desc`
+          )
+          totalPages = Number(json.total || json.totalpages || 1)
+          const rows = Array.isArray(json.rows) ? json.rows : []
+          listRows.push(...rows)
+          if (!rows.length) break
+          pageNo++
+        }
+
+        const wantedKind =
+          this.form16Type === "form16a" ? "bulk form 16a file" : "bulk form 16 file"
+        const availableFiles = listRows.filter((row: any) => {
+          const status = String(row.status || "").toLowerCase()
+          const kind = String(row.fileProcessed || row.dntype || "").toLowerCase()
+          return status === "available" && kind === wantedKind
+        })
+        this.logger.log(
+          `Request list: ${listRows.length} rows, ${availableFiles.length} available ${wantedKind} files`
+        )
+
+        const parseDate = (dateStr: string) => {
+          if (!dateStr) return new Date(0)
+          try {
+            const parts = dateStr.split("-")
+            if (parts.length !== 3) return new Date(0)
+            const monthMap: Record<string, number> = {
+              Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5,
+              Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11,
+            }
+            if (parts[1]?.length === 3) {
+              return new Date(parseInt(parts[2]!), monthMap[parts[1]!] || 0, parseInt(parts[0]!))
+            }
+            return new Date(parseInt(parts[0]!), parseInt(parts[1]!) - 1, parseInt(parts[2]!))
+          } catch {
+            return new Date(0)
+          }
+        }
+
+        const groupedFiles = new Map<string, any>()
+        for (const file of availableFiles) {
+          const finYr = String(file.finYr || file.financialYear || file.fin || "")
+          const quarter = String(file.qrtr || file.quarter || "")
+          const formType = String(file.frmType || file.formType || "")
+          const key = `${String(finYr).split("-")[0]}_${quarter}_${formType}`
+          const existing = groupedFiles.get(key)
+          if (!existing || parseDate(file.reqDate || file.requestDate) > parseDate(existing.reqDate)) {
+            groupedFiles.set(key, {
+              ...file,
+              financialYear: finYr,
+              quarter,
+              formType,
+              requestNumber: String(file.reqNo || file.requestNumber || ""),
+              requestDate: file.reqDate || file.requestDate || "",
+            })
+          }
+        }
+        const filesToDownload = Array.from(groupedFiles.values())
+        this.logger.log(`After filtering duplicates: ${filesToDownload.length} files to download`)
+
+        const safeCompany = (record.name || "UNKNOWN_COMPANY").replace(/[/\\?%*:|"<>]/g, "_")
+        const downloadResults: any[] = []
+
+        for (const fileToDownload of filesToDownload) {
+          const reqNo = String(fileToDownload.requestNumber || "")
+          try {
+            this.logger.log(
+              `\nDownloading: FY ${fileToDownload.financialYear}, ${fileToDownload.quarter}, ${fileToDownload.formType}, Req: ${reqNo}`
+            )
+            const { url: downloadUrl, reply } = await fetchLegacyDownloadUrl(session, reqNo)
+            if (!downloadUrl) {
+              this.logger.log(`Could not find download URL for reqNo: ${reqNo} (${reply.slice(0, 180)})`)
+              downloadResults.push({
+                success: false,
+                reason: "Could not find download URL",
+                finYr: fileToDownload.financialYear,
+                qrtr: fileToDownload.quarter,
+                frmType: fileToDownload.formType,
+                reqNo,
+              })
+              continue
+            }
+
+            const formTypeDir = String(fileToDownload.formType).replace(/[/\\?%*:|"<>]/g, "_")
+            const finYrDir = String(fileToDownload.financialYear).replace(/[/\\?%*:|"<>]/g, "_")
+            const qrtrDir = String(fileToDownload.quarter)
+            const targetDir = pathMod.join(
+              process.cwd(), "public", "pdf", "traces", safeCompany, finYrDir, qrtrDir, formTypeDir
+            )
+            fsMod.mkdirSync(targetDir, { recursive: true })
+            let fileName = `${reqNo}.zip`
+            try {
+              const urlParts = downloadUrl.split("/")
+              fileName = urlParts.reverse().find((part: string) => part.includes(".")) || fileName
+            } catch {
+              /* keep default */
+            }
+            const targetFilePath = pathMod.join(targetDir, fileName)
+
+            const downloadResponse = await axios.get(downloadUrl, { responseType: "arraybuffer" })
+            fsMod.writeFileSync(targetFilePath, Buffer.from(downloadResponse.data))
+            this.logger.log(`✓ File downloaded: ${targetFilePath}`)
+
+            downloadResults.push({
+              success: true,
+              tanReqNo: `${(record.tan || "").toUpperCase()}_${reqNo}`,
+              company: record.name,
+              filePath: targetFilePath,
+              finYr: fileToDownload.financialYear,
+              qrtr: fileToDownload.quarter,
+              frmType: fileToDownload.formType,
+              reqNo,
+              reqDate: fileToDownload.requestDate,
+            })
+            await waitForSecs(1000)
+          } catch (err: any) {
+            this.logger.log(`✗ Failed to download file for reqNo ${reqNo}: ${err.message}`)
+            downloadResults.push({
+              success: false,
+              reason: `Failed to download: ${err.message}`,
+              finYr: fileToDownload.financialYear,
+              qrtr: fileToDownload.quarter,
+              frmType: fileToDownload.formType,
+              reqNo,
+            })
+          }
+        }
+
+        const successCount = downloadResults.filter((r) => r.success).length
+        this.logger.log(
+          `\n=== Download Summary === success: ${successCount}, failed: ${downloadResults.length - successCount}`
+        )
+
+        if (downloadResults.length === 0) {
+          return {
+            success: false,
+            reason: "No files available",
+            company: record.name,
+            tan: record.tan,
+          }
+        }
+        if (successCount > 0) {
+          return {
+            success: true,
+            company: record.name,
+            tan: (record.tan || "").toUpperCase(),
+            downloadResults,
+            summary: { total: downloadResults.length, success: successCount, failed: downloadResults.length - successCount },
+          }
+        }
+        return {
+          success: false,
+          reason: "All downloads failed",
+          company: record.name,
+          tan: record.tan,
+          downloadResults,
+        }
+      } finally {
+        await session.close()
+      }
+    } catch (error: any) {
+      this.logger.log(`Error in TRACES API file download: ${error.message}`)
+      throw error
+    }
+  }
+
+  /**
+   * API-only Form 16/16A request submission (no Puppeteer).
+   *
+   * Flow (same controls the Puppeteer flow clicked): download16.xhtml / download16a.xhtml —
+   * #bulkfinYr (+ #bulkquarter, #bulkformType for 16A) + Go (#bulkGo) → optional secondary
+   * Go (#clickGo) → Submit (#j_id1972728517_7cc7de5f) → Normal KYC (#search2, #normalkyc)
+   * → challan details (#token … #amt3, #clickKYC) → Proceed with Transaction (#redirect).
+   * Each step posts the form the previous response rendered, to that form's own action.
+   *
+   * NOTE: submits requests on the portal (state-changing). It has NOT been live-tested
+   * (no state-changing POSTs in tests) — validate with one test TAN first.
+   */
+  async sendForm16RequestApi(record: any) {
+    const SUBMIT_CONTROL_ID = "j_id1972728517_7cc7de5f"
+    try {
+      if (!record) throw new Error("No company record provided for TRACES automation")
+      this.logger.log(`Starting TRACES API Form 16/16A request for ${record.companyName}`)
+
+      const isForm16A = this.form16Type === "form16a"
+      const formLabel = isForm16A ? "Form 16A" : "Form 16"
+      const pageUrl = isForm16A ? "app/ded/download16a.xhtml" : "app/ded/download16.xhtml"
+      // The Puppeteer flow fell back to FY 2025 / Q1 when these were missing; filing a
+      // request for the wrong period is worse than failing the job.
+      const year = String(this.financialYear ?? "").split("-")[0]?.trim() || ""
+      if (!year) throw new Error(`No financial year set for the ${formLabel} request`)
+      const quarterMap: Record<string, string> = { Q1: "3", Q2: "4", Q3: "5", Q4: "6" }
+      const quarterValue = quarterMap[String(this.quarter || "").trim().toUpperCase()] || ""
+      if (isForm16A && !quarterValue) {
+        throw new Error(`Could not map quarter "${this.quarter}" to a TRACES option`)
+      }
+      const formTypeValue = String(record.formType || this.formType || "").trim()
+      this.logger.log(
+        `Submitting ${formLabel} request — FY ${year}` +
+          (isForm16A ? `, quarter ${this.quarter} (${quarterValue}), form ${formTypeValue}` : "")
+      )
+
+      // Failures before the final submit are retried from a fresh login (the Puppeteer flow
+      // retried 5 times); never after it.
+      const result = await runLegacyRequestFlow(
+        { label: `${formLabel} request`, maxAttempts: 5, log: (msg) => this.logger.log(msg) },
+        async () => {
+          const session: Traces61ApiSession = await openTraces61ApiSession(
+            {
+              userId: record.userId || record.user_id,
+              password: record.password,
+              tan: record.tan,
+            },
+            { log: (msg) => this.logger.log(msg) }
+          )
+          try {
+            // Step 1: filters + Go (#bulkGo).
+            let page = await loadLegacyPage(session, pageUrl)
+            assertLegacyStep(page, `opening ${formLabel} page`, ["bulkGo"])
+            const finYr = await ensureLegacySelectOption(session, page, "bulkfinYr", year)
+            page = finYr.page
+            const fields: Record<string, string> = { bulkfinYr: finYr.value }
+            if (isForm16A) {
+              const quarter = await ensureLegacySelectOption(session, page, "bulkquarter", quarterValue, {
+                bulkfinYr: finYr.value,
+              })
+              const formType = await ensureLegacySelectOption(
+                session,
+                quarter.page,
+                "bulkformType",
+                formTypeValue,
+                { bulkfinYr: finYr.value, bulkquarter: quarter.value }
+              )
+              page = formType.page
+              fields.bulkquarter = quarter.value
+              fields.bulkformType = formType.value
+            }
+            // dwnldFormBulkType normally comes with the page; fill the known value only if absent.
+            const goFormId = formIdContainingInput(page.html, "bulkGo")
+            if (goFormId && !extractLegacyFormInputs(page.html, goFormId).dwnldFormBulkType) {
+              fields.dwnldFormBulkType = isForm16A ? "14" : "13"
+            }
+            page = await submitLegacyControl(session, page, "bulkGo", { fields })
+            this.logger.log("Go submitted")
+
+            // Optional secondary Go (#clickGo) — the Puppeteer flow clicked it when present.
+            if (assertLegacyStep(page, "after Go", ["clickGo", SUBMIT_CONTROL_ID]) === "clickGo") {
+              page = await submitLegacyControl(session, page, "clickGo")
+              this.logger.log("Secondary Go submitted")
+            }
+
+            // Step 2: Submit.
+            assertLegacyStep(page, "after Go", [SUBMIT_CONTROL_ID])
+            page = await submitLegacyControl(session, page, SUBMIT_CONTROL_ID)
+            this.logger.log("Submit clicked")
+
+            // Steps 3-5: Normal KYC → challan details → Proceed with Transaction.
+            return await submitNormalKycChain(session, page, record, (msg) => this.logger.log(msg))
+          } finally {
+            await session.close()
+          }
+        }
+      )
+
+      this.logger.log(
+        `TRACES API automation completed successfully for ${record.companyName || this.company.name}`
+      )
+      return { success: true, requestNumber: result.requestNumber }
+    } catch (error: any) {
+      this.logger.log(`Error in TRACES API automation: ${error.message}`)
+      throw error
     }
   }
 
@@ -3230,7 +3544,7 @@ export default class NoticeDownloaderForm16 {
     )
     console.log("Company", this.company?.name, this.company?.tan)
 
-    const result = await this.getTracesFilepuppeteer(this.company)
+    const result = await this.getTracesFileApi(this.company)
     console.log("result", result)
     // Extract successful downloads from the result
     if (result && result.success && result.downloadResults) {
@@ -3486,7 +3800,7 @@ export default class NoticeDownloaderForm16 {
       const companyData = await this.readReturnsTxtFiles()
       console.log("companyData", companyData)
 
-      await this.getTracesDatapuppeteer(companyData)
+      await this.sendForm16RequestApi(companyData)
     }
 
     if (this.jobTypes.includes("DownloadFile")) {

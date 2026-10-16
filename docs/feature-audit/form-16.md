@@ -83,4 +83,4 @@
 - Fixed: `sign_pdf` uses `form16`/`form16a` folder from `form16Type`; `getUploadHistory` batchId bug fixed.
 
 ## DSC signing
-- Auto-attach of the digital signature after Form 16A / Form 131 PDF generation is documented in [../DSC-SETUP.md](../DSC-SETUP.md) — prerequisites (.NET 10), certificate resolution order, the once-per-session token unlock (`yarn dsc:unlock`), and recovery of unsigned batches (`yarn dsc:sign`).
+- Auto-attach of the digital signature after Form 16A / Form 131 PDF generation is documented in [../DSC-SETUP.md](../DSC-SETUP.md) — prerequisites, certificate resolution order, the once-per-session token unlock (`yarn dsc:unlock`), and recovery of unsigned batches (`yarn dsc:sign`).

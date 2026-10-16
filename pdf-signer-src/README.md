@@ -8,8 +8,19 @@ The built binary lives in `../pdf-signer/`; this folder is its source. Rebuild w
 yarn dsc:build-signer
 ```
 
-That needs the .NET **SDK** (`winget install Microsoft.DotNet.SDK.10`). Running the signer needs
-only the Desktop Runtime.
+That needs the .NET **SDK** (`winget install Microsoft.DotNet.SDK.10`, or any OS — the build
+cross-publishes to `win-x64`). The output is **self-contained**: it bundles the .NET runtime, so
+running the signer needs no .NET install. Keep trimming off — Spire relies on reflection.
+
+## Self-test and logs
+
+`diagnose.cmd` (shipped next to the exe) runs `pdf-signer.exe --diagnose ["CERT NAME"] [--pin]`:
+certificate, key, PIN, one signature, one signed test PDF, each step reported as OK or FAILED,
+with `RESULT: PASS/FAIL` at the end. Its log is `logs\diagnose-*.log`.
+
+Every other run appends to `logs\pdf-signer-<date>.log` next to the exe (or `%TEMP%\pdf-signer-logs`
+if that folder is read-only). stderr carries the same lines with a `pdf-signer: ` prefix; stdout
+stays reserved for serve mode's JSON results. The PIN is never written anywhere.
 
 ## Input
 
@@ -56,9 +67,17 @@ form's signature cell when the PDF is generated.
 
 * Certificate matching tries thumbprint, then exact CN, then a substring of the subject, and
   only ever considers certificates that have a usable private key.
-* A supplied PIN is pushed into the key handle and then used for one throwaway signature. That
+* The token is driven the way the TRACES PDF Utility drives it (`TokenKey.cs`): one key handle
+  from `CryptAcquireCertificatePrivateKey`, the PIN dialog parented to our window, and a single
+  SHA-256 digest signed with PKCS#1 v1.5 per PDF. Spire never sees the private key — the PKCS#7
+  is built by `SignedCms` (`CmsFormatter.cs`) and handed to Spire's `PdfMDPSignatureMaker`.
+* A supplied PIN is pushed into that handle and then used for one throwaway signature. That
   makes the token cache it for the Windows session and turns a wrong PIN into an immediate,
   clear error rather than a dialog nobody is watching. Wrong PINs are never retried — tokens
   lock after a few attempts.
-* If the provider supports neither CNG nor CSP PIN injection, the run continues and the token's
-  own dialog asks for the PIN, exactly as before.
+* If the driver will not take the PIN that way, the run continues and the token's own dialog
+  asks for it, which is all the TRACES utility ever does.
+* Each PDF is saved to `<output>.signing` and moved over the output only once the signature is
+  in, so a token failure never leaves a generated certificate truncated. The save is a full
+  rewrite: Spire's incremental save leaves the signature unlinked from the catalog, and readers
+  that start from the catalog (pdfium, which is Chrome's viewer, and pypdf) see no signature.
